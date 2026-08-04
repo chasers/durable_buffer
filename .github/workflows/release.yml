@@ -35,7 +35,9 @@ jobs:
 
       - name: Read version from mix.exs
         id: version
-        run: echo "version=$(grep -m1 -oE 'version: "[^"]+"' mix.exs | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(grep -m1 -oE 'version: "[^"]+"' mix.exs | cut -d'"' -f2)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create release if the tag is new
         env:
