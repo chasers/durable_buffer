@@ -1,5 +1,7 @@
 # DurableBuffer
 
+[![CI](https://github.com/chasers/durable_buffer/actions/workflows/ci.yml/badge.svg)](https://github.com/chasers/durable_buffer/actions/workflows/ci.yml)
+
 A partitioned, group-committed buffer for Elixir, durable to **local disk**,
 **N replica nodes**, or **S3**.
 
@@ -168,3 +170,13 @@ The suite covers WAL framing and torn-tail recovery, group-commit batching
 and error propagation, all three backends (S3 via a `Req.Test` fake with
 ListObjectsV2 pagination, replication via `:erpc` to the local node), and
 end-to-end restart recovery.
+
+CI runs formatting, a warnings-as-errors compile, and the test suite on
+every push and pull request.
+
+## Releases
+
+Bumping `version:` in `mix.exs` and pushing to `main` cuts a release: the
+release workflow re-runs the tests, then creates the `v<version>` tag and a
+GitHub release with generated notes. Pushes that touch `mix.exs` without
+changing the version are no-ops (the existing tag is detected and skipped).
