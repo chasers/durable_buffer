@@ -3,17 +3,23 @@ defmodule DurableBuffer.Partition do
   Per-partition group-commit writer.
 
   Appends are calls that do not reply immediately: entries accumulate in a
-  pending batch and the first entry into an empty batch self-sends `:flush`.
-  Every append the mailbox delivers before `:flush` joins the batch, so a
-  single backend commit (one write + fsync / replicate / PUT) covers all
-  concurrent callers, and each caller is replied to only once its data is
-  durable. When the buffer is idle a lone append pays exactly one commit of
-  latency. `max_batch_bytes` / `max_batch_entries` force an immediate flush
-  under heavy load.
+  pending batch, and batches are handed to a linked
+  `DurableBuffer.Partition.Committer` that owns the backend and replies to
+  callers once their data is durable. Commits are pipelined: while one batch
+  is being committed (fsync / replication / PUT), the writer keeps draining
+  its mailbox into the next batch, and `:commit_done` triggers the next
+  handoff — so batch formation overlaps commit latency instead of stopping
+  for it.
+
+  When the partition is idle a lone append pays exactly one commit of
+  latency (plus `flush_delay_ms`, if configured, which lets batches fill at
+  moderate load). `max_batch_bytes` / `max_batch_entries` force an immediate
+  handoff under heavy load.
   """
 
   use GenServer
 
+  alias DurableBuffer.Partition.Committer
   alias DurableBuffer.WAL
 
   def start_link(opts) do
@@ -26,6 +32,23 @@ defmodule DurableBuffer.Partition do
   @spec append(GenServer.server(), iodata(), timeout()) :: :ok | {:error, term()}
   def append(server, payload, timeout \\ :infinity) do
     GenServer.call(server, {:append, payload}, timeout)
+  end
+
+  @doc """
+  Appends a list of payloads in one call and blocks until all of them are
+  durable.
+
+  The whole list is framed as consecutive WAL entries and joins the current
+  group commit together, so the per-call messaging cost is paid once for the
+  entire list — the main lever for small-payload throughput.
+  """
+  @spec append_batch(GenServer.server(), [iodata()], timeout()) :: :ok | {:error, term()}
+  def append_batch(server, payloads, timeout \\ :infinity)
+
+  def append_batch(_server, [], _timeout), do: :ok
+
+  def append_batch(server, payloads, timeout) do
+    GenServer.call(server, {:append_batch, payloads}, timeout)
   end
 
   @doc """
@@ -60,129 +83,134 @@ defmodule DurableBuffer.Partition do
   def init(opts) do
     {backend, config} = Keyword.fetch!(opts, :backend)
     partition_index = Keyword.fetch!(opts, :partition_index)
-    {:ok, backend_state} = backend.open(config, partition_index)
+    {:ok, committer} = Committer.start_link(backend, config, partition_index)
 
     {:ok,
      %{
-       backend: backend,
-       backend_state: backend_state,
+       committer: committer,
        pending: [],
        pending_bytes: 0,
        pending_count: 0,
+       in_flight: 0,
        flush_scheduled?: false,
-       async_error: nil,
        max_batch_bytes: Keyword.get(opts, :max_batch_bytes, 8 * 1024 * 1024),
-       max_batch_entries: Keyword.get(opts, :max_batch_entries, 5000)
+       max_batch_entries: Keyword.get(opts, :max_batch_entries, 5000),
+       flush_delay_ms: Keyword.get(opts, :flush_delay_ms, 0)
      }}
   end
 
   @impl GenServer
   def handle_call({:append, payload}, from, state) do
-    {:noreply, enqueue(state, from, payload)}
+    {:noreply, enqueue(state, from, encode_one(payload))}
   end
 
-  def handle_call(:sync, _from, %{pending: []} = state) do
-    {:reply, sync_reply(:ok, state), %{state | async_error: nil}}
+  def handle_call({:append_batch, payloads}, from, state) do
+    {:noreply, enqueue(state, from, encode_many(payloads))}
+  end
+
+  def handle_call(:sync, from, %{pending: []} = state) do
+    Committer.request_sync(state.committer, from)
+    {:noreply, state}
   end
 
   def handle_call(:sync, from, state) do
-    {reply, state} = flush(state)
-    GenServer.reply(from, sync_reply(reply, state))
-    {:noreply, %{state | async_error: nil}}
+    state =
+      %{state | pending: [{:sync, from} | state.pending]}
+      |> handoff()
+
+    {:noreply, state}
   end
 
-  def handle_call(:truncate, _from, state) do
-    {_reply, state} = if state.pending == [], do: {:ok, state}, else: flush(state)
-    {:ok, backend_state} = state.backend.truncate(state.backend_state)
-    {:reply, :ok, %{state | backend_state: backend_state, async_error: nil}}
+  def handle_call(:truncate, from, state) do
+    state = if state.pending == [], do: state, else: handoff(state)
+    Committer.request_truncate(state.committer, from)
+    {:noreply, state}
   end
 
   @impl GenServer
   def handle_cast({:append, payload}, state) do
-    {:noreply, enqueue(state, nil, payload)}
+    {:noreply, enqueue(state, nil, encode_one(payload))}
   end
 
   @impl GenServer
-  def handle_info(:flush, %{pending: []} = state) do
-    {:noreply, %{state | flush_scheduled?: false}}
+  def handle_info(:flush, state) do
+    state = %{state | flush_scheduled?: false}
+
+    if state.pending != [] and state.in_flight == 0 do
+      {:noreply, handoff(state)}
+    else
+      {:noreply, state}
+    end
   end
 
-  def handle_info(:flush, state) do
-    {_reply, state} = flush(%{state | flush_scheduled?: false})
-    {:noreply, state}
+  def handle_info(:commit_done, state) do
+    state = %{state | in_flight: state.in_flight - 1}
+
+    if state.pending != [] and state.in_flight == 0 do
+      {:noreply, handoff(state)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(_message, state) do
     {:noreply, state}
   end
 
-  @impl GenServer
-  def terminate(_reason, state) do
-    state.backend.close(state.backend_state)
+  defp encode_one(payload) do
+    {entry, entry_size} = WAL.encode(payload)
+    {entry, 1, entry_size}
   end
 
-  defp enqueue(state, from, payload) do
-    {entry, entry_size} = WAL.encode(payload)
+  defp encode_many(payloads) do
+    {entries, count, bytes} =
+      Enum.reduce(payloads, {[], 0, 0}, fn payload, {entries, count, bytes} ->
+        {entry, entry_size} = WAL.encode(payload)
+        {[entry | entries], count + 1, bytes + entry_size}
+      end)
 
+    {Enum.reverse(entries), count, bytes}
+  end
+
+  defp enqueue(state, from, {entries, count, bytes}) do
     state = %{
       state
-      | pending: [{from, entry} | state.pending],
-        pending_bytes: state.pending_bytes + entry_size,
-        pending_count: state.pending_count + 1
+      | pending: [{:entries, from, entries} | state.pending],
+        pending_bytes: state.pending_bytes + bytes,
+        pending_count: state.pending_count + count
     }
 
     cond do
       state.pending_bytes >= state.max_batch_bytes or
           state.pending_count >= state.max_batch_entries ->
-        {_reply, state} = flush(state)
-        state
+        handoff(state)
 
-      state.flush_scheduled? ->
+      state.flush_scheduled? or state.in_flight > 0 ->
         state
 
       true ->
-        send(self(), :flush)
+        schedule_flush(state)
         %{state | flush_scheduled?: true}
     end
   end
 
-  defp flush(state) do
-    pending = Enum.reverse(state.pending)
-    batch = Enum.map(pending, fn {_from, entry} -> entry end)
+  defp handoff(state) do
+    Committer.commit(state.committer, Enum.reverse(state.pending), state.pending_bytes)
 
-    {reply, backend_state} =
-      case state.backend.commit(state.backend_state, batch, state.pending_bytes) do
-        {:ok, backend_state} -> {:ok, backend_state}
-        {:error, reason, backend_state} -> {{:error, reason}, backend_state}
-      end
-
-    Enum.each(pending, fn
-      {nil, _entry} -> :ok
-      {from, _entry} -> GenServer.reply(from, reply)
-    end)
-
-    {reply,
-     %{
-       state
-       | backend_state: backend_state,
-         pending: [],
-         pending_bytes: 0,
-         pending_count: 0,
-         async_error: async_error(reply, pending, state.async_error)
-     }}
+    %{
+      state
+      | pending: [],
+        pending_bytes: 0,
+        pending_count: 0,
+        in_flight: state.in_flight + 1
+    }
   end
 
-  defp async_error({:error, reason}, pending, previous) do
-    if Enum.any?(pending, fn {from, _entry} -> from == nil end) do
-      reason
-    else
-      previous
-    end
+  defp schedule_flush(%{flush_delay_ms: 0}) do
+    send(self(), :flush)
   end
 
-  defp async_error(:ok, _pending, previous), do: previous
-
-  defp sync_reply(reply, %{async_error: nil}), do: reply
-  defp sync_reply(:ok, state), do: {:error, state.async_error}
-  defp sync_reply(error, _state), do: error
+  defp schedule_flush(state) do
+    Process.send_after(self(), :flush, state.flush_delay_ms)
+  end
 end

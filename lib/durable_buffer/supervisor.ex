@@ -23,7 +23,7 @@ defmodule DurableBuffer.Supervisor do
       for index <- 0..(partitions - 1) do
         partition_opts =
           opts
-          |> Keyword.take([:max_batch_bytes, :max_batch_entries])
+          |> Keyword.take([:max_batch_bytes, :max_batch_entries, :flush_delay_ms])
           |> Keyword.merge(
             name: DurableBuffer.partition_name(name, index),
             backend: backend,

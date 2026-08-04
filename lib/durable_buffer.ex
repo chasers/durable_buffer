@@ -19,9 +19,11 @@ defmodule DurableBuffer do
   `append/3` returns once the payload is durable per the backend's guarantee.
   All appends that arrive at a partition while a commit is in flight are
   group-committed together, so the per-write fsync/replication/PUT cost is
-  amortized across concurrent callers. The `partition_key` is hashed to one
-  of a fixed set of partitions; each partition commits independently and in
-  parallel.
+  amortized across concurrent callers, and commits are pipelined — the next
+  batch forms while the previous one is being committed. For small payloads
+  prefer `append_batch/4`, which moves a whole list of payloads in one call.
+  The `partition_key` is hashed to one of a fixed set of partitions; each
+  partition commits independently and in parallel.
 
   Backends:
 
@@ -44,6 +46,10 @@ defmodule DurableBuffer do
     * `:partitions` — number of partition writers, default `System.schedulers_online()`
     * `:max_batch_bytes` — force a flush when a pending batch reaches this size, default 8 MiB
     * `:max_batch_entries` — force a flush at this many pending entries, default 5000
+    * `:flush_delay_ms` — dwell time before committing a batch that started
+      while the partition was idle, default 0 (commit as soon as possible).
+      A small delay lets batches fill at moderate load, trading median
+      latency for throughput; size caps and `sync/3` still flush immediately
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -68,6 +74,21 @@ defmodule DurableBuffer do
     name
     |> partition_server(partition_key)
     |> Partition.append(payload, timeout)
+  end
+
+  @doc """
+  Appends a list of payloads to the partition selected by `partition_key` in
+  a single call, blocking until all of them are durable.
+
+  Far cheaper than N `append/3` calls for small payloads: the messaging and
+  reply cost is paid once per list, and the whole list joins one group
+  commit. An empty list is a no-op.
+  """
+  @spec append_batch(atom(), term(), [iodata()], timeout()) :: :ok | {:error, term()}
+  def append_batch(name, partition_key, payloads, timeout \\ :infinity) do
+    name
+    |> partition_server(partition_key)
+    |> Partition.append_batch(payloads, timeout)
   end
 
   @doc """

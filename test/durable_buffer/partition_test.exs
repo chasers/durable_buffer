@@ -12,7 +12,7 @@ defmodule DurableBuffer.PartitionTest do
 
     opts =
       context_opts
-      |> Keyword.take([:max_batch_bytes, :max_batch_entries])
+      |> Keyword.take([:max_batch_bytes, :max_batch_entries, :flush_delay_ms])
       |> Keyword.merge(
         name: :"partition_test_#{System.unique_integer([:positive])}",
         backend: DurableBuffer.Backend.normalize({SlowBackend, backend_opts}),
@@ -45,6 +45,82 @@ defmodule DurableBuffer.PartitionTest do
     batches = SlowBackend.committed_batches(recorder)
     assert length(List.flatten(batches)) == 50
     assert length(batches) < 50
+  end
+
+  test "append_batch commits all payloads in order with one reply" do
+    {pid, recorder} = start_partition()
+
+    assert :ok = Partition.append_batch(pid, ["b1", "b2", "b3"])
+    assert :ok = Partition.append(pid, "single")
+
+    assert List.flatten(SlowBackend.committed_batches(recorder)) == ["b1", "b2", "b3", "single"]
+  end
+
+  test "append_batch with an empty list is a no-op" do
+    {pid, recorder} = start_partition()
+
+    assert :ok = Partition.append_batch(pid, [])
+    assert SlowBackend.committed_batches(recorder) == []
+  end
+
+  test "append_batch interleaves with concurrent single appends in one commit" do
+    {pid, recorder} = start_partition()
+
+    tasks =
+      [
+        Task.async(fn -> Partition.append_batch(pid, Enum.map(1..50, &"batch-#{&1}")) end),
+        Task.async(fn -> Partition.append(pid, "lone") end)
+      ]
+
+    assert Task.await_many(tasks, 5000) == [:ok, :ok]
+
+    committed = List.flatten(SlowBackend.committed_batches(recorder))
+    assert length(committed) == 51
+    assert "lone" in committed
+
+    assert Enum.filter(committed, &String.starts_with?(&1, "batch-")) ==
+             Enum.map(1..50, &"batch-#{&1}")
+  end
+
+  test "append_batch propagates commit errors" do
+    {pid, _recorder} = start_partition(backend_opts: [fail_on: "poison"])
+
+    assert {:error, :injected_failure} = Partition.append_batch(pid, ["ok-entry", "poison-pill"])
+  end
+
+  test "max_batch_entries counts individual batch payloads" do
+    {pid, recorder} = start_partition(max_batch_entries: 10)
+
+    assert :ok = Partition.append_batch(pid, Enum.map(1..25, &"forced-#{&1}"))
+    :ok = Partition.sync(pid)
+
+    batches = SlowBackend.committed_batches(recorder)
+    assert length(List.flatten(batches)) == 25
+  end
+
+  test "flush_delay_ms coalesces a burst into one commit" do
+    {pid, recorder} =
+      start_partition(flush_delay_ms: 50, backend_opts: [commit_sleep: 0])
+
+    for index <- 1..10 do
+      :ok = Partition.append_async(pid, "delayed-#{index}")
+    end
+
+    Process.sleep(150)
+
+    batches = SlowBackend.committed_batches(recorder)
+    assert length(batches) == 1
+    assert List.flatten(batches) == Enum.map(1..10, &"delayed-#{&1}")
+  end
+
+  test "sync flushes immediately without waiting out the flush delay" do
+    {pid, recorder} =
+      start_partition(flush_delay_ms: 60_000, backend_opts: [commit_sleep: 0])
+
+    :ok = Partition.append_async(pid, "no-waiting")
+
+    assert :ok = Partition.sync(pid)
+    assert List.flatten(SlowBackend.committed_batches(recorder)) == ["no-waiting"]
   end
 
   test "append_async entries are durable after sync" do

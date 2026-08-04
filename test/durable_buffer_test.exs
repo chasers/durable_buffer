@@ -60,6 +60,15 @@ defmodule DurableBufferTest do
     end
   end
 
+  test "append_batch round-trips through the keyed partition", %{tmp_dir: tmp_dir} do
+    name = start_buffer(tmp_dir)
+
+    assert :ok = DurableBuffer.append_batch(name, "user-9", ["one", "two", "three"])
+    assert :ok = DurableBuffer.append_batch(name, "user-9", [])
+
+    assert Enum.to_list(DurableBuffer.stream(name, "user-9")) == ["one", "two", "three"]
+  end
+
   test "append_async then sync_all makes everything durable", %{tmp_dir: tmp_dir} do
     name = start_buffer(tmp_dir)
 

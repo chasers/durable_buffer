@@ -28,6 +28,8 @@ Append, read, and trim:
 
 ```elixir
 :ok = DurableBuffer.append(:events, user_id, payload)      # blocks until durable
+:ok = DurableBuffer.append_batch(:events, user_id, payloads) # N payloads, one call,
+                                                            # one reply after commit
 :ok = DurableBuffer.append_async(:events, user_id, payload) # enqueue, don't wait
 :ok = DurableBuffer.sync(:events, user_id)                  # await pending appends;
                                                             # also surfaces commit errors
@@ -54,6 +56,25 @@ use more partitions to saturate your disk.
 | `:partitions` | schedulers | Number of parallel partition writers |
 | `:max_batch_bytes` | 8 MiB | Force a flush when a pending batch reaches this size |
 | `:max_batch_entries` | 5000 | Force a flush at this many pending entries |
+| `:flush_delay_ms` | 0 | Dwell time before committing a batch started while idle — lets batches fill at moderate load, trading median latency for throughput (~+50% at 256 B under load with 1 ms on the bench machine) |
+
+### Tuning for small payloads
+
+Throughput is `fsync rate × entries per commit`, so small payloads are fast
+exactly when commits carry many of them:
+
+- **Use `append_batch/4`** whenever producers can hand over lists — it pays
+  the messaging cost once per list and is ~100× single appends at 256 B
+  (disk-bandwidth-bound even at tiny payload sizes).
+- **Use fewer partitions.** More partitions help large payloads (parallel
+  bandwidth) but split small-payload batches across more fsyncs:
+  2 partitions beat 10 by ~2.2× at 256 B in the bench.
+- **Consider `flush_delay_ms: 1`** if median latency matters less than
+  throughput at moderate concurrency.
+
+Commits are pipelined internally (batch formation overlaps the in-flight
+fsync/PUT), so `append_async` and `append_batch` producers keep the disk fed
+without waiting for commit boundaries.
 
 ## Backends
 
@@ -113,9 +134,11 @@ round trip.
 ## Benchmarks
 
 On a MacBook Pro (M1 Max, internal SSD), the local backend sustains
-**~1.9 GB/s of fsync-durable appends** (64 KB payloads, 256 concurrent
-callers, 10 partitions). Full results for all three backends — including
-mixed append + stream workloads and caller latency distributions — are in
+**~2 GB/s of fsync-durable appends** (64 KB payloads, 256 concurrent
+callers, 10 partitions), and `append_batch` keeps even 256 B payloads
+disk-bandwidth-bound at **4.9M entries/s**. Full results for all three
+backends — including batch and mixed append + stream workloads, caller
+latency distributions, and small-payload tuning — are in
 [`bench/README.md`](bench/README.md).
 
 Each script prints an aggregate **throughput** grid (ops/s and MB/s over a

@@ -13,6 +13,7 @@ partitions = String.to_integer(System.get_env("PARTITIONS", "#{System.schedulers
 IO.puts("local backend: dir=#{dir} partitions=#{partitions}")
 
 DurableBuffer.Bench.throughput_grid(:bench_local)
+DurableBuffer.Bench.batch_grid(:bench_local)
 DurableBuffer.Bench.mixed_grid(:bench_local)
 DurableBuffer.Bench.latency(:bench_local)
 

@@ -88,6 +88,86 @@ defmodule DurableBuffer.Bench do
     end
   end
 
+  @default_batch_sizes [10, 100, 1000]
+  @default_batch_concurrencies [1, 8, 64]
+
+  def batch_grid(name, opts \\ []) do
+    payload_size = Keyword.get(opts, :payload_size, 256)
+    batch_sizes = Keyword.get(opts, :batch_sizes, @default_batch_sizes)
+    concurrencies = Keyword.get(opts, :concurrencies, @default_batch_concurrencies)
+
+    duration_ms =
+      Keyword.get(
+        opts,
+        :duration_ms,
+        String.to_integer(System.get_env("BENCH_DURATION_MS", "5000"))
+      )
+
+    warmup_ms =
+      Keyword.get(opts, :warmup_ms, String.to_integer(System.get_env("BENCH_WARMUP_MS", "1000")))
+
+    IO.puts("\n== append_batch throughput: #{name}, #{format_bytes(payload_size)} payload ==")
+
+    header =
+      String.pad_trailing("batch", 8) <>
+        String.pad_trailing("callers", 9) <>
+        String.pad_leading("entries/s", 13) <>
+        String.pad_leading("MB/s", 10)
+
+    IO.puts(header)
+
+    for batch_size <- batch_sizes, concurrency <- concurrencies do
+      result =
+        measure_batch(name, payload_size, batch_size, concurrency, warmup_ms, duration_ms)
+
+      IO.puts(
+        String.pad_trailing(Integer.to_string(batch_size), 8) <>
+          String.pad_trailing(Integer.to_string(concurrency), 9) <>
+          String.pad_leading(format_number(result.entries_per_sec), 13) <>
+          String.pad_leading(:erlang.float_to_binary(result.mb_per_sec, decimals: 1), 10)
+      )
+
+      DurableBuffer.truncate_all(name)
+    end
+
+    :ok
+  end
+
+  defp measure_batch(name, payload_size, batch_size, concurrency, warmup_ms, duration_ms) do
+    payloads = List.duplicate(:binary.copy("x", payload_size), batch_size)
+
+    run = fn ms ->
+      deadline = System.monotonic_time(:millisecond) + ms
+
+      1..concurrency
+      |> Enum.map(fn caller ->
+        Task.async(fn -> append_batch_loop(name, caller, payloads, batch_size, deadline, 0) end)
+      end)
+      |> Task.await_many(ms + 60_000)
+      |> Enum.sum()
+    end
+
+    run.(warmup_ms)
+    DurableBuffer.truncate_all(name)
+
+    entries = run.(duration_ms)
+    seconds = duration_ms / 1000
+
+    %{
+      entries_per_sec: round(entries / seconds),
+      mb_per_sec: entries * payload_size / seconds / 1_048_576
+    }
+  end
+
+  defp append_batch_loop(name, caller, payloads, batch_size, deadline, count) do
+    if System.monotonic_time(:millisecond) < deadline do
+      :ok = DurableBuffer.append_batch(name, caller, payloads)
+      append_batch_loop(name, caller, payloads, batch_size, deadline, count + batch_size)
+    else
+      count
+    end
+  end
+
   @default_mixed_combos [{1, 1}, {8, 8}, {64, 8}, {256, 8}]
 
   def mixed_grid(name, opts \\ []) do
