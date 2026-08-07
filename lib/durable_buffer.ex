@@ -47,9 +47,16 @@ defmodule DurableBuffer do
     * `:max_batch_bytes` — force a flush when a pending batch reaches this size, default 8 MiB
     * `:max_batch_entries` — force a flush at this many pending entries, default 5000
     * `:flush_delay_ms` — dwell time before committing a batch that started
-      while the partition was idle, default 0 (commit as soon as possible).
-      A small delay lets batches fill at moderate load, trading median
-      latency for throughput; size caps and `sync/3` still flush immediately
+      while the partition was idle. The default 0 is adaptive: batches
+      normally commit as soon as possible, but when commits are completing
+      slowly (an fsync or PUT is the bottleneck) and batches are concurrent,
+      a dwell of up to 2 ms is applied automatically so batches fill. An
+      explicit value fixes the dwell instead, trading median latency for
+      throughput; size caps and `sync/3` still flush immediately
+    * `:max_inflight_commits` — for backends that support pipelined commits
+      (currently `DurableBuffer.Backend.Replica`), how many batches may be
+      committing concurrently per partition, default 32. Callers are always
+      replied to in order
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do

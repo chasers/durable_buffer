@@ -75,6 +75,35 @@ defmodule DurableBuffer.Backend.LocalTest do
     assert :ok = Local.close(state)
   end
 
+  test "fsync defaults to true and can be disabled", %{tmp_dir: tmp_dir} do
+    assert Local.init_config(dir: tmp_dir).fsync == true
+
+    config = Local.init_config(dir: tmp_dir, fsync: false)
+    {:ok, state} = Local.open(config, 0)
+    {batch, bytes} = encode_batch(["unsynced"])
+
+    assert {:ok, state} = Local.commit(state, batch, bytes)
+    assert Enum.to_list(Local.stream(config, 0)) == ["unsynced"]
+    assert :ok = Local.close(state)
+  end
+
+  test "offset tracks the WAL size across commit, truncate, and reopen", %{tmp_dir: tmp_dir} do
+    {_config, state} = open(tmp_dir)
+    assert Local.offset(state) == 0
+
+    {batch, bytes} = encode_batch(["one", "two"])
+    {:ok, state} = Local.commit(state, batch, bytes)
+    assert Local.offset(state) == bytes
+
+    :ok = Local.close(state)
+    {_config, state} = open(tmp_dir)
+    assert Local.offset(state) == bytes
+
+    {:ok, state} = Local.truncate(state)
+    assert Local.offset(state) == 0
+    assert :ok = Local.close(state)
+  end
+
   test "streams entries larger than the read chunk", %{tmp_dir: tmp_dir} do
     {config, state} = open(tmp_dir)
     big = :binary.copy("x", 200_000)

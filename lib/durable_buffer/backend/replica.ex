@@ -2,12 +2,14 @@ defmodule DurableBuffer.Backend.Replica do
   @moduledoc """
   Replicated-disk backend.
 
-  Each group commit is written to the local WAL and, in parallel, shipped over
-  `:erpc` to every node in `replicas:`, where a `DurableBuffer.Replica.Writer`
-  appends and `datasync`s it. Replication overlaps the local write, so with
-  fast replicas a commit costs roughly `max(local fsync, network round trip +
-  replica fsync)` — and group commit amortizes that cost across all concurrent
-  callers.
+  Each group commit is written to the local WAL and then pipelined to every
+  node in `replicas:` over a long-lived per-replica
+  `DurableBuffer.Replica.Sender` channel, where a
+  `DurableBuffer.Replica.Writer` appends it (replicas therefore never hold
+  bytes the primary WAL doesn't). Through the asynchronous commit contract,
+  commits overlap each other: while one batch's acks are still in flight,
+  the next batches are already written locally and on the wire. A slow or
+  dead replica stalls only its own channel, never the commit path.
 
   The `ack:` policy decides when a commit counts as durable (the local write
   is one ack):
@@ -16,15 +18,54 @@ defmodule DurableBuffer.Backend.Replica do
     * `:quorum` — a majority of `1 + length(replicas)`
     * a positive integer — that many acks
 
-  A commit that reaches its ack target returns as soon as the target is met;
-  stragglers finish in the background. Reads (`stream/2`) are served from the
-  local WAL. A failed local write is always an error regardless of policy,
-  since reads depend on the local copy.
+  A commit that reaches its ack target completes as soon as the target is
+  met; stragglers keep replicating in the background. Reads (`stream/2`)
+  are served from the local WAL. A failed local write is always an error
+  regardless of policy, since reads depend on the local copy.
+
+  By default this backend does **not** fsync (`fsync: false`): durability is
+  the ack policy — data is durable because N machines hold it in their page
+  caches and WALs, not because any one disk flushed it. This is the stance
+  RabbitMQ streams take. Correlated power loss across an ack-quorum of
+  nodes can lose acked writes; per-node crashes are already handled by CRC
+  torn-tail recovery. Pass `fsync: true` to `datasync` every commit on the
+  primary and every replica before it is acked, at a significant throughput
+  cost when many partitions share a disk.
+
+  Every batch is stamped with `{epoch, offset}` — the partition's epoch
+  (bumped on truncate, persisted via `DurableBuffer.Epoch`) and the WAL byte
+  offset at which the batch starts. Replica writers append a batch only when
+  it lands exactly at their tail, so a replica that missed a batch or a
+  truncate rejects everything after the gap instead of diverging silently.
+  Rejections, disconnects, and ack stalls all heal the same way: the sender
+  re-attaches, learns the replica's tail, and streams the missing WAL
+  suffix (truncating the replica first when it missed an epoch bump or
+  holds bytes the primary lost) before resuming live traffic — a replica
+  that was down for an hour catches up automatically. Until it does, its
+  acks are missing, which surfaces as `:insufficient_acks` errors when the
+  ack policy needs it. Primary and replica nodes must run the same
+  `:durable_buffer` version, since batches cross nodes with this framing.
+
+  Acks are durability watermarks, not per-batch confirmations: each replica
+  replies with `{epoch, offset}` meaning "everything up to `offset` in
+  `epoch` is on my disk", and the primary keeps the highest watermark seen
+  per member (monotonic, so duplicate or reordered acks are harmless). A
+  batch counts as committed once at least `ack:` members — the primary
+  included — have watermarks at or past the batch's end.
   """
 
   @behaviour DurableBuffer.Backend
 
   alias DurableBuffer.Backend.Local
+  alias DurableBuffer.Epoch
+  alias DurableBuffer.Replica.Sender
+
+  @typedoc """
+  A member's durability watermark: everything up to `offset` in `epoch` is
+  on that member's disk. Watermarks order correctly as plain term
+  comparisons, since the epoch dominates the offset.
+  """
+  @type watermark :: {epoch :: non_neg_integer(), offset :: non_neg_integer()}
 
   @impl DurableBuffer.Backend
   def init_config(opts) do
@@ -36,42 +77,117 @@ defmodule DurableBuffer.Backend.Replica do
       replicas: replicas,
       replica_dir: Keyword.get(opts, :replica_dir, dir),
       needed_acks: needed_acks(Keyword.get(opts, :ack, :all), replicas),
-      rpc_timeout: Keyword.get(opts, :rpc_timeout, 15_000)
+      rpc_timeout: Keyword.get(opts, :rpc_timeout, 15_000),
+      max_sender_bytes: Keyword.get(opts, :max_sender_bytes, 64 * 1024 * 1024),
+      fsync: Keyword.get(opts, :fsync, false)
     }
   end
 
   @impl DurableBuffer.Backend
   def open(config, partition_index) do
     {:ok, local} = Local.open(local_config(config), partition_index)
-    {:ok, %{local: local, config: config, partition_index: partition_index}}
+    epoch = Epoch.load(config.dir, partition_index)
+
+    senders =
+      Map.new(config.replicas, fn node ->
+        {:ok, sender} =
+          Sender.start_link(
+            owner: self(),
+            node: node,
+            dir: config.replica_dir,
+            partition_index: partition_index,
+            primary_dir: config.dir,
+            primary_tail: Local.offset(local),
+            epoch: epoch,
+            rpc_timeout: config.rpc_timeout,
+            max_bytes: config.max_sender_bytes,
+            fsync: config.fsync
+          )
+
+        {node, sender}
+      end)
+
+    {:ok,
+     %{
+       local: local,
+       config: config,
+       partition_index: partition_index,
+       epoch: epoch,
+       watermarks: %{},
+       senders: senders,
+       pending: [],
+       timeout_armed?: false
+     }}
   end
 
   @impl DurableBuffer.Backend
   def commit(state, batch, byte_size) do
+    tag = make_ref()
+
+    case commit_async(state, batch, byte_size, tag) do
+      {:done, :ok, state} -> {:ok, state}
+      {:done, {:error, reason}, state} -> {:error, reason, state}
+      {:pending, state} -> await_commit(state, tag)
+    end
+  end
+
+  @impl DurableBuffer.Backend
+  def commit_async(state, batch, byte_size, tag) do
     config = state.config
     binary = IO.iodata_to_binary(batch)
-
-    tasks =
-      for node <- config.replicas do
-        Task.async(fn ->
-          replicate(node, config.replica_dir, state.partition_index, binary, config.rpc_timeout)
-        end)
-      end
+    epoch = state.epoch
+    offset = Local.offset(state.local)
+    target = {epoch, offset + byte_size}
 
     case Local.commit(state.local, binary, byte_size) do
       {:ok, local} ->
-        acks = 1 + await_acks(tasks, config.needed_acks - 1, config.rpc_timeout)
-        state = %{state | local: local}
+        Enum.each(state.senders, fn {_node, sender} ->
+          Sender.commit(sender, epoch, offset, binary)
+        end)
 
-        if acks >= config.needed_acks do
-          {:ok, state}
+        watermarks = advance(state.watermarks, :local, target)
+        state = %{state | local: local, watermarks: watermarks}
+
+        if durable_count(watermarks, target) >= config.needed_acks do
+          {:done, :ok, state}
         else
-          {:error, {:insufficient_acks, acks, config.needed_acks}, state}
+          deadline = System.monotonic_time(:millisecond) + config.rpc_timeout
+          state = %{state | pending: state.pending ++ [{tag, target, deadline}]}
+          {:pending, arm_timeout(state)}
         end
 
       {:error, reason, local} ->
-        {:error, {:local_commit_failed, reason}, %{state | local: local}}
+        {:done, {:error, {:local_commit_failed, reason}}, %{state | local: local}}
     end
+  end
+
+  @impl DurableBuffer.Backend
+  def handle_message({:watermark, node, watermark}, state) do
+    watermarks = advance(state.watermarks, node, watermark)
+
+    {completed, pending} =
+      Enum.split_while(state.pending, fn {_tag, target, _deadline} ->
+        durable_count(watermarks, target) >= state.config.needed_acks
+      end)
+
+    completions = for {tag, _target, _deadline} <- completed, do: {tag, :ok}
+    {completions, %{state | watermarks: watermarks, pending: pending}}
+  end
+
+  def handle_message(:check_timeouts, state) do
+    now = System.monotonic_time(:millisecond)
+
+    {overdue, pending} =
+      Enum.split_while(state.pending, fn {_tag, _target, deadline} -> deadline <= now end)
+
+    completions =
+      for {tag, target, _deadline} <- overdue do
+        acks = durable_count(state.watermarks, target)
+        {tag, {:error, {:insufficient_acks, acks, state.config.needed_acks}}}
+      end
+
+    state = %{state | pending: pending, timeout_armed?: false}
+    {completions, arm_timeout(state)}
   end
 
   @impl DurableBuffer.Backend
@@ -81,7 +197,11 @@ defmodule DurableBuffer.Backend.Replica do
 
   @impl DurableBuffer.Backend
   def truncate(state) do
+    epoch = state.epoch + 1
+    Epoch.store!(state.config.dir, state.partition_index, epoch)
     {:ok, local} = Local.truncate(state.local)
+
+    Enum.each(state.senders, fn {_node, sender} -> Sender.reset(sender, epoch) end)
 
     for node <- state.config.replicas do
       try do
@@ -89,7 +209,7 @@ defmodule DurableBuffer.Backend.Replica do
           node,
           DurableBuffer.Replica,
           :truncate,
-          [state.config.replica_dir, state.partition_index],
+          [state.config.replica_dir, state.partition_index, epoch],
           state.config.rpc_timeout
         )
       catch
@@ -97,63 +217,50 @@ defmodule DurableBuffer.Backend.Replica do
       end
     end
 
-    {:ok, %{state | local: local}}
+    {:ok, %{state | local: local, epoch: epoch}}
   end
 
   @impl DurableBuffer.Backend
   def close(state) do
+    Enum.each(state.senders, fn {_node, sender} -> Sender.stop(sender) end)
     Local.close(state.local)
   end
 
+  defp await_commit(state, tag) do
+    receive do
+      {:backend, message} ->
+        {completions, state} = handle_message(message, state)
+
+        case List.keyfind(completions, tag, 0) do
+          {^tag, :ok} -> {:ok, state}
+          {^tag, {:error, reason}} -> {:error, reason, state}
+          nil -> await_commit(state, tag)
+        end
+    end
+  end
+
   defp local_config(config) do
-    Local.init_config(dir: config.dir)
+    Local.init_config(dir: config.dir, fsync: config.fsync)
   end
 
   defp needed_acks(:all, replicas), do: 1 + length(replicas)
   defp needed_acks(:quorum, replicas), do: div(1 + length(replicas), 2) + 1
   defp needed_acks(count, _replicas) when is_integer(count) and count > 0, do: count
 
-  defp replicate(node, replica_dir, partition_index, binary, timeout) do
-    :erpc.call(
-      node,
-      DurableBuffer.Replica,
-      :commit,
-      [replica_dir, partition_index, binary],
-      timeout
-    )
-  catch
-    kind, reason -> {:error, {kind, reason}}
+  defp arm_timeout(%{timeout_armed?: true} = state), do: state
+  defp arm_timeout(%{pending: []} = state), do: state
+
+  defp arm_timeout(%{pending: [{_tag, _target, deadline} | _rest]} = state) do
+    delay = max(deadline - System.monotonic_time(:millisecond), 0)
+    Process.send_after(self(), {:backend, :check_timeouts}, delay)
+    %{state | timeout_armed?: true}
   end
 
-  defp await_acks(_tasks, needed, _timeout) when needed <= 0, do: 0
-
-  defp await_acks(tasks, needed, timeout) do
-    refs = Map.new(tasks, fn task -> {task.ref, true} end)
-    deadline = System.monotonic_time(:millisecond) + timeout
-    collect_acks(refs, 0, needed, deadline)
+  defp advance(watermarks, member, watermark) do
+    Map.update(watermarks, member, watermark, &max(&1, watermark))
   end
 
-  defp collect_acks(refs, acked, needed, _deadline)
-       when acked >= needed
-       when map_size(refs) == 0 do
-    acked
+  defp durable_count(watermarks, target) do
+    Enum.count(watermarks, fn {_member, watermark} -> watermark >= target end)
   end
-
-  defp collect_acks(refs, acked, needed, deadline) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    receive do
-      {ref, result} when is_map_key(refs, ref) ->
-        Process.demonitor(ref, [:flush])
-        collect_acks(Map.delete(refs, ref), acked + ack_value(result), needed, deadline)
-
-      {:DOWN, ref, :process, _pid, _reason} when is_map_key(refs, ref) ->
-        collect_acks(Map.delete(refs, ref), acked, needed, deadline)
-    after
-      remaining -> acked
-    end
-  end
-
-  defp ack_value(:ok), do: 1
-  defp ack_value(_result), do: 0
 end

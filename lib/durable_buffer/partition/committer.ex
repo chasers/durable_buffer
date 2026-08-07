@@ -9,12 +9,29 @@ defmodule DurableBuffer.Partition.Committer do
   sync requests are answered after everything cast before them, and truncate
   clears the backend. Traps exits so the backend is closed when the writer
   goes down.
+
+  Backends implementing the asynchronous commit contract
+  (`DurableBuffer.Backend.commit_async/4` + `handle_message/2`) get
+  pipelining: up to `:max_inflight_commits` batches are submitted before
+  their predecessors settle, callers are replied to strictly in submission
+  order, and the writer is credited with `:commit_done` at submission time
+  while the pipeline has capacity — so batch formation overlaps the local
+  write only, not the full replication round trip. Synchronous backends keep
+  the one-commit-at-a-time path unchanged.
+
+  The async path also tracks an exponential moving average of commit
+  completion latency (submission to settle) and tells the writer how much
+  batching would pay via `{:dwell_hint, ms}` messages — 0 below 2 ms, 1 ms
+  from 2 ms, 2 ms from 4 ms — sent only when the recommendation changes.
+  The writer uses the hint as its adaptive flush dwell.
   """
 
   use GenServer
 
-  def start_link(backend, config, partition_index) do
-    GenServer.start_link(__MODULE__, {backend, config, partition_index, self()})
+  alias DurableBuffer.Backend
+
+  def start_link(backend, config, partition_index, opts \\ []) do
+    GenServer.start_link(__MODULE__, {backend, config, partition_index, opts, self()})
   end
 
   @doc """
@@ -39,13 +56,58 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   @impl GenServer
-  def init({backend, config, partition_index, writer}) do
+  def init({backend, config, partition_index, opts, writer}) do
     Process.flag(:trap_exit, true)
     {:ok, backend_state} = backend.open(config, partition_index)
-    {:ok, %{backend: backend, backend_state: backend_state, writer: writer, async_error: nil}}
+
+    {:ok,
+     %{
+       backend: backend,
+       backend_state: backend_state,
+       writer: writer,
+       async_error: nil,
+       async?: Backend.async?(backend),
+       max_inflight: Keyword.get(opts, :max_inflight_commits, 32),
+       pending: :queue.new(),
+       completed: %{},
+       deferred_credits: 0,
+       completion_ewma_ms: 0.0,
+       dwell_hint: 0
+     }}
   end
 
   @impl GenServer
+  def handle_cast({:commit, units, byte_size}, %{async?: true} = state) do
+    batch = for {:entries, _from, entries} <- units, do: entries
+    tag = make_ref()
+
+    state =
+      case state.backend.commit_async(state.backend_state, batch, byte_size, tag) do
+        {:done, result, backend_state} ->
+          %{
+            state
+            | backend_state: backend_state,
+              completed: Map.put(state.completed, tag, result)
+          }
+
+        {:pending, backend_state} ->
+          %{state | backend_state: backend_state}
+      end
+
+    submitted_at = System.monotonic_time(:millisecond)
+    state = %{state | pending: :queue.in({:commit, tag, units, submitted_at}, state.pending)}
+
+    state =
+      if :queue.len(state.pending) <= state.max_inflight do
+        send(state.writer, :commit_done)
+        state
+      else
+        %{state | deferred_credits: state.deferred_credits + 1}
+      end
+
+    {:noreply, flush(state)}
+  end
+
   def handle_cast({:commit, units, byte_size}, state) do
     batch = for {:entries, _from, entries} <- units, do: entries
 
@@ -55,22 +117,18 @@ defmodule DurableBuffer.Partition.Committer do
         {:error, reason, backend_state} -> {{:error, reason}, backend_state}
       end
 
-    state = %{
-      state
-      | backend_state: backend_state,
-        async_error: async_error(reply, units, state.async_error)
-    }
-
-    Enum.each(units, fn
-      {:entries, nil, _entries} -> :ok
-      {:entries, from, _entries} -> GenServer.reply(from, reply)
-      {:sync, _from} -> :ok
-    end)
-
-    state = reply_to_syncs(units, reply, state)
-
+    state = reply_units(%{state | backend_state: backend_state}, units, reply)
     send(state.writer, :commit_done)
     {:noreply, state}
+  end
+
+  def handle_cast({:sync, from}, %{async?: true} = state) do
+    if :queue.is_empty(state.pending) do
+      GenServer.reply(from, sync_reply(:ok, state))
+      {:noreply, %{state | async_error: nil}}
+    else
+      {:noreply, %{state | pending: :queue.in({:sync_mark, from}, state.pending)}}
+    end
   end
 
   def handle_cast({:sync, from}, state) do
@@ -79,12 +137,17 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   def handle_cast({:truncate, from}, state) do
+    state = drain(state)
     {:ok, backend_state} = state.backend.truncate(state.backend_state)
     GenServer.reply(from, :ok)
     {:noreply, %{state | backend_state: backend_state, async_error: nil}}
   end
 
   @impl GenServer
+  def handle_info({:backend, message}, state) do
+    {:noreply, handle_backend_message(state, message)}
+  end
+
   def handle_info({:EXIT, pid, reason}, %{writer: pid} = state) do
     {:stop, reason, state}
   end
@@ -104,6 +167,91 @@ defmodule DurableBuffer.Partition.Committer do
   @impl GenServer
   def terminate(_reason, state) do
     state.backend.close(state.backend_state)
+  end
+
+  defp handle_backend_message(state, message) do
+    {completions, backend_state} =
+      state.backend.handle_message(message, state.backend_state)
+
+    %{
+      state
+      | backend_state: backend_state,
+        completed: Enum.into(completions, state.completed)
+    }
+    |> flush()
+  end
+
+  defp flush(state) do
+    case :queue.peek(state.pending) do
+      {:value, {:commit, tag, units, submitted_at}} ->
+        case Map.pop(state.completed, tag) do
+          {nil, _completed} ->
+            state
+
+          {result, completed} ->
+            {_head, pending} = :queue.out(state.pending)
+
+            %{state | pending: pending, completed: completed}
+            |> observe_completion(submitted_at)
+            |> reply_units(units, result)
+            |> release_credit()
+            |> flush()
+        end
+
+      {:value, {:sync_mark, from}} ->
+        GenServer.reply(from, sync_reply(:ok, state))
+        {_head, pending} = :queue.out(state.pending)
+        flush(%{state | pending: pending, async_error: nil})
+
+      :empty ->
+        state
+    end
+  end
+
+  defp release_credit(%{deferred_credits: 0} = state), do: state
+
+  defp release_credit(state) do
+    send(state.writer, :commit_done)
+    %{state | deferred_credits: state.deferred_credits - 1}
+  end
+
+  defp observe_completion(state, submitted_at) do
+    latency = System.monotonic_time(:millisecond) - submitted_at
+    ewma = state.completion_ewma_ms * 0.8 + latency * 0.2
+
+    hint =
+      cond do
+        ewma >= 4 -> 2
+        ewma >= 2 -> 1
+        true -> 0
+      end
+
+    if hint != state.dwell_hint do
+      send(state.writer, {:dwell_hint, hint})
+    end
+
+    %{state | completion_ewma_ms: ewma, dwell_hint: hint}
+  end
+
+  defp drain(state) do
+    if :queue.is_empty(state.pending) do
+      state
+    else
+      receive do
+        {:backend, message} -> state |> handle_backend_message(message) |> drain()
+      end
+    end
+  end
+
+  defp reply_units(state, units, reply) do
+    Enum.each(units, fn
+      {:entries, nil, _entries} -> :ok
+      {:entries, from, _entries} -> GenServer.reply(from, reply)
+      {:sync, _from} -> :ok
+    end)
+
+    state = %{state | async_error: async_error(reply, units, state.async_error)}
+    reply_to_syncs(units, reply, state)
   end
 
   defp async_error({:error, reason}, units, previous) do

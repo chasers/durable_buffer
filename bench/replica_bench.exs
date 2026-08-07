@@ -30,6 +30,7 @@ base_dir = Path.join(System.tmp_dir!(), "durable_buffer_bench_replica_#{System.o
 primary_dir = Path.join(base_dir, "primary")
 replica_dir = Path.join(base_dir, "replica")
 partitions = String.to_integer(System.get_env("PARTITIONS", "#{System.schedulers_online()}"))
+fsync = System.get_env("FSYNC", "false") == "true"
 
 {:ok, _pid} =
   DurableBuffer.start_link(
@@ -37,12 +38,12 @@ partitions = String.to_integer(System.get_env("PARTITIONS", "#{System.schedulers
     partitions: partitions,
     backend:
       {DurableBuffer.Backend.Replica,
-       dir: primary_dir, replica_dir: replica_dir, replicas: replicas, ack: ack}
+       dir: primary_dir, replica_dir: replica_dir, replicas: replicas, ack: ack, fsync: fsync}
   )
 
 IO.puts(
   "replica backend: replicas=#{inspect(replicas)} ack=#{inspect(ack)} " <>
-    "partitions=#{partitions} dir=#{base_dir}"
+    "partitions=#{partitions} fsync=#{fsync} dir=#{base_dir}"
 )
 
 IO.puts("note: peers run on this host, so this measures protocol overhead, not network RTT")

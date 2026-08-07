@@ -1,0 +1,171 @@
+defmodule DurableBuffer.Replica.SenderTest do
+  use ExUnit.Case, async: true
+
+  alias DurableBuffer.Backend.Local
+  alias DurableBuffer.Replica.Sender
+  alias DurableBuffer.WAL
+
+  @moduletag :tmp_dir
+  @moduletag capture_log: true
+
+  defp dirs(tmp_dir) do
+    {Path.join(tmp_dir, "primary"), Path.join(tmp_dir, "replica")}
+  end
+
+  defp entry(payload) do
+    payload |> WAL.encode() |> elem(0) |> IO.iodata_to_binary()
+  end
+
+  defp open_primary(primary_dir) do
+    {:ok, local} = Local.open(Local.init_config(dir: primary_dir), 0)
+    local
+  end
+
+  defp start_sender(tmp_dir, opts) do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+
+    {:ok, sender} =
+      Sender.start_link(
+        Keyword.merge(
+          [
+            owner: self(),
+            node: node(),
+            dir: replica_dir,
+            partition_index: 0,
+            primary_dir: primary_dir,
+            primary_tail: 0,
+            epoch: 0,
+            rpc_timeout: 500,
+            max_bytes: 64 * 1024 * 1024
+          ],
+          opts
+        )
+      )
+
+    sender
+  end
+
+  defp commit_both(local, sender, binary) do
+    offset = Local.offset(local)
+    {:ok, local} = Local.commit(local, binary, byte_size(binary))
+    :ok = Sender.commit(sender, 0, offset, binary)
+    local
+  end
+
+  defp await_watermark(target) do
+    assert_receive {:backend, {:watermark, _node, watermark}}, 5000
+
+    if watermark < target do
+      await_watermark(target)
+    else
+      assert watermark == target
+    end
+  end
+
+  defp replica_entries(tmp_dir) do
+    {_primary_dir, replica_dir} = dirs(tmp_dir)
+    Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0))
+  end
+
+  test "pipelines batches and forwards watermark acks", %{tmp_dir: tmp_dir} do
+    {primary_dir, _replica_dir} = dirs(tmp_dir)
+    sender = start_sender(tmp_dir, [])
+    local = open_primary(primary_dir)
+
+    local = commit_both(local, sender, entry("one"))
+    local = commit_both(local, sender, entry("two"))
+
+    await_watermark({0, Local.offset(local)})
+    assert replica_entries(tmp_dir) == ["one", "two"]
+    Local.close(local)
+  end
+
+  test "re-sends unacked batches after the writer dies", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+    sender = start_sender(tmp_dir, [])
+    local = open_primary(primary_dir)
+
+    local = commit_both(local, sender, entry("survives"))
+    await_watermark({0, Local.offset(local)})
+
+    writer = DurableBuffer.Replica.writer_pid(replica_dir, 0, true)
+    :ok = GenServer.stop(writer)
+
+    local = commit_both(local, sender, entry("after-crash"))
+
+    await_watermark({0, Local.offset(local)})
+    assert replica_entries(tmp_dir) == ["survives", "after-crash"]
+    Local.close(local)
+  end
+
+  test "resyncs a fresh replica from the primary WAL on attach", %{tmp_dir: tmp_dir} do
+    {primary_dir, _replica_dir} = dirs(tmp_dir)
+    local = open_primary(primary_dir)
+    {:ok, local} = Local.commit(local, entry("old-one"), byte_size(entry("old-one")))
+    {:ok, local} = Local.commit(local, entry("old-two"), byte_size(entry("old-two")))
+    tail = Local.offset(local)
+
+    _sender = start_sender(tmp_dir, primary_tail: tail)
+
+    await_watermark({0, tail})
+    assert replica_entries(tmp_dir) == ["old-one", "old-two"]
+    Local.close(local)
+  end
+
+  test "resyncs after the replica loses its WAL", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+    sender = start_sender(tmp_dir, [])
+    local = open_primary(primary_dir)
+
+    local = commit_both(local, sender, entry("lost"))
+    await_watermark({0, Local.offset(local)})
+
+    writer = DurableBuffer.Replica.writer_pid(replica_dir, 0, true)
+    :ok = GenServer.stop(writer)
+    File.rm!(Path.join(replica_dir, "p0.wal"))
+
+    local = commit_both(local, sender, entry("after-wipe"))
+
+    await_watermark({0, Local.offset(local)})
+    assert replica_entries(tmp_dir) == ["lost", "after-wipe"]
+
+    assert File.read!(Path.join(primary_dir, "p0.wal")) ==
+             File.read!(Path.join(replica_dir, "p0.wal"))
+
+    Local.close(local)
+  end
+
+  test "drops its queue and reattaches when it overflows toward an unreachable node", %{
+    tmp_dir: tmp_dir
+  } do
+    b1 = entry("queued")
+    b2 = entry("overflows")
+    sender = start_sender(tmp_dir, node: :unreachable@nohost, max_bytes: byte_size(b1))
+
+    :ok = Sender.commit(sender, 0, 0, b1)
+    :ok = Sender.commit(sender, 0, byte_size(b1), b2)
+
+    refute_receive {:backend, {:watermark, _node, _watermark}}, 200
+  end
+
+  test "reset adopts the new epoch and clears the queue", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+    sender = start_sender(tmp_dir, [])
+    local = open_primary(primary_dir)
+
+    local = commit_both(local, sender, entry("pre-truncate"))
+    await_watermark({0, Local.offset(local)})
+
+    {:ok, local} = Local.truncate(local)
+    :ok = Sender.reset(sender, 1)
+    :ok = DurableBuffer.Replica.truncate(replica_dir, 0, 1)
+
+    fresh = entry("fresh")
+    {:ok, local} = Local.commit(local, fresh, byte_size(fresh))
+    :ok = Sender.commit(sender, 1, 0, fresh)
+
+    await_watermark({1, byte_size(fresh)})
+    assert replica_entries(tmp_dir) == ["fresh"]
+    Local.close(local)
+  end
+end

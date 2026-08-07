@@ -58,7 +58,8 @@ use more partitions to saturate your disk.
 | `:partitions` | schedulers | Number of parallel partition writers |
 | `:max_batch_bytes` | 8 MiB | Force a flush when a pending batch reaches this size |
 | `:max_batch_entries` | 5000 | Force a flush at this many pending entries |
-| `:flush_delay_ms` | 0 | Dwell time before committing a batch started while idle — lets batches fill at moderate load, trading median latency for throughput (~+50% at 256 B under load with 1 ms on the bench machine) |
+| `:flush_delay_ms` | 0 (adaptive) | Dwell before committing a batch started while idle. Default is adaptive: 0 normally, growing to 2 ms automatically when commit completions are slow (fsync/PUT-bound) and batches are concurrent. An explicit value fixes the dwell |
+| `:max_inflight_commits` | 32 | For backends with pipelined commits (currently `Backend.Replica`): batches committing concurrently per partition; replies stay in order |
 
 ### Tuning for small payloads
 
@@ -71,8 +72,15 @@ exactly when commits carry many of them:
 - **Use fewer partitions.** More partitions help large payloads (parallel
   bandwidth) but split small-payload batches across more fsyncs:
   2 partitions beat 10 by ~2.2× at 256 B in the bench.
-- **Consider `flush_delay_ms: 1`** if median latency matters less than
-  throughput at moderate concurrency.
+- **Leave `flush_delay_ms` at its adaptive default.** The dwell only pays
+  where an expensive durability step dominates each commit (fsync, S3
+  PUT), and the adaptive default detects exactly that: on the fsync-on
+  replicated bench it captured ~90% of the best fixed dwell's throughput
+  (34.6k vs 37.8k ops/s at 256 B × 256 callers, ~5× the no-dwell 7.1k)
+  while keeping single-caller latency 3× lower than the fixed dwell, and
+  with `fsync: false` it stays at zero — a fixed 1 ms dwell there *drops*
+  throughput ~334k → ~123k ops/s and puts a ~2 ms floor under idle
+  appends. Set an explicit value only to force the trade one way.
 
 Commits are pipelined internally (batch formation overlaps the in-flight
 fsync/PUT), so `append_async` and `append_batch` producers keep the disk fed
@@ -91,6 +99,10 @@ Append-only WAL file per partition (`p<index>.wal`), one write + one
 `<<len::32, crc32::32, payload>>`; torn tails from crashes are detected by
 CRC and truncated on open.
 
+`fsync: false` skips the `datasync` — commits then survive a BEAM crash but
+not an OS crash or power loss. Defaults to `true` for this backend: with a
+single copy, the fsync *is* the durability.
+
 ### Replicated
 
 ```elixir
@@ -101,16 +113,54 @@ CRC and truncated on open.
  ack: :quorum}
 ```
 
-Each group commit is written to the local WAL and, in parallel, shipped over
-`:erpc` to every replica node, where it is appended and `datasync`ed by a
-`DurableBuffer.Replica.Writer`. Replica nodes need no configuration beyond
-running the `:durable_buffer` application; writers start on demand, keyed by
-`{replica_dir, partition}`.
+Each group commit is written to the local WAL and, in parallel, pipelined to
+every replica node over a long-lived per-replica channel
+(`DurableBuffer.Replica.Sender`), where it is appended and `datasync`ed by a
+`DurableBuffer.Replica.Writer`. Commits overlap: up to
+`:max_inflight_commits` batches are replicating concurrently per partition
+(callers still get replies in order), and the replica writer group-commits
+whatever has queued on its channel into a single write + fsync — so a slow
+or dead replica stalls only its own channel, never the commit path. Replica
+nodes need no configuration beyond running the `:durable_buffer`
+application; writers start on demand, keyed by `{replica_dir, partition}`.
 
 `ack:` controls when a commit counts as durable (the local write is one ack):
 `:all` (default), `:quorum` (majority of `1 + length(replicas)`), or an
 integer. Commits return as soon as the ack target is met; reads are served
 from the local WAL.
+
+Every batch is stamped with `{epoch, offset}` — a per-partition epoch that
+increments on truncate (persisted in a `p<index>.meta` sidecar file) and the
+WAL byte offset where the batch starts. A replica appends a batch only when
+it lands exactly at its own WAL tail, so it can never diverge silently, and
+every failure heals the same way: the sender re-attaches, compares tails,
+and streams the replica the missing suffix of the primary's WAL before
+resuming live traffic (truncating the replica first if it missed a truncate
+or holds bytes the primary lost). A replica that was down for an hour — or
+that lost its disk entirely — catches up automatically; until it has, its
+missing acks surface as `:insufficient_acks` errors whenever the ack policy
+needs it. Primary and replica nodes must run the same `:durable_buffer`
+version.
+
+Acks are durability watermarks rather than per-batch confirmations: a
+replica replies "durable through `{epoch, offset}`", the primary keeps the
+highest watermark seen per member, and a batch is committed once `ack:`
+members (the primary included) have watermarks at or past its end — the
+same commit rule RabbitMQ's quorum queues use, generalized to the
+configurable ack policy.
+
+**Durability model:** by default the replicated backend does *not* fsync
+(`fsync: false`) — durability is the ack policy itself, data held on N
+machines, the same stance RabbitMQ streams take. Per-node crashes are
+handled by CRC torn-tail recovery; the trade-off is that correlated power
+loss across an ack-quorum of nodes can lose acked writes. Pass
+`fsync: true` to `datasync` on the primary and on every replica before its
+ack. Fsyncing per commit costs throughput when many partitions share a
+disk, so the adaptive flush dwell (see `flush_delay_ms`) kicks in
+automatically under exactly that pressure — with it, `fsync: true`
+measures ~35k ops/s at 256 B × 256 callers on the bench machine, ~1.7×
+the old always-fsync engine, without taxing idle latency. `FSYNC=true`
+toggles it in `replica_bench.exs`.
 
 ### S3
 
@@ -138,9 +188,12 @@ round trip.
 On a MacBook Pro (M1 Max, internal SSD), the local backend sustains
 **~2 GB/s of fsync-durable appends** (64 KB payloads, 256 concurrent
 callers, 10 partitions), and `append_batch` keeps even 256 B payloads
-disk-bandwidth-bound at **4.9M entries/s**. Full results for all three
-backends — including batch and mixed append + stream workloads, caller
-latency distributions, and small-payload tuning — are in
+disk-bandwidth-bound at **4.9M entries/s**. The replicated backend
+(2 replica nodes, `ack: :all`, default `fsync: false`) sustains
+**~1.4 GB/s / 197k appends/s** of quorum-acked writes with a ~105 µs
+single-caller median. Full results for
+all three backends — including batch and mixed append + stream workloads,
+caller latency distributions, and small-payload tuning — are in
 [`bench/README.md`](bench/README.md).
 
 Each script prints an aggregate **throughput** grid (ops/s and MB/s over a
@@ -151,7 +204,7 @@ while writers append), and Benchee **caller latency** distributions
 
 ```sh
 mix run bench/local_bench.exs                       # PARTITIONS=N
-mix run bench/replica_bench.exs                     # REPLICAS=2 ACK=all|quorum|N PARTITIONS=N
+mix run bench/replica_bench.exs                     # REPLICAS=2 ACK=all|quorum|N PARTITIONS=N FSYNC=true|false
 mix run bench/s3_bench.exs                          # fake S3, S3_SIM_LATENCY_MS=30
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs # real S3 (AWS_* env vars)
 ```
