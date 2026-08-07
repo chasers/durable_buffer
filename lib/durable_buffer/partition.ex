@@ -83,7 +83,14 @@ defmodule DurableBuffer.Partition do
   def init(opts) do
     {backend, config} = Keyword.fetch!(opts, :backend)
     partition_index = Keyword.fetch!(opts, :partition_index)
-    {:ok, committer} = Committer.start_link(backend, config, partition_index)
+
+    {:ok, committer} =
+      Committer.start_link(
+        backend,
+        config,
+        partition_index,
+        Keyword.take(opts, [:max_inflight_commits])
+      )
 
     {:ok,
      %{

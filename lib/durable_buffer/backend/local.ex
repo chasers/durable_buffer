@@ -6,6 +6,12 @@ defmodule DurableBuffer.Backend.Local do
   A group commit is one `:file.write/2` of the whole batch followed by one
   `:file.datasync/1`, so the fsync cost is shared by every entry in the batch.
   Torn tails are truncated on open.
+
+  `fsync: false` skips the `datasync`, making a commit durable only to the
+  page cache — data survives a BEAM crash but not an OS crash or power
+  loss. The default is `true` here; `DurableBuffer.Backend.Replica` opens
+  its WALs with the buffer's `fsync:` setting, which defaults to `false`
+  there because replication is the durability mechanism.
   """
 
   @behaviour DurableBuffer.Backend
@@ -16,31 +22,49 @@ defmodule DurableBuffer.Backend.Local do
 
   @impl DurableBuffer.Backend
   def init_config(opts) do
-    %{dir: Keyword.fetch!(opts, :dir)}
+    %{dir: Keyword.fetch!(opts, :dir), fsync: Keyword.get(opts, :fsync, true)}
   end
 
   @impl DurableBuffer.Backend
   def open(config, partition_index) do
-    path = wal_path(config, partition_index)
+    path = wal_path(config.dir, partition_index)
     File.mkdir_p!(Path.dirname(path))
-    WAL.recover!(path)
+    offset = WAL.recover!(path)
     {:ok, fd} = :file.open(path, [:append, :raw, :binary])
-    {:ok, %{fd: fd, path: path}}
+    {:ok, %{fd: fd, path: path, offset: offset, fsync: config.fsync}}
   end
 
   @impl DurableBuffer.Backend
-  def commit(state, batch, _byte_size) do
+  def commit(state, batch, byte_size) do
     with :ok <- :file.write(state.fd, batch),
-         :ok <- :file.datasync(state.fd) do
-      {:ok, state}
+         :ok <- sync(state) do
+      {:ok, %{state | offset: state.offset + byte_size}}
     else
       {:error, reason} -> {:error, reason, state}
     end
   end
 
+  defp sync(%{fsync: false}), do: :ok
+  defp sync(state), do: :file.datasync(state.fd)
+
+  @doc """
+  Byte offset at which the next commit will be appended — the current WAL
+  size.
+  """
+  @spec offset(map()) :: non_neg_integer()
+  def offset(state), do: state.offset
+
+  @doc """
+  Path of the WAL file for `partition_index` under `dir`.
+  """
+  @spec wal_path(Path.t(), non_neg_integer()) :: Path.t()
+  def wal_path(dir, partition_index) when is_binary(dir) do
+    Path.join(dir, "p#{partition_index}.wal")
+  end
+
   @impl DurableBuffer.Backend
   def stream(config, partition_index) do
-    path = wal_path(config, partition_index)
+    path = wal_path(config.dir, partition_index)
     stream_file(path)
   end
 
@@ -49,7 +73,7 @@ defmodule DurableBuffer.Backend.Local do
     :ok = :file.close(state.fd)
     :ok = File.rm(state.path)
     {:ok, fd} = :file.open(state.path, [:append, :raw, :binary])
-    {:ok, %{state | fd: fd}}
+    {:ok, %{state | fd: fd, offset: 0}}
   end
 
   @impl DurableBuffer.Backend
@@ -88,9 +112,5 @@ defmodule DurableBuffer.Backend.Local do
         {fd, _buffer} -> :file.close(fd)
       end
     )
-  end
-
-  defp wal_path(config, partition_index) do
-    Path.join(config.dir, "p#{partition_index}.wal")
   end
 end

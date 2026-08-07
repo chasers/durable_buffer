@@ -50,6 +50,10 @@ defmodule DurableBuffer do
       while the partition was idle, default 0 (commit as soon as possible).
       A small delay lets batches fill at moderate load, trading median
       latency for throughput; size caps and `sync/3` still flush immediately
+    * `:max_inflight_commits` — for backends that support pipelined commits
+      (currently `DurableBuffer.Backend.Replica`), how many batches may be
+      committing concurrently per partition, default 32. Callers are always
+      replied to in order
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do

@@ -108,44 +108,64 @@ parallel      average     median     99th %
 ## Replica (2 replica nodes, ack :all, 10 partitions)
 
 Real `:peer` nodes over Erlang distribution on the same host, so this
-measures protocol overhead (serialize + ship + remote fsync + ack), not
-network RTT. Every batch is durable on all three copies before the caller
-returns. Commit pipelining overlaps the replication round trip with
-building the next batch — 64 KB × 256 went from ~514 to ~832 MB/s.
+measures protocol overhead (serialize + ship + remote group commit + ack),
+not network RTT. Every batch is acked by all three copies before the
+caller returns. Batches are pipelined over a long-lived channel per
+replica (`max_inflight_commits`, default 32), and each replica
+group-commits whatever has queued on its channel.
+
+With the default `fsync: false` (durability = the ack quorum, RabbitMQ
+streams' stance):
 
 ```
 payload   callers         ops/s      MB/s
-256B      1                1.2k       0.3
-256B      8                2.1k       0.5
-256B      64               6.2k       1.5
-256B      256             24.6k       6.0
-4KB       1                1.1k       4.4
-4KB       8                2.0k       7.9
-4KB       64               6.1k      24.0
-4KB       256             23.7k      92.7
-64KB      1                1.1k      71.2
-64KB      8                1.9k     116.4
-64KB      64               5.1k     316.6
-64KB      256             13.3k     832.1
+256B      1                8.0k       2.0
+256B      8               24.3k       5.9
+256B      64              70.5k      17.2
+256B      256            197.0k      48.1
+4KB       1                7.2k      28.0
+4KB       8               20.2k      79.0
+4KB       64              24.0k      93.9
+4KB       256            118.5k     462.9
+64KB      1                5.1k     321.6
+64KB      8               14.6k     913.5
+64KB      64              21.9k    1367.7
+64KB      256              5.0k     310.0
 ```
 
-Mixed append + stream (4 KB payload; reads served from the primary's WAL):
+(The 64 KB × 256 cell is disk-noise-sensitive: it ranged 5–17k ops/s
+(0.3–1.1 GB/s) across runs of the same build as the SSD heated up; the
+64-caller row's ~1.4 GB/s is representative of the sustained ceiling.)
+
+With `FSYNC=true` (datasync on the primary and both replicas before ack —
+one shared SSD serving 30 fsyncing writers, so this is the pessimal
+configuration for it):
+
+```
+payload   callers         ops/s      MB/s
+256B      256             11.5k       2.8
+4KB       256             11.9k      46.4
+64KB      256              7.6k     474.1
+```
+
+Mixed append + stream (4 KB payload, `fsync: false`; reads served from the
+primary's WAL):
 
 ```
 writers  readers       w ops/s    w MB/s   r entries/s    r MB/s
-1        1                1.2k       4.6        551.9k    2155.9
-8        8                1.9k       7.4        914.6k    3572.8
-64       8                4.5k      17.4        336.5k    1314.4
-256      8               21.6k      84.2        424.3k    1657.4
+1        1                5.7k      22.4        406.9k    1589.4
+8        8               13.2k      51.5         1.46M    5703.9
+64       8               48.7k     190.2        961.6k    3756.1
+256      8              119.7k     467.7        757.6k    2959.5
 ```
 
-Caller latency (4 KB payload):
+Caller latency (4 KB payload, `fsync: false`):
 
 ```
 parallel      average     median     99th %
-1           666.04 μs  602.10 μs    2.21 ms
-16            5.51 ms    5.47 ms   12.03 ms
-128          11.85 ms   10.72 ms   34.61 ms
+1           116.44 μs  104.71 μs  231.79 μs
+16          423.67 μs  376.42 μs    1.12 ms
+128           1.13 ms    1.01 ms    2.97 ms
 ```
 
 ## S3 (in-memory fake, 30 ms simulated PUT latency, 4 partitions)
