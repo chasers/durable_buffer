@@ -143,6 +143,33 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     assert :ok = Replica.close(state)
   end
 
+  test "pipelined fsync: true commits stay ordered and converge", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+    name = :"fsync_pipeline_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {DurableBuffer,
+       name: name,
+       partitions: 1,
+       max_inflight_commits: 8,
+       backend:
+         {DurableBuffer.Backend.Replica,
+          dir: primary_dir, replica_dir: replica_dir, replicas: [node()], fsync: true}}
+    )
+
+    for index <- 1..100 do
+      DurableBuffer.append_async(name, :key, "synced-#{index}")
+    end
+
+    assert :ok = DurableBuffer.sync(name, :key)
+
+    expected = Enum.map(1..100, &"synced-#{&1}")
+    assert Enum.to_list(DurableBuffer.stream(name, :key)) == expected
+
+    assert File.read!(Path.join(primary_dir, "p0.wal")) ==
+             File.read!(Path.join(replica_dir, "p0.wal"))
+  end
+
   test "commit records durability watermarks per member", %{tmp_dir: tmp_dir} do
     {primary_dir, replica_dir} = dirs(tmp_dir)
 

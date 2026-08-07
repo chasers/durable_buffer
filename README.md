@@ -154,8 +154,12 @@ machines, the same stance RabbitMQ streams take. Per-node crashes are
 handled by CRC torn-tail recovery; the trade-off is that correlated power
 loss across an ack-quorum of nodes can lose acked writes. Pass
 `fsync: true` to `datasync` on the primary and on every replica before its
-ack, at a large throughput cost when many partitions share a disk (see the
-benchmarks). `FSYNC=true` toggles it in `replica_bench.exs`.
+ack. Fsyncing per commit costs throughput when many partitions share a
+disk; pair it with `flush_delay_ms: 1` when throughput-bound at high
+concurrency — on the bench machine that combination beats the old
+always-fsync engine (~22k vs ~20k ops/s at 256 B × 256 callers) at the
+cost of a ~1 ms latency floor and much lower throughput at low caller
+counts. `FSYNC=true` toggles it in `replica_bench.exs`.
 
 ### S3
 
