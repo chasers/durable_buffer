@@ -58,7 +58,7 @@ use more partitions to saturate your disk.
 | `:partitions` | schedulers | Number of parallel partition writers |
 | `:max_batch_bytes` | 8 MiB | Force a flush when a pending batch reaches this size |
 | `:max_batch_entries` | 5000 | Force a flush at this many pending entries |
-| `:flush_delay_ms` | 0 | Dwell time before committing a batch started while idle — lets batches fill at moderate load, trading median latency for throughput (~+50% at 256 B under load with 1 ms on the bench machine) |
+| `:flush_delay_ms` | 0 (adaptive) | Dwell before committing a batch started while idle. Default is adaptive: 0 normally, growing to 2 ms automatically when commit completions are slow (fsync/PUT-bound) and batches are concurrent. An explicit value fixes the dwell |
 | `:max_inflight_commits` | 32 | For backends with pipelined commits (currently `Backend.Replica`): batches committing concurrently per partition; replies stay in order |
 
 ### Tuning for small payloads
@@ -72,14 +72,15 @@ exactly when commits carry many of them:
 - **Use fewer partitions.** More partitions help large payloads (parallel
   bandwidth) but split small-payload batches across more fsyncs:
   2 partitions beat 10 by ~2.2× at 256 B in the bench.
-- **Consider `flush_delay_ms: 1`** if median latency matters less than
-  throughput at moderate concurrency — but only where an expensive
-  durability step dominates each commit (fsyncing backends, S3, or the
-  replicated backend with `fsync: true`, where it recovered ~57k → ~75k
-  ops/s at 256 B × 256 callers). With the replicated backend's default
-  `fsync: false`, commits are cheap and the dwell only starves them: the
-  same workload *dropped* ~334k → ~123k ops/s with a 1 ms dwell. Leave it
-  at 0 there.
+- **Leave `flush_delay_ms` at its adaptive default.** The dwell only pays
+  where an expensive durability step dominates each commit (fsync, S3
+  PUT), and the adaptive default detects exactly that: on the fsync-on
+  replicated bench it captured ~90% of the best fixed dwell's throughput
+  (34.6k vs 37.8k ops/s at 256 B × 256 callers, ~5× the no-dwell 7.1k)
+  while keeping single-caller latency 3× lower than the fixed dwell, and
+  with `fsync: false` it stays at zero — a fixed 1 ms dwell there *drops*
+  throughput ~334k → ~123k ops/s and puts a ~2 ms floor under idle
+  appends. Set an explicit value only to force the trade one way.
 
 Commits are pipelined internally (batch formation overlaps the in-flight
 fsync/PUT), so `append_async` and `append_batch` producers keep the disk fed
@@ -155,11 +156,11 @@ handled by CRC torn-tail recovery; the trade-off is that correlated power
 loss across an ack-quorum of nodes can lose acked writes. Pass
 `fsync: true` to `datasync` on the primary and on every replica before its
 ack. Fsyncing per commit costs throughput when many partitions share a
-disk; pair it with `flush_delay_ms: 1` when throughput-bound at high
-concurrency — on the bench machine that combination beats the old
-always-fsync engine (~22k vs ~20k ops/s at 256 B × 256 callers) at the
-cost of a ~1 ms latency floor and much lower throughput at low caller
-counts. `FSYNC=true` toggles it in `replica_bench.exs`.
+disk, so the adaptive flush dwell (see `flush_delay_ms`) kicks in
+automatically under exactly that pressure — with it, `fsync: true`
+measures ~35k ops/s at 256 B × 256 callers on the bench machine, ~1.7×
+the old always-fsync engine, without taxing idle latency. `FSYNC=true`
+toggles it in `replica_bench.exs`.
 
 ### S3
 

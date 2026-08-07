@@ -15,6 +15,15 @@ defmodule DurableBuffer.Partition do
   latency (plus `flush_delay_ms`, if configured, which lets batches fill at
   moderate load). `max_batch_bytes` / `max_batch_entries` force an immediate
   handoff under heavy load.
+
+  With the default `flush_delay_ms: 0` the dwell is adaptive: the committer
+  reports how long commits are taking to complete via `{:dwell_hint, ms}`
+  messages, and a batch that starts while the partition is idle waits that
+  long (0–2 ms) before handoff — but only when the previous batch was
+  concurrent (≥ 2 entries), so a lone caller never pays it. This grows
+  batches exactly when an expensive durability step (fsync, S3 PUT) is the
+  bottleneck and stays at zero otherwise. An explicit `flush_delay_ms`
+  fixes the dwell instead.
   """
 
   use GenServer
@@ -102,7 +111,9 @@ defmodule DurableBuffer.Partition do
        flush_scheduled?: false,
        max_batch_bytes: Keyword.get(opts, :max_batch_bytes, 8 * 1024 * 1024),
        max_batch_entries: Keyword.get(opts, :max_batch_entries, 5000),
-       flush_delay_ms: Keyword.get(opts, :flush_delay_ms, 0)
+       flush_delay_ms: Keyword.get(opts, :flush_delay_ms, 0),
+       hinted_dwell_ms: 0,
+       last_batch_count: 0
      }}
   end
 
@@ -160,6 +171,10 @@ defmodule DurableBuffer.Partition do
     end
   end
 
+  def handle_info({:dwell_hint, dwell_ms}, state) do
+    {:noreply, %{state | hinted_dwell_ms: dwell_ms}}
+  end
+
   def handle_info(_message, state) do
     {:noreply, state}
   end
@@ -209,15 +224,21 @@ defmodule DurableBuffer.Partition do
       | pending: [],
         pending_bytes: 0,
         pending_count: 0,
+        last_batch_count: state.pending_count,
         in_flight: state.in_flight + 1
     }
   end
 
-  defp schedule_flush(%{flush_delay_ms: 0}) do
-    send(self(), :flush)
+  defp schedule_flush(state) do
+    case flush_delay(state) do
+      0 -> send(self(), :flush)
+      delay -> Process.send_after(self(), :flush, delay)
+    end
   end
 
-  defp schedule_flush(state) do
-    Process.send_after(self(), :flush, state.flush_delay_ms)
+  defp flush_delay(%{flush_delay_ms: 0} = state) do
+    if state.last_batch_count > 1, do: state.hinted_dwell_ms, else: 0
   end
+
+  defp flush_delay(state), do: state.flush_delay_ms
 end

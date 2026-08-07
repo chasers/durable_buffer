@@ -18,6 +18,12 @@ defmodule DurableBuffer.Partition.Committer do
   while the pipeline has capacity — so batch formation overlaps the local
   write only, not the full replication round trip. Synchronous backends keep
   the one-commit-at-a-time path unchanged.
+
+  The async path also tracks an exponential moving average of commit
+  completion latency (submission to settle) and tells the writer how much
+  batching would pay via `{:dwell_hint, ms}` messages — 0 below 2 ms, 1 ms
+  from 2 ms, 2 ms from 4 ms — sent only when the recommendation changes.
+  The writer uses the hint as its adaptive flush dwell.
   """
 
   use GenServer
@@ -64,7 +70,9 @@ defmodule DurableBuffer.Partition.Committer do
        max_inflight: Keyword.get(opts, :max_inflight_commits, 32),
        pending: :queue.new(),
        completed: %{},
-       deferred_credits: 0
+       deferred_credits: 0,
+       completion_ewma_ms: 0.0,
+       dwell_hint: 0
      }}
   end
 
@@ -86,7 +94,8 @@ defmodule DurableBuffer.Partition.Committer do
           %{state | backend_state: backend_state}
       end
 
-    state = %{state | pending: :queue.in({:commit, tag, units}, state.pending)}
+    submitted_at = System.monotonic_time(:millisecond)
+    state = %{state | pending: :queue.in({:commit, tag, units, submitted_at}, state.pending)}
 
     state =
       if :queue.len(state.pending) <= state.max_inflight do
@@ -174,7 +183,7 @@ defmodule DurableBuffer.Partition.Committer do
 
   defp flush(state) do
     case :queue.peek(state.pending) do
-      {:value, {:commit, tag, units}} ->
+      {:value, {:commit, tag, units, submitted_at}} ->
         case Map.pop(state.completed, tag) do
           {nil, _completed} ->
             state
@@ -183,6 +192,7 @@ defmodule DurableBuffer.Partition.Committer do
             {_head, pending} = :queue.out(state.pending)
 
             %{state | pending: pending, completed: completed}
+            |> observe_completion(submitted_at)
             |> reply_units(units, result)
             |> release_credit()
             |> flush()
@@ -203,6 +213,24 @@ defmodule DurableBuffer.Partition.Committer do
   defp release_credit(state) do
     send(state.writer, :commit_done)
     %{state | deferred_credits: state.deferred_credits - 1}
+  end
+
+  defp observe_completion(state, submitted_at) do
+    latency = System.monotonic_time(:millisecond) - submitted_at
+    ewma = state.completion_ewma_ms * 0.8 + latency * 0.2
+
+    hint =
+      cond do
+        ewma >= 4 -> 2
+        ewma >= 2 -> 1
+        true -> 0
+      end
+
+    if hint != state.dwell_hint do
+      send(state.writer, {:dwell_hint, hint})
+    end
+
+    %{state | completion_ewma_ms: ewma, dwell_hint: hint}
   end
 
   defp drain(state) do
