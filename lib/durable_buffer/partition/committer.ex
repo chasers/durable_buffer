@@ -233,33 +233,34 @@ defmodule DurableBuffer.Partition.Committer do
             {:error, reason, backend_state} -> {{:error, reason}, backend_state}
           end
 
+        state =
+          publish_offset(%{
+            state
+            | backend_state: backend_state,
+              base_offset: seed_base_offset(state.backend, backend_state)
+          })
+
         GenServer.reply(from, reply)
-
-        state = %{
-          state
-          | backend_state: backend_state,
-            base_offset: seed_base_offset(state.backend, backend_state)
-        }
-
-        {:noreply, publish_offset(state)}
+        {:noreply, state}
     end
   end
 
   def handle_cast({:truncate, from}, state) do
     state = drain(state)
     {:ok, backend_state} = state.backend.truncate(state.backend_state, state.next_offset)
+
+    state =
+      publish_offset(%{
+        state
+        | backend_state: backend_state,
+          async_error: nil,
+          next_offset: seed_next_offset(state.backend, backend_state),
+          durable_logical: seed_next_offset(state.backend, backend_state),
+          base_offset: seed_base_offset(state.backend, backend_state)
+      })
+
     GenServer.reply(from, :ok)
-
-    state = %{
-      state
-      | backend_state: backend_state,
-        async_error: nil,
-        next_offset: seed_next_offset(state.backend, backend_state),
-        durable_logical: seed_next_offset(state.backend, backend_state),
-        base_offset: seed_base_offset(state.backend, backend_state)
-    }
-
-    {:noreply, publish_offset(state)}
+    {:noreply, state}
   end
 
   @impl GenServer
