@@ -528,14 +528,22 @@ other.
 
 **When it is worth it.** `bench/transport_bench.exs` puts an unrelated load
 on the distribution channel between the same pair and measures both
-transports. Throughput does not separate them. Caller latency does: under
-contention distribution's p50 rises about 12x and its p99 about 5x, while
-gen_rpc stays near its idle numbers. See [bench/README.md](bench/README.md).
+transports. Idle, the two are indistinguishable. Under contention every
+column separates, in the same direction across three runs:
 
-That is head-of-line blocking doing what it does — it delays individual
-commits behind other traffic rather than reducing aggregate bytes. Reach for
-gen_rpc when the node pair carries anything besides replication and you care
-about append latency, or when a delayed cluster heartbeat would be costly.
+| | distribution | gen_rpc |
+|---|---|---|
+| throughput | falls ~2.5x | holds most of it |
+| p50 latency | rises 7-9x | rises ~1.3x |
+| p99 latency | rises 4.5-7x | rises 1.1-1.7x |
+
+See [bench/README.md](bench/README.md) for the numbers.
+
+Reach for gen_rpc when the node pair carries anything besides replication —
+that is when distribution gives up most of its throughput and roughly an
+order of magnitude of median latency. The heartbeat argument stands on its
+own: a starved heartbeat reads as a node going down.
+
 Stay on distribution when the pair is quiet, or when the extra port, the
 separate TLS configuration and the git dependency are not worth it.
 

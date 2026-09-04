@@ -20,8 +20,9 @@ defmodule DurableBuffer.TransportBench do
   @payload_bytes 64 * 1024
   @throughput_callers 64
   @latency_callers 8
-  @latency_samples 2000
+  @latency_samples 8000
   @hog_bytes 4 * 1024 * 1024
+  @hog_error_backoff_ms 100
 
   def run(replica_node, transports, hog_counts) do
     for {label, transport} <- transports, hogs <- hog_counts do
@@ -36,7 +37,7 @@ defmodule DurableBuffer.TransportBench do
     {:ok, pid} =
       DurableBuffer.start_link(
         name: name,
-        partitions: 8,
+        partitions: partitions(),
         backend:
           {DurableBuffer.Backend.Replica,
            dir: Path.join(base_dir, "primary"),
@@ -48,16 +49,61 @@ defmodule DurableBuffer.TransportBench do
     hog_pids = start_hogs(replica_node, hogs)
 
     throughput =
-      DurableBuffer.Bench.measure(name, @payload_bytes, @throughput_callers, 1000, 5000)
+      DurableBuffer.Bench.measure(
+        name,
+        @payload_bytes,
+        @throughput_callers,
+        warmup_ms(),
+        duration_ms()
+      )
 
     DurableBuffer.truncate_all(name)
     latency = latency(name)
 
-    Enum.each(hog_pids, &Process.exit(&1, :kill))
+    stop_hogs(hog_pids)
     Supervisor.stop(pid)
-    File.rm_rf!(base_dir)
+    stop_replica_writers(replica_node, Path.join(base_dir, "replica"))
+    _ = File.rm_rf(base_dir)
 
     report(label, hogs, throughput, latency)
+  end
+
+  defp warmup_ms do
+    String.to_integer(System.get_env("BENCH_WARMUP_MS", "1000"))
+  end
+
+  defp duration_ms do
+    String.to_integer(System.get_env("BENCH_DURATION_MS", "5000"))
+  end
+
+  defp partitions do
+    String.to_integer(System.get_env("PARTITIONS", "8"))
+  end
+
+  defp stop_hogs(pids) do
+    refs = for pid <- pids, do: {pid, Process.monitor(pid)}
+    Enum.each(pids, &Process.exit(&1, :kill))
+
+    for {_pid, ref} <- refs do
+      receive do
+        {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+      after
+        5000 -> :ok
+      end
+    end
+  end
+
+  defp stop_replica_writers(replica_node, replica_dir) do
+    for partition_index <- 0..(partitions() - 1) do
+      key = {:replica_writer, replica_dir, partition_index}
+
+      case :erpc.call(replica_node, Registry, :lookup, [DurableBuffer.Registry, key], 30_000) do
+        [{pid, _value}] -> :erpc.call(replica_node, GenServer, :stop, [pid], 30_000)
+        [] -> :ok
+      end
+    end
+
+    :ok
   end
 
   defp start_hogs(_replica_node, 0), do: []
@@ -71,10 +117,17 @@ defmodule DurableBuffer.TransportBench do
   end
 
   defp hog_loop(replica_node, payload) do
-    _ = :erpc.call(replica_node, :erlang, :byte_size, [payload], 30_000)
+    ok? =
+      try do
+        _ = :erpc.call(replica_node, :erlang, :byte_size, [payload], 30_000)
+        true
+      catch
+        _kind, _reason -> false
+      end
+
+    unless ok?, do: Process.sleep(@hog_error_backoff_ms)
+
     hog_loop(replica_node, payload)
-  catch
-    _kind, _reason -> hog_loop(replica_node, payload)
   end
 
   defp latency(name) do
@@ -100,12 +153,13 @@ defmodule DurableBuffer.TransportBench do
   end
 
   defp percentile(sorted, fraction) do
-    index = min(round(fraction * length(sorted)), length(sorted) - 1)
+    count = length(sorted)
+    index = min(max(ceil(fraction * count) - 1, 0), count - 1)
     Enum.at(sorted, index)
   end
 
   def header do
-    IO.puts("\n== Replication transport: 64 KiB payload, 8 partitions ==")
+    IO.puts("\n== Replication transport: 64 KiB payload, #{partitions()} partitions ==")
     IO.puts("(hogs ship 4 MiB :erpc payloads to the replica node, unrelated to replication)")
 
     IO.puts(
