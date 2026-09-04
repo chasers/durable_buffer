@@ -171,11 +171,38 @@ ack from counting, because an epoch-0 watermark can never satisfy an epoch-1
 target. So this cannot cause a false ack or permanent divergence.
 
 It does mean a replica is **not safe to promote** until its sender has
-re-attached after a truncate. See the promotion runbook in the README.
+re-attached after a truncate.
 
-Detaching the sender on truncate does not fix it — TLC rejected that. The
-stale batch is delivered before the sender ever re-attaches. Any real fix has
-to retry the `:erpc` truncate until the replica adopts the new epoch.
+Detaching the sender on truncate does not close the window — TLC rejected
+that. The stale batch is delivered before the sender ever re-attaches, so
+nothing that acts at attach time is early enough. The window cannot be
+closed from the replica side either: the writer has no way to learn a
+truncate happened, because the message that would tell it is the one that
+failed.
+
+**Handled, not closed.** The primary now tracks which epoch each replica has
+confirmed, and reports it:
+
+- `truncate/1` records every replica its `:erpc` reached, and logs a warning
+  for each one it did not. It no longer swallows the failure.
+- `Sender.reset/2` re-attaches immediately instead of staying attached with a
+  new epoch. The sender then compares epochs, truncates the replica itself,
+  and keeps retrying on its reconnect timer until the replica confirms. An
+  idle partition converges too; before, it waited for the next commit to be
+  rejected.
+- `DurableBuffer.replica_status/3` exposes `adopted_epoch` and
+  `promotable?`, and `await_replicas/3` blocks until every replica is on the
+  primary's epoch.
+
+Config `Replication_adopt` checks the two properties that make that report
+trustworthy: `AdoptedIsHonest` (the primary never claims an epoch a replica
+has not persisted) and `PromotableIsClean` (a replica reported promotable
+holds no pre-truncate data). Both PASS. Marking every replica adopted
+regardless of whether the `:erpc` reached it turns `AdoptedIsHonest` red, so
+the check has teeth.
+
+`Replication_staletruncate` stays VIOLATED. The divergence window is real and
+still there; what changed is that the primary now knows about it.
 
 ### F-4 — reads are not gated on the ack policy
 
@@ -199,6 +226,10 @@ Planned fix: `.plans/2026-09-03_02_ack-durable-reads.md`.
 - A heal from two replicas at different tails. The model picks the furthest,
   but every config runs one replica through the crash path.
 - More than one truncate, and more than one primary crash, per behavior.
+- Liveness. Every config checks a state invariant. `Spec` has no fairness, so
+  "every replica *eventually* adopts the epoch" is not checked — only that
+  the primary never claims one that has not. Adding `WF_vars` to the healing
+  actions is the follow-up.
 - The WAL frame layer: CRC torn-tail recovery in `DurableBuffer.WAL`.
 - Group-commit batching and the adaptive flush dwell in
   `DurableBuffer.Partition.Committer`.

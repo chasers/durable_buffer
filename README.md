@@ -180,10 +180,18 @@ token. If you need automatic failover, put it above this library.
    `p<index>.wal` file sizes under `replica_dir` on each node and take the
    largest, per partition. Note that a primary which merely *restarts* does
    not need this: it heals itself from the followers at open.
-3. **Wait out a recent truncate.** A truncate whose `:erpc` to a follower
-   failed leaves that follower holding pre-truncate data until its sender
-   re-attaches. Do not promote inside that window. See F-3 in
-   [`tla/FINDINGS.md`](tla/FINDINGS.md).
+3. **Check that the follower adopted the current epoch.** A truncate whose
+   `:erpc` to a follower failed leaves that follower holding pre-truncate
+   data until its sender re-attaches. Do not promote inside that window:
+
+   ```elixir
+   {:ok, status} = DurableBuffer.replica_status(:events, user_id)
+   status[:"node2@host2"].promotable?          # false inside the window
+
+   :ok = DurableBuffer.await_replicas(:events, user_id)   # or block on it
+   ```
+
+   See F-3 in [`tla/FINDINGS.md`](tla/FINDINGS.md).
 4. **Start a buffer on that node** with `dir:` set to the follower's
    `replica_dir`, the **same** `partitions:` count, and the surviving nodes
    as `replicas:`. A follower's WAL is written by the same `Backend.Local`
@@ -194,6 +202,16 @@ The partition count must match. Keys are hashed with
 `:erlang.phash2(key, partitions)` into `p<index>.wal`, so a different count
 sends a key to a different file. Note also that `replica_dir` defaults to
 `dir`, and that any write the promoted follower had not acked is gone.
+
+**Truncate and replicas:** `truncate/3` bumps the epoch, wipes the local
+WAL, resets the senders and returns. It does not wait for the replicas. Each
+replica is sent an `:erpc` truncate; one that fails is logged, and that
+replica converges shortly afterwards when its sender re-attaches, compares
+epochs and truncates it. Until it does, the replica still holds pre-truncate
+data — it cannot cause a false ack, because an old-epoch watermark can never
+satisfy a new-epoch target, but it is not safe to promote. Use
+`replica_status/3` to see which replicas have adopted the current epoch, or
+`await_replicas/3` to block until they all have.
 
 **Reads:** `stream/2` reads the local WAL of the primary and is *not* gated
 on the ack policy. A reader can see a batch that no replica has acked yet,

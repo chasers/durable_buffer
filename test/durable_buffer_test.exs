@@ -122,4 +122,50 @@ defmodule DurableBufferTest do
 
     {key_a, key_b}
   end
+
+  test "replica_status reports :unsupported for a non-replicated backend", %{tmp_dir: tmp_dir} do
+    name = start_buffer(tmp_dir)
+
+    assert {:error, :unsupported} = DurableBuffer.replica_status(name, "user-1")
+    assert {:error, :unsupported} = DurableBuffer.await_replicas(name, "user-1")
+  end
+
+  test "await_replicas returns the nodes that never adopted the epoch", %{tmp_dir: tmp_dir} do
+    name =
+      start_buffer(tmp_dir,
+        backend:
+          {DurableBuffer.Backend.Replica,
+           dir: Path.join(tmp_dir, "primary"),
+           replica_dir: Path.join(tmp_dir, "replica"),
+           replicas: [:unreachable@nohost],
+           ack: 1,
+           rpc_timeout: 500,
+           heal_timeout: 500},
+        partitions: 1
+      )
+
+    assert {:error, {:not_adopted, [:unreachable@nohost]}} =
+             DurableBuffer.await_replicas(name, "user-1", 200)
+  end
+
+  test "await_replicas succeeds once every replica is on the epoch", %{tmp_dir: tmp_dir} do
+    name =
+      start_buffer(tmp_dir,
+        backend:
+          {DurableBuffer.Backend.Replica,
+           dir: Path.join(tmp_dir, "primary"),
+           replica_dir: Path.join(tmp_dir, "replica"),
+           replicas: [node()]},
+        partitions: 1
+      )
+
+    assert :ok = DurableBuffer.append(name, "user-1", "replicated")
+    assert :ok = DurableBuffer.await_replicas(name, "user-1")
+
+    assert :ok = DurableBuffer.truncate(name, "user-1")
+    assert :ok = DurableBuffer.await_replicas(name, "user-1")
+
+    {:ok, status} = DurableBuffer.replica_status(name, "user-1")
+    assert %{adopted_epoch: 1, epoch: 1, promotable?: true} = Map.fetch!(status, node())
+  end
 end

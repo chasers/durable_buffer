@@ -168,6 +168,42 @@ defmodule DurableBuffer do
   end
 
   @doc """
+  Reports each replica's replication state for `partition_key`'s partition.
+
+  Only `DurableBuffer.Backend.Replica` tracks one; the other backends return
+  `{:error, :unsupported}`. Each entry carries the epoch that replica has
+  confirmed, the watermark the primary last saw from it, and two flags:
+
+    * `promotable?` — the replica is on the primary's epoch. A replica that
+      missed a truncate still holds pre-truncate data, and is not safe to
+      promote until its sender re-attaches and truncates it.
+    * `caught_up?` — `promotable?`, and its watermark is at the primary's
+      WAL tail.
+  """
+  @spec replica_status(atom(), term(), timeout()) :: {:ok, map()} | {:error, term()}
+  def replica_status(name, partition_key, timeout \\ 5_000) do
+    name
+    |> partition_server(partition_key)
+    |> Partition.replica_status(timeout)
+  end
+
+  @doc """
+  Blocks until every replica of `partition_key`'s partition is on the
+  primary's epoch, or until `timeout`.
+
+  `truncate/3` does not wait: it bumps the epoch, resets the senders, and
+  returns. A replica its `:erpc` did not reach converges shortly afterwards,
+  when its sender re-attaches. Call this when you need the stronger
+  guarantee — before you promote a follower, say.
+  """
+  @spec await_replicas(atom(), term(), timeout()) ::
+          :ok | {:error, {:not_adopted, [node()]} | term()}
+  def await_replicas(name, partition_key, timeout \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    await_adoption(name, partition_key, deadline)
+  end
+
+  @doc """
   Returns the partition index `partition_key` hashes to.
   """
   @spec partition_index(atom(), term()) :: non_neg_integer()
@@ -190,6 +226,28 @@ defmodule DurableBuffer do
   @spec config(atom()) :: %{partitions: pos_integer(), backend: {module(), map()}}
   def config(name) do
     :persistent_term.get({DurableBuffer, name})
+  end
+
+  defp await_adoption(name, partition_key, deadline) do
+    case replica_status(name, partition_key) do
+      {:ok, status} ->
+        pending = for {node, %{promotable?: false}} <- status, do: node
+
+        cond do
+          pending == [] ->
+            :ok
+
+          System.monotonic_time(:millisecond) >= deadline ->
+            {:error, {:not_adopted, pending}}
+
+          true ->
+            Process.sleep(25)
+            await_adoption(name, partition_key, deadline)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp partition_server(name, partition_key) do

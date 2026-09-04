@@ -1,4 +1,5 @@
 Replication	VIOLATED
+Replication_adopt	PASS
 Replication_ahead	VIOLATED
 Replication_core	PASS
 Replication_dirtyread	VIOLATED

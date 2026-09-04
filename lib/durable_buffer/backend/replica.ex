@@ -102,7 +102,9 @@ defmodule DurableBuffer.Backend.Replica do
   def open(config, partition_index) do
     {:ok, local} = Local.open(local_config(config), partition_index)
     epoch = Epoch.load(config.dir, partition_index)
-    local = heal(config, partition_index, epoch, local)
+    tails = remote_tails(config, partition_index)
+    local = heal(config, partition_index, epoch, local, tails)
+    adopted = for {node, {^epoch, _offset}} <- tails, into: %{}, do: {node, epoch}
 
     senders =
       Map.new(config.replicas, fn node ->
@@ -130,6 +132,7 @@ defmodule DurableBuffer.Backend.Replica do
        partition_index: partition_index,
        epoch: epoch,
        watermarks: %{},
+       adopted: adopted,
        senders: senders,
        pending: [],
        timeout_armed?: false
@@ -190,6 +193,10 @@ defmodule DurableBuffer.Backend.Replica do
     {completions, %{state | watermarks: watermarks, pending: pending}}
   end
 
+  def handle_message({:adopted, node, epoch}, state) do
+    {[], %{state | adopted: Map.update(state.adopted, node, epoch, &max(&1, epoch))}}
+  end
+
   def handle_message(:check_timeouts, state) do
     now = System.monotonic_time(:millisecond)
 
@@ -219,21 +226,65 @@ defmodule DurableBuffer.Backend.Replica do
 
     Enum.each(state.senders, fn {_node, sender} -> Sender.reset(sender, epoch) end)
 
-    for node <- state.config.replicas do
-      try do
-        :erpc.call(
-          node,
-          DurableBuffer.Replica,
-          :truncate,
-          [state.config.replica_dir, state.partition_index, epoch],
-          state.config.rpc_timeout
-        )
-      catch
-        _kind, _reason -> :ok
-      end
-    end
+    adopted =
+      Enum.reduce(state.config.replicas, %{}, fn node, adopted ->
+        case truncate_replica(state, node, epoch) do
+          :ok ->
+            Map.put(adopted, node, epoch)
 
-    {:ok, %{state | local: local, epoch: epoch}}
+          :error ->
+            Logger.warning(
+              "DurableBuffer #{state.config.dir} p#{state.partition_index} could not " <>
+                "truncate #{inspect(node)}; it holds pre-truncate data until its sender " <>
+                "re-attaches, and is not safe to promote until then"
+            )
+
+            adopted
+        end
+      end)
+
+    {:ok, %{state | local: local, epoch: epoch, adopted: adopted, watermarks: %{}}}
+  end
+
+  @doc """
+  Reports each replica's replication state.
+
+  `adopted_epoch` is the newest epoch that replica has confirmed. A replica
+  behind the primary's epoch still holds pre-truncate data and is not safe
+  to promote, so `promotable?` is false until its sender re-attaches and
+  truncates it. `caught_up?` additionally requires its watermark to be at
+  the primary's WAL tail.
+  """
+  @spec status(map()) :: %{node() => map()}
+  def status(state) do
+    tail = {state.epoch, Local.offset(state.local)}
+
+    Map.new(state.config.replicas, fn node ->
+      adopted = Map.get(state.adopted, node)
+      watermark = Map.get(state.watermarks, node)
+
+      {node,
+       %{
+         epoch: state.epoch,
+         adopted_epoch: adopted,
+         watermark: watermark,
+         tail: tail,
+         promotable?: adopted == state.epoch,
+         caught_up?: adopted == state.epoch and watermark == tail
+       }}
+    end)
+  end
+
+  defp truncate_replica(state, node, epoch) do
+    :erpc.call(
+      node,
+      DurableBuffer.Replica,
+      :truncate,
+      [state.config.replica_dir, state.partition_index, epoch],
+      state.config.rpc_timeout
+    )
+  catch
+    _kind, _reason -> :error
   end
 
   @impl DurableBuffer.Backend
@@ -255,26 +306,29 @@ defmodule DurableBuffer.Backend.Replica do
     end
   end
 
-  defp heal(%{replicas: []}, _partition_index, _epoch, local), do: local
-
-  defp heal(config, partition_index, epoch, local) do
-    case ahead_replica(config, partition_index, epoch, Local.offset(local)) do
+  defp heal(config, partition_index, epoch, local, tails) do
+    case ahead_replica(tails, epoch, Local.offset(local)) do
       nil -> local
       {node, remote_offset} -> pull(config, partition_index, node, local, remote_offset)
     end
   end
 
-  defp ahead_replica(config, partition_index, epoch, local_offset) do
+  defp ahead_replica(tails, epoch, local_offset) do
     candidates =
-      for node <- config.replicas,
-          {^epoch, offset} <- [remote_tail(config, partition_index, node)],
-          offset > local_offset,
-          do: {node, offset}
+      for {node, {^epoch, offset}} <- tails, offset > local_offset, do: {node, offset}
 
     case candidates do
       [] -> nil
       list -> Enum.max_by(list, fn {_node, offset} -> offset end)
     end
+  end
+
+  defp remote_tails(config, partition_index) do
+    for node <- config.replicas,
+        tail = remote_tail(config, partition_index, node),
+        tail != nil,
+        into: %{},
+        do: {node, tail}
   end
 
   defp remote_tail(config, partition_index, node) do
