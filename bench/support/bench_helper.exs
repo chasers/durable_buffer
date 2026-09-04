@@ -363,9 +363,10 @@ defmodule DurableBuffer.Bench do
 
     DurableBuffer.truncate_all(name)
     fill(name, payload_size, entries)
+    %{first: first} = DurableBuffer.offsets(name, 1)
 
     for fraction <- [0.0, 0.25, 0.5, 0.9, 0.99] do
-      from = round(entries * fraction)
+      from = first + round(entries * fraction)
 
       {microseconds, _} =
         :timer.tc(fn ->
@@ -377,7 +378,7 @@ defmodule DurableBuffer.Bench do
       per_seek = microseconds / samples
 
       IO.puts(
-        String.pad_trailing(format_number(from), 12) <>
+        String.pad_trailing(format_number(from - first), 12) <>
           String.pad_leading(:erlang.float_to_binary(per_seek, decimals: 1), 12) <>
           String.pad_leading(format_number(round(1_000_000 / per_seek)), 13)
       )

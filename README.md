@@ -481,7 +481,9 @@ caller latency distributions, and small-payload tuning — are in
 Each script prints an aggregate **throughput** grid (ops/s and MB/s over a
 payload-size × caller-concurrency matrix, measured with timed concurrent
 loops), a **mixed append + stream** grid (readers re-streaming partitions
-while writers append), and Benchee **caller latency** distributions
+while writers append), a **stream-only** grid (the read path with no
+writers), a **seek** grid (time to the first entry of a `from:` read at
+increasing depth), and Benchee **caller latency** distributions
 (median / p99) at several concurrency levels.
 
 ```sh

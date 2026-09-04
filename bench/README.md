@@ -13,8 +13,23 @@ replication-, or PUT-durable, not buffered. Measurements per backend:
   `DurableBuffer.append_batch/4` with N payloads per call.
 - **Mixed append + stream** — writers appending while readers repeatedly
   re-stream whole partitions; both sides measured simultaneously.
+- **Stream only** (local) — readers re-streaming with no writers at all, so
+  the read path is measured on its own.
+- **Seek** (local) — time to the first entry of a `from:` read at
+  increasing depth, which is where a scan would show up.
 - **Caller latency** — Benchee distributions for a single append under
   increasing `parallel:` load.
+
+> **The append grid below dates from 2026-08-04 and needs a clean
+> re-capture.** The harness matched `:ok` from `append/3`, which started
+> returning `{:ok, offset}` in 0.4.0, so every bench crashed on its first
+> append from that change until 2026-09-04. Nothing compiles or runs
+> `bench/`, so it went unnoticed. The read sections below are from
+> 2026-09-04 on the fixed harness.
+>
+> Single-caller rows are fsync-bound and **vary ±40% run to run** on this
+> machine — repeated medians of the same build ranged 1.4k-3.7k ops/s. Do
+> not read a regression out of one run; alternate builds and take medians.
 
 Reproduce with:
 
@@ -27,7 +42,8 @@ S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs    # real S3
 
 `BENCH_DURATION_MS`, `BENCH_WARMUP_MS`, and `BENCH_TIME` shorten runs;
 `PARTITIONS` overrides partition count. Numbers at the disk-bandwidth
-ceiling vary ±20-30% between runs.
+ceiling vary ±20-30% between runs, and single-caller fsync-bound rows vary
+considerably more.
 
 ## Local (10 partitions)
 
@@ -104,6 +120,45 @@ parallel      average     median     99th %
 16            2.31 ms    2.13 ms    6.73 ms
 128           3.49 ms    3.17 ms   12.16 ms
 ```
+
+## Stream only (1 partition, 4 KB payloads, 20k entries)
+
+Reads with no writers, re-streaming the whole partition end to end. A single
+reader sustains **~1.8-2.2 GB/s**; readers scale to roughly the SSD's read
+ceiling, which is where the per-reader rate stops improving.
+
+```
+readers      entries/s      MB/s  full scans/s
+1               460.0k    1796.9          23.0
+8                1.74M    6796.9          87.0
+64               2.13M    8333.3         106.7
+```
+
+`mixed_grid` measures reads against concurrent appends and cannot separate
+the two; this is the read path alone.
+
+## Seek (1 partition, 256 B payloads, 200k entries)
+
+Time to the **first** entry of a `from:` read, which is where a scan would
+show up. This is what the sparse index is for.
+
+```
+from             us/seek    entries/s      us/seek (index: false)
+0                  367.4         2.7k                       366.1
+50.0k              327.9         3.0k                     14175.5
+100.0k             319.1         3.1k                     20245.7
+180.0k             366.7         2.7k                     50406.3
+198.0k             352.9         2.8k                     44872.1
+```
+
+**Flat with the index, linear without it.** A resume 180k entries into the
+log costs the same as one at the head — 367 us — because the index binary-
+searches to the batch and skips the few entries inside it. Turn the index
+off and the same read scans the log: 50 ms, **137x slower**. That gap is the
+index's whole reason for existing, and nothing measured it until now.
+
+The flat cost is dominated by opening the WAL and the index and reading the
+first chunk, not by the search.
 
 ## Replica (2 replica nodes, ack :all, 10 partitions)
 
