@@ -465,6 +465,52 @@ A transport must deliver batches to one replica in the order they were sent.
 A replica appends a batch only when it lands exactly at its WAL tail, so a
 reordered pair costs a full resync.
 
+##### gen_rpc
+
+`DurableBuffer.Transport.GenRPC` gives each node pair a dedicated TCP
+socket, outside distribution:
+
+```elixir
+{DurableBuffer.Backend.Replica,
+ dir: "/var/lib/events",
+ replicas: [:"node2@host2"],
+ transport: DurableBuffer.Transport.GenRPC}
+```
+
+**Add the dependency yourself.** `:durable_buffer` does not declare it. The
+maintained fork is not on Hex, so it can only be a git dependency, and Hex
+forbids a git dependency in a published package. Add it to your own
+application, on every primary and replica node:
+
+```elixir
+{:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1"}
+```
+
+`init_config/1` raises when the transport is set and `:gen_rpc` is not
+loaded, so a missing dependency is an argument error at startup rather than
+a failure on the first commit.
+
+What it costs:
+
+* **A port.** gen_rpc listens on its own TCP port on every node. Open it
+  between the nodes. Two nodes on one host need `port_discovery: :stateless`
+  or distinct `tcp_server_port` settings, or they collide on 5369.
+* **A TLS decision.** gen_rpc speaks plain TCP by default, and
+  distribution's TLS settings do not apply to it. Configure its own
+  `ssl_server_options` and `ssl_client_options`.
+* **A different place for backpressure.** `send/2` to a remote pid blocks
+  the sender when the distribution buffer fills. `:gen_rpc.ordered_cast/4`
+  does not block the caller: it hands the payload to gen_rpc's client
+  process, whose mailbox is unbounded, and the TCP send blocks that process
+  instead. In-flight bytes stay bounded — `max_sender_bytes` still caps the
+  unacked queue, and the sender drops it and re-attaches on overflow — but
+  the bytes wait somewhere else.
+
+Ordering comes from `ordered_cast/4`, which gen_rpc serialises per
+`{node, tag}`. The tag is `{replica_dir, partition}`, so each partition
+gets its own connection and its own order, and partitions never block each
+other.
+
 ### S3
 
 ```elixir
