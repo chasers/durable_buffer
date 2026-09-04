@@ -36,7 +36,8 @@ defmodule DurableBuffer.Replica.SenderTest do
             primary_tail: 0,
             epoch: 0,
             rpc_timeout: 500,
-            max_bytes: 64 * 1024 * 1024
+            max_bytes: 64 * 1024 * 1024,
+            transport: DurableBuffer.Transport.Distribution
           ],
           opts
         )

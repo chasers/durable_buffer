@@ -17,7 +17,7 @@ defmodule DurableBuffer.Transport.Distribution do
   @behaviour DurableBuffer.Transport
 
   @impl DurableBuffer.Transport
-  def channel(_node, _dir, _partition_index, writer), do: writer
+  def channel(_node, _dir, _partition_index, writer), do: {:ok, writer}
 
   @impl DurableBuffer.Transport
   def send_batch(writer, ref, epoch, offset, batch, reply_to) do

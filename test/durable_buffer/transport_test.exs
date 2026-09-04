@@ -3,6 +3,7 @@ defmodule DurableBuffer.TransportTest do
 
   alias DurableBuffer.Backend.Local
   alias DurableBuffer.Backend.Replica
+  alias DurableBuffer.FailingTransport
   alias DurableBuffer.RecordingTransport
   alias DurableBuffer.Replica.Sender
   alias DurableBuffer.Transport
@@ -27,6 +28,16 @@ defmodule DurableBuffer.TransportTest do
   defp span(state, batch) do
     first = Replica.offsets(state).next
     {first, length(batch)}
+  end
+
+  defp await_watermark(target) do
+    assert_receive {:backend, {:watermark, _node, watermark}}, 5000
+
+    if watermark < target do
+      await_watermark(target)
+    else
+      assert watermark >= target
+    end
   end
 
   describe "the transport: option" do
@@ -64,6 +75,84 @@ defmodule DurableBuffer.TransportTest do
       assert_raise ArgumentError, ~r/expects a module/, fn ->
         Replica.init_config(dir: primary_dir, transport: "gen_rpc")
       end
+    end
+  end
+
+  describe "a transport that fails" do
+    setup %{tmp_dir: tmp_dir} do
+      {_primary_dir, replica_dir} = dirs(tmp_dir)
+      on_exit(fn -> FailingTransport.set(replica_dir, :ok) end)
+      :ok
+    end
+
+    for mode <- [:error, :raise] do
+      @mode mode
+
+      test "a send that returns #{inspect(mode)} never stops the partition", ctx do
+        {primary_dir, replica_dir} = dirs(ctx.tmp_dir)
+        FailingTransport.set(replica_dir, @mode)
+
+        config =
+          Replica.init_config(
+            dir: primary_dir,
+            replica_dir: replica_dir,
+            replicas: [node()],
+            ack: 1,
+            transport: FailingTransport
+          )
+
+        {:ok, state} = Replica.open(config, 0)
+        {batch, bytes} = encode_batch(["local-only"])
+
+        assert {:ok, state} = Replica.commit(state, batch, bytes, span(state, batch))
+        assert Enum.to_list(Replica.stream(config, 0)) == ["local-only"]
+
+        assert :ok = Replica.close(state)
+      end
+    end
+
+    test "a channel that cannot open never stops the partition", ctx do
+      {primary_dir, replica_dir} = dirs(ctx.tmp_dir)
+      FailingTransport.set(replica_dir, :no_channel)
+
+      config =
+        Replica.init_config(
+          dir: primary_dir,
+          replica_dir: replica_dir,
+          replicas: [node()],
+          ack: 1,
+          transport: FailingTransport
+        )
+
+      {:ok, state} = Replica.open(config, 0)
+      {batch, bytes} = encode_batch(["local-only"])
+
+      assert {:ok, state} = Replica.commit(state, batch, bytes, span(state, batch))
+      assert Enum.to_list(Replica.stream(config, 0)) == ["local-only"]
+
+      assert :ok = Replica.close(state)
+    end
+
+    test "nil is a legal channel, not a stalled sender", ctx do
+      {primary_dir, replica_dir} = dirs(ctx.tmp_dir)
+      FailingTransport.set(replica_dir, :nil_channel)
+
+      config =
+        Replica.init_config(
+          dir: primary_dir,
+          replica_dir: replica_dir,
+          replicas: [node()],
+          ack: 1,
+          transport: FailingTransport
+        )
+
+      {:ok, state} = Replica.open(config, 0)
+      {batch, bytes} = encode_batch(["local-only"])
+
+      assert {:ok, state} = Replica.commit(state, batch, bytes, span(state, batch))
+      assert Enum.to_list(Replica.stream(config, 0)) == ["local-only"]
+
+      assert :ok = Replica.close(state)
     end
   end
 
@@ -109,7 +198,7 @@ defmodule DurableBuffer.TransportTest do
 
       tail = Local.offset(local)
 
-      {:ok, _sender} =
+      {:ok, sender} =
         Sender.start_link(
           owner: self(),
           node: node(),
@@ -123,7 +212,10 @@ defmodule DurableBuffer.TransportTest do
           transport: RecordingTransport
         )
 
+      on_exit(fn -> if Process.alive?(sender), do: Sender.stop(sender) end)
+
       assert_receive {:transport_batch, ^replica_dir, 0, 0, ^tail}, 5000
+      await_watermark({0, tail})
 
       assert Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0)) ==
                ["old-one", "old-two"]

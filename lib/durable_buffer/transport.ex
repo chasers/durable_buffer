@@ -38,8 +38,15 @@ defmodule DurableBuffer.Transport do
   `writer` is the pid the sender got from its `:erpc` attach. A transport
   that addresses the writer by pid returns it; one that addresses it by name
   ignores it.
+
+  A transport that must dial a remote does it here, and reports a failure as
+  `{:error, reason}` rather than blocking or raising. The sender treats that
+  like a failed attach: it retries on its reconnect timer. Raising is
+  survivable — the sender catches it and retries the same way — but it costs
+  a log line that reads like a bug.
   """
-  @callback channel(node(), Path.t(), non_neg_integer(), pid()) :: channel()
+  @callback channel(node(), Path.t(), non_neg_integer(), pid()) ::
+              {:ok, channel()} | {:error, term()}
 
   @doc """
   Puts one already-framed batch on `channel`.
@@ -52,6 +59,13 @@ defmodule DurableBuffer.Transport do
   Batches must arrive in the order they are sent. The writer appends a batch
   only when it lands exactly at its tail, so a reordered pair costs a full
   resync.
+
+  A send that fails reports `{:error, reason}`. The sender drops the channel
+  and re-attaches, which is how it heals every other failure, so a broken
+  wire costs one resync and nothing else. Never let a failed send exit the
+  sender: it is linked to the committer, which stops the whole partition on
+  a non-normal exit — local WAL included. That would turn one dead replica
+  into an outage, which is the opposite of what this backend promises.
   """
   @callback send_batch(
               channel(),
@@ -60,5 +74,5 @@ defmodule DurableBuffer.Transport do
               non_neg_integer(),
               binary(),
               pid()
-            ) :: :ok
+            ) :: :ok | {:error, term()}
 end

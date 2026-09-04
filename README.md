@@ -321,29 +321,6 @@ or dead replica stalls only its own channel, never the commit path. Replica
 nodes need no configuration beyond running the `:durable_buffer`
 application; writers start on demand, keyed by `{replica_dir, partition}`.
 
-#### Transports
-
-`transport:` decides what carries replicated batches. It defaults to
-`DurableBuffer.Transport.Distribution`, which sends them to the remote
-writer over the Erlang distribution channel — the behaviour every earlier
-version had.
-
-Only the batches use it. The control path (attach, truncate, trim, remote
-tail, remote read) and the acks stay on distribution whatever `transport:`
-says. They are small request/reply round trips, so they block nothing, and
-keeping them on distribution is what lets the sender detect a dead replica
-with an ordinary `Process.monitor/1` on the remote writer.
-
-The reason to change it is head-of-line blocking. Distribution is **one TCP
-connection per node pair**, shared by every process on those nodes. An
-8-partition buffer under load is 8 senders pushing batches through the same
-socket that carries the cluster heartbeat. A starved heartbeat reads as a
-node going down, which is the event replication exists to survive.
-
-A transport must deliver batches to one replica in the order they were sent.
-A replica appends a batch only when it lands exactly at its WAL tail, so a
-reordered pair costs a full resync.
-
 `ack:` controls when a commit counts as durable (the local write is one ack):
 `:all` (default), `:quorum` (majority of `1 + length(replicas)`), or an
 integer. Commits return as soon as the ack target is met; reads are served
@@ -464,6 +441,29 @@ automatically under exactly that pressure — with it, `fsync: true`
 measures ~35k ops/s at 256 B × 256 callers on the bench machine, ~1.7×
 the old always-fsync engine, without taxing idle latency. `FSYNC=true`
 toggles it in `replica_bench.exs`.
+
+#### Transports
+
+`transport:` decides what carries replicated batches. It defaults to
+`DurableBuffer.Transport.Distribution`, which sends them to the remote
+writer over the Erlang distribution channel — the behaviour every earlier
+version had.
+
+Only the batches use it. The control path (attach, truncate, trim, remote
+tail, remote read) and the acks stay on distribution whatever `transport:`
+says. They are small request/reply round trips, so they block nothing, and
+keeping them on distribution is what lets the sender detect a dead replica
+with an ordinary `Process.monitor/1` on the remote writer.
+
+The reason to change it is head-of-line blocking. Distribution is **one TCP
+connection per node pair**, shared by every process on those nodes. An
+8-partition buffer under load is 8 senders pushing batches through the same
+socket that carries the cluster heartbeat. A starved heartbeat reads as a
+node going down, which is the event replication exists to survive.
+
+A transport must deliver batches to one replica in the order they were sent.
+A replica appends a batch only when it lands exactly at its WAL tail, so a
+reordered pair costs a full resync.
 
 ### S3
 

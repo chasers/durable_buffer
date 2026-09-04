@@ -21,7 +21,8 @@ defmodule DurableBuffer.RecordingTransport do
 
   @impl DurableBuffer.Transport
   def channel(node, dir, partition_index, writer) do
-    {dir, Distribution.channel(node, dir, partition_index, writer)}
+    {:ok, inner} = Distribution.channel(node, dir, partition_index, writer)
+    {:ok, {dir, inner}}
   end
 
   @impl DurableBuffer.Transport

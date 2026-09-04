@@ -10,8 +10,12 @@
 (*   DurableBuffer.Replica.Writer   replicate_group/2                      *)
 (*                                                                         *)
 (* One batch is one byte, so a WAL byte offset is a sequence index and a    *)
-(* batch id also identifies its content. Channels are ordered, matching     *)
-(* Erlang's per-pair message ordering.                                      *)
+(* batch id also identifies its content. Channels are ordered.              *)
+(*                                                                         *)
+(* That ordering used to be a property of Erlang distribution. It is now a  *)
+(* contract DurableBuffer.Transport requires of every implementation, and   *)
+(* every safety result below rests on it. A transport that reorders is not  *)
+(* covered by this model: the spec changes first, then the transport.       *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
