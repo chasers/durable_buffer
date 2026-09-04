@@ -1,7 +1,8 @@
 defmodule DurableBuffer.Replica do
   @moduledoc """
-  Replica-side entry points, invoked over `:erpc` by
-  `DurableBuffer.Backend.Replica` on the primary.
+  Replica-side entry points, invoked by `DurableBuffer.Backend.Replica` on
+  the primary — over `:erpc` for the control path, and over the configured
+  `DurableBuffer.Transport` for `replicate/7`.
 
   Any node running the `:durable_buffer` application can serve as a replica:
   writers are started on demand under a `PartitionSupervisor` and keyed by
@@ -55,6 +56,49 @@ defmodule DurableBuffer.Replica do
           {:ok, binary()} | {:error, term()}
   def read_range(dir, partition_index, offset, length) do
     Writer.read_range(ensure_writer(dir, partition_index), offset, length)
+  end
+
+  @doc """
+  Hands one replicated batch to the already-running writer for
+  `{dir, partition_index}`.
+
+  This is the replica-side end of a `DurableBuffer.Transport` that has no
+  pid-to-pid messaging, such as `DurableBuffer.Transport.GenRPC`. It sends
+  the same `:replicate` message the writer would receive over distribution,
+  so the writer's group-commit drain is unaffected, and the ack goes
+  straight back to `reply_to` over distribution.
+
+  It does **not** start a writer. `attach/3` starts one, with the primary's
+  configured `fsync`, and a sender attaches before it sends anything. A
+  batch that arrives with no writer running therefore means the writer died
+  after the attach, so dropping it is right: the sender's monitor fires and
+  it re-attaches, which starts the writer with the correct setting and
+  resyncs. Starting one here would pick the `fsync: true` default and
+  silently datasync every batch against an explicit `fsync: false`.
+
+  It does the least possible work on purpose. `:gen_rpc.ordered_cast/4`
+  blocks its acceptor until this returns, and that acceptor is what keeps
+  batches in order for the whole node pair.
+  """
+  @spec replicate(
+          Path.t(),
+          non_neg_integer(),
+          reference(),
+          non_neg_integer(),
+          non_neg_integer(),
+          binary(),
+          pid()
+        ) :: :ok
+  def replicate(dir, partition_index, ref, epoch, offset, batch, reply_to) do
+    case Registry.lookup(DurableBuffer.Registry, {:replica_writer, dir, partition_index}) do
+      [{writer, _value}] ->
+        send(writer, {:replicate, ref, epoch, offset, batch, reply_to})
+
+      [] ->
+        :ok
+    end
+
+    :ok
   end
 
   @doc """

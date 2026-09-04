@@ -122,6 +122,8 @@ defmodule DurableBuffer.Replica.Sender do
        mode: :live,
        resync_fd: nil,
        resync_cursor: nil,
+       resync_base: nil,
+       resync_stall_check: nil,
        queue: :queue.new(),
        queued_bytes: 0,
        watermark: {0, 0},
@@ -224,6 +226,9 @@ defmodule DurableBuffer.Replica.Sender do
         state = resend_queue(%{state | mode: :live})
         {:noreply, ensure_progress_check(state)}
 
+      resync_inflight(state) >= state.max_bytes ->
+        {:noreply, ensure_resync_stall_check(state)}
+
       true ->
         case :file.pread(
                state.resync_fd,
@@ -261,7 +266,28 @@ defmodule DurableBuffer.Replica.Sender do
         queued_bytes: queued_bytes
     }
 
+    if state.mode == :resync and resync_inflight(state) < state.max_bytes do
+      send(self(), :resync_step)
+    end
+
     {:noreply, state}
+  end
+
+  def handle_info({:check_resync, cursor, watermark}, state) do
+    state = %{state | resync_stall_check: nil}
+
+    if state.mode == :resync and state.resync_cursor == cursor and
+         state.watermark == watermark do
+      Logger.warning(
+        "DurableBuffer replica sender to #{inspect(state.node)} " <>
+          "(#{state.dir} p#{state.partition_index}) stalled resyncing at offset " <>
+          "#{cursor} with a full window; reattaching"
+      )
+
+      {:noreply, force_reattach(state)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(
@@ -401,7 +427,7 @@ defmodule DurableBuffer.Replica.Sender do
     path = DurableBuffer.Backend.Local.wal_path(state.primary_dir, state.partition_index)
     base = primary_base(state)
     cursor = max(cursor, base)
-    state = %{state | primary_base: base}
+    state = %{state | primary_base: base, resync_base: cursor}
 
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
@@ -439,16 +465,46 @@ defmodule DurableBuffer.Replica.Sender do
   defp reattach(state, delay) do
     if state.monitor, do: Process.demonitor(state.monitor, [:flush])
     state = close_resync(state)
+    if state.resync_stall_check, do: Process.cancel_timer(state.resync_stall_check)
     Process.send_after(self(), :connect, delay)
-    %{state | writer: nil, channel: nil, monitor: nil, attach_ref: nil, mode: :live}
+
+    %{
+      state
+      | writer: nil,
+        channel: nil,
+        monitor: nil,
+        attach_ref: nil,
+        mode: :live,
+        resync_stall_check: nil
+    }
   end
 
   defp close_resync(%{resync_fd: nil} = state), do: state
 
   defp close_resync(state) do
     :ok = :file.close(state.resync_fd)
-    %{state | resync_fd: nil, resync_cursor: nil}
+    %{state | resync_fd: nil, resync_cursor: nil, resync_base: nil}
   end
+
+  defp resync_inflight(%{resync_cursor: nil}), do: 0
+
+  defp resync_inflight(state) do
+    {_epoch, acked} = state.watermark
+    max(state.resync_cursor - max(acked, state.resync_base), 0)
+  end
+
+  defp ensure_resync_stall_check(%{resync_stall_check: nil} = state) do
+    ref =
+      Process.send_after(
+        self(),
+        {:check_resync, state.resync_cursor, state.watermark},
+        state.rpc_timeout
+      )
+
+    %{state | resync_stall_check: ref}
+  end
+
+  defp ensure_resync_stall_check(state), do: state
 
   defp send_entry(%{attach_ref: nil} = state, _entry), do: state
 

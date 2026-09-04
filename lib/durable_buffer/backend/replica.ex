@@ -108,6 +108,18 @@ defmodule DurableBuffer.Backend.Replica do
     }
   end
 
+  defp transport!(DurableBuffer.Transport.GenRPC = module) do
+    unless DurableBuffer.Transport.GenRPC.available?() do
+      raise ArgumentError,
+            "transport: DurableBuffer.Transport.GenRPC needs :gen_rpc, which is not loaded. " <>
+              "durable_buffer does not declare it, because the maintained fork is not on Hex. " <>
+              ~s|Add {:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1"} to | <>
+              "your own application, on every primary and replica node."
+    end
+
+    module
+  end
+
   defp transport!(module) when is_atom(module) do
     if Code.ensure_loaded?(module) and function_exported?(module, :send_batch, 6) and
          function_exported?(module, :channel, 4) do

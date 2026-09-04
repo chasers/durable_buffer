@@ -12,6 +12,8 @@ defmodule DurableBuffer.TransportTest do
   @moduletag :tmp_dir
   @moduletag capture_log: true
 
+  @resync_chunk_bytes 1024 * 1024
+
   defp dirs(tmp_dir) do
     {Path.join(tmp_dir, "primary"), Path.join(tmp_dir, "replica")}
   end
@@ -153,6 +155,59 @@ defmodule DurableBuffer.TransportTest do
       assert Enum.to_list(Replica.stream(config, 0)) == ["local-only"]
 
       assert :ok = Replica.close(state)
+    end
+  end
+
+  describe "the resync window" do
+    test "bounds in-flight bytes when the transport does not block", ctx do
+      {primary_dir, replica_dir} = dirs(ctx.tmp_dir)
+      window = 64 * 1024
+      wal_bytes = 8 * 1024 * 1024
+      entry = entry(:binary.copy("x", 8192))
+      entries = div(wal_bytes, byte_size(entry))
+
+      {:ok, local} = Local.open(Local.init_config(dir: primary_dir), 0)
+
+      local =
+        Enum.reduce(1..entries, local, fn _index, local ->
+          {:ok, local} = Local.commit(local, entry, byte_size(entry), {0, 1})
+          local
+        end)
+
+      tail = Local.offset(local)
+      assert tail > 4 * @resync_chunk_bytes
+
+      FailingTransport.set(replica_dir, :blackhole)
+      on_exit(fn -> FailingTransport.set(replica_dir, :ok) end)
+
+      {:ok, sender} =
+        Sender.start_link(
+          owner: self(),
+          node: node(),
+          dir: replica_dir,
+          partition_index: 0,
+          primary_dir: primary_dir,
+          primary_tail: tail,
+          epoch: 0,
+          rpc_timeout: 60_000,
+          max_bytes: window,
+          transport: FailingTransport
+        )
+
+      on_exit(fn -> if Process.alive?(sender), do: Sender.stop(sender) end)
+
+      Process.sleep(300)
+
+      sent = FailingTransport.sent_bytes(replica_dir)
+
+      assert sent > 0,
+             "the sender never started the resync"
+
+      assert sent <= window + 2 * @resync_chunk_bytes,
+             "the sender streamed #{sent} bytes of a #{tail}-byte WAL with no ack; " <>
+               "the resync window should have capped it near #{window + @resync_chunk_bytes}"
+
+      Local.close(local)
     end
   end
 

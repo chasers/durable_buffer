@@ -465,6 +465,67 @@ A transport must deliver batches to one replica in the order they were sent.
 A replica appends a batch only when it lands exactly at its WAL tail, so a
 reordered pair costs a full resync.
 
+A transport reports a failure rather than raising: `channel/4` and
+`send_batch/6` both return `{:error, reason}`, and the sender heals by
+re-attaching. It catches a raise too, but a transport that raises on an
+ordinary dead peer produces log lines that read like a bug.
+
+`max_sender_bytes` bounds in-flight bytes on both paths — the unacked queue
+while live, and the unacknowledged window while resyncing a replica that is
+behind. The resync bound matters most for a transport that does not block
+its caller, which is every transport except distribution.
+
+##### gen_rpc
+
+`DurableBuffer.Transport.GenRPC` gives each node pair a dedicated TCP
+socket, outside distribution:
+
+```elixir
+{DurableBuffer.Backend.Replica,
+ dir: "/var/lib/events",
+ replicas: [:"node2@host2"],
+ transport: DurableBuffer.Transport.GenRPC}
+```
+
+**Add the dependency yourself.** `:durable_buffer` does not declare it. The
+maintained fork is not on Hex, so it can only be a git dependency, and Hex
+forbids a git dependency in a published package. Add it to your own
+application, on every primary and replica node:
+
+```elixir
+{:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1"}
+```
+
+`init_config/1` raises when the transport is set and `:gen_rpc` is not
+loaded, so a missing dependency is an argument error at startup rather than
+a failure on the first commit.
+
+What it costs:
+
+* **A port.** gen_rpc listens on its own TCP port on every node. Open it
+  between the nodes. Two nodes on one host need `port_discovery: :stateless`
+  or distinct `tcp_server_port` settings, or they collide on 5369.
+* **A TLS decision.** gen_rpc speaks plain TCP by default, and
+  distribution's TLS settings do not apply to it. Configure its own
+  `ssl_server_options` and `ssl_client_options`.
+* **A different place for backpressure.** `send/2` to a remote pid blocks
+  the sender when the distribution buffer fills. `:gen_rpc.ordered_cast/4`
+  does not block the caller: it hands the payload to gen_rpc's client
+  process, whose mailbox is unbounded, and the TCP send blocks that process
+  instead. So the bytes wait in that mailbox rather than in the sender.
+  `max_sender_bytes` is what bounds them: it caps the unacked queue on the
+  live path and the unacknowledged resync window on the catch-up path. A
+  replica far behind still parks up to that much in gen_rpc's mailbox.
+* **A whitelist, if the node already runs gen_rpc.** With
+  `rpc_module_control` set to `:whitelist`, the acceptor discards a batch
+  whose module is not listed — at debug level, while the send still
+  reports success. Add `DurableBuffer.Replica` to the list.
+
+Ordering comes from `ordered_cast/4`, which gen_rpc serialises per
+`{node, tag}`. The tag is `{replica_dir, partition}`, so each partition
+gets its own connection and its own order, and partitions never block each
+other.
+
 ### S3
 
 ```elixir
