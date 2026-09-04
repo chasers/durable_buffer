@@ -17,6 +17,12 @@ defmodule DurableBuffer.Backend.S3 do
   a truncate records the new base in a sibling `base` object so offsets stay
   monotonic across it.
 
+  `open/2` reads the newest segment, so it needs more than a LIST to
+  succeed. A transient failure there raises rather than guessing: an
+  under-counted newest segment would re-issue offsets that already name
+  entries. Failing lets the supervisor retry.
+
+
   S3 PUT latency is high relative to disk, which makes group commit the whole
   ballgame: while one PUT is in flight every new append queues into the next
   batch, so throughput is bounded by `batch size × partitions / PUT latency`,
@@ -180,6 +186,138 @@ defmodule DurableBuffer.Backend.S3 do
     Stream.drop_while(stream, fn {_payload, offset} -> offset < from end)
   end
 
+  @doc """
+  The offset a retention policy would cut at, or `:none` when neither bound
+  is exceeded.
+
+  Segments are objects, so the LIST that `trim/2` already does carries both
+  bounds: `LastModified` dates a segment and `Size` measures it. No extra
+  request, and no state of our own to keep.
+
+  Age comes from when a segment was written, not from when its entries were
+  produced. The two differ by at most one group commit.
+  """
+  @impl DurableBuffer.Backend
+  @spec retention_point(map(), map()) :: {:ok, non_neg_integer()} | :none
+  def retention_point(state, policy) do
+    segments = list_objects(state.req, state.config, state.partition_index)
+
+    case Enum.reject(
+           [time_point(segments, policy[:ms]), size_point(segments, policy[:bytes])],
+           &is_nil/1
+         ) do
+      [] -> :none
+      points -> {:ok, Enum.max(points)}
+    end
+  end
+
+  defp time_point([], _ms), do: nil
+  defp time_point(_segments, nil), do: nil
+
+  defp time_point(segments, ms) do
+    cutoff = System.system_time(:millisecond) - ms
+
+    case Enum.split_while(segments, &(&1.modified_ms != nil and &1.modified_ms < cutoff)) do
+      {[], _kept} -> nil
+      {_older, [segment | _rest]} -> offset_from_key(segment.key)
+      {_older, []} -> offset_from_key(List.last(segments).key)
+    end
+  end
+
+  defp size_point([], _bytes), do: nil
+  defp size_point(_segments, nil), do: nil
+
+  defp size_point(segments, bytes) do
+    suffixes = suffix_sizes(segments)
+
+    if hd(suffixes) <= bytes do
+      nil
+    else
+      case Enum.find(Enum.zip(segments, suffixes), fn {_segment, kept} -> kept <= bytes end) do
+        nil -> offset_from_key(List.last(segments).key)
+        {segment, _kept} -> offset_from_key(segment.key)
+      end
+    end
+  end
+
+  defp suffix_sizes(segments) do
+    segments
+    |> Enum.reverse()
+    |> Enum.scan(0, fn segment, total -> total + segment.size end)
+    |> Enum.reverse()
+  end
+
+  @impl DurableBuffer.Backend
+  @spec retention_status(map()) :: %{oldest_ms: integer() | nil, bytes: non_neg_integer()}
+  def retention_status(state) do
+    segments = list_objects(state.req, state.config, state.partition_index)
+
+    %{
+      oldest_ms: oldest_ms(segments),
+      bytes: segments |> Enum.map(& &1.size) |> Enum.sum()
+    }
+  end
+
+  defp oldest_ms([segment | _rest]), do: segment.modified_ms
+  defp oldest_ms([]), do: nil
+
+  @doc """
+  Deletes every segment that lies entirely below `upto`.
+
+  Segments are immutable objects, so a partly-covered one is kept whole.
+  `first` therefore lands on a segment boundary at or below `upto`, and a
+  reader may still see a few entries under the requested trim point. The
+  local backend cuts exactly, since it can rewrite its file.
+  """
+  @impl DurableBuffer.Backend
+  @spec trim(map(), non_neg_integer()) :: {:ok, map()}
+  def trim(state, upto) do
+    keys = list_keys(state.req, state.config, state.partition_index)
+
+    dropped =
+      for {key, segment_end} <- segment_ends(keys, state.next_offset),
+          segment_end <= upto,
+          do: key
+
+    for key <- dropped do
+      %Req.Response{status: status} =
+        Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
+
+      true = status in 200..299
+    end
+
+    first =
+      case keys -- dropped do
+        [] -> state.next_offset
+        [kept | _rest] -> offset_from_key(kept)
+      end
+
+    :ok = store_base(state.req, state.config, state.partition_index, first)
+    {:ok, %{state | first_offset: first}}
+  end
+
+  defp describe(content) do
+    %{
+      key: Map.fetch!(content, "Key"),
+      modified_ms: modified_ms(Map.get(content, "LastModified")),
+      size: content |> Map.get("Size", "0") |> String.to_integer()
+    }
+  end
+
+  defp modified_ms(nil), do: nil
+
+  defp modified_ms(stamp) do
+    case DateTime.from_iso8601(stamp) do
+      {:ok, datetime, _offset} -> DateTime.to_unix(datetime, :millisecond)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp segment_ends(keys, next_offset) do
+    offsets = Enum.map(keys, &offset_from_key/1)
+    Enum.zip(keys, Enum.drop(offsets, 1) ++ [next_offset])
+  end
+
   @impl DurableBuffer.Backend
   def truncate(state, next) do
     for key <- list_keys(state.req, state.config, state.partition_index) do
@@ -253,22 +391,40 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   defp count_entries(req, config, key) do
-    %Req.Response{status: 200, body: body} =
-      Req.get!(req, url: "s3://#{config.bucket}/#{key}", decode_body: false)
-
-    {payloads, _valid, _rest} = WAL.decode_all(body)
+    {payloads, _valid, _rest} = WAL.decode_all(fetch!(req, config, key))
     length(payloads)
   end
 
-  defp list_keys(req, config, partition_index) do
-    list_keys(req, config, partition_index, nil, [])
+  defp fetch!(req, config, key) do
+    case Req.get(req, url: "s3://#{config.bucket}/#{key}", decode_body: false) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        body
+
+      {:ok, %Req.Response{status: status}} ->
+        raise "DurableBuffer could not open #{key}: S3 answered #{status}"
+
+      {:error, exception} ->
+        raise "DurableBuffer could not open #{key}: #{Exception.message(exception)}"
+    end
   end
 
-  defp list_keys(req, config, partition_index, continuation_token, acc) do
+  defp list_keys(req, config, partition_index) do
+    req
+    |> list_objects(config, partition_index)
+    |> Enum.map(& &1.key)
+  end
+
+  defp list_objects(req, config, partition_index) do
+    req
+    |> list_prefix(config, partition_prefix(config, partition_index), nil, [])
+    |> Enum.filter(&String.ends_with?(&1.key, ".wal"))
+  end
+
+  defp list_prefix(req, config, prefix, continuation_token, acc) do
     params =
       [
         {"list-type", "2"},
-        {"prefix", partition_prefix(config, partition_index)}
+        {"prefix", prefix}
       ] ++
         if continuation_token do
           [{"continuation-token", continuation_token}]
@@ -281,21 +437,20 @@ defmodule DurableBuffer.Backend.S3 do
 
     %{"ListBucketResult" => result} = body
 
-    keys =
+    objects =
       result
       |> Map.get("Contents", [])
       |> List.wrap()
-      |> Enum.map(&Map.fetch!(&1, "Key"))
-      |> Enum.filter(&String.ends_with?(&1, ".wal"))
+      |> Enum.map(&describe/1)
 
-    acc = acc ++ keys
+    acc = acc ++ objects
 
     case result do
       %{"IsTruncated" => "true", "NextContinuationToken" => token} ->
-        list_keys(req, config, partition_index, token, acc)
+        list_prefix(req, config, prefix, token, acc)
 
       _result ->
-        Enum.sort(acc)
+        Enum.sort_by(acc, & &1.key)
     end
   end
 end

@@ -57,9 +57,18 @@ defmodule DurableBuffer.Replica.Writer do
     GenServer.call(server, {:commit, epoch, offset, batch}, :infinity)
   end
 
-  @spec truncate(GenServer.server(), non_neg_integer()) :: :ok
-  def truncate(server, epoch) do
-    GenServer.call(server, {:truncate, epoch}, :infinity)
+  @spec truncate(GenServer.server(), non_neg_integer(), non_neg_integer()) :: :ok
+  def truncate(server, epoch, base_byte) do
+    GenServer.call(server, {:truncate, epoch, base_byte}, :infinity)
+  end
+
+  @doc """
+  Drops every byte below the logical byte offset `base_byte`, passing on a
+  trim the primary already applied.
+  """
+  @spec trim(GenServer.server(), non_neg_integer()) :: :ok
+  def trim(server, base_byte) do
+    GenServer.call(server, {:trim, base_byte}, :infinity)
   end
 
   @doc """
@@ -105,10 +114,18 @@ defmodule DurableBuffer.Replica.Writer do
     {:reply, reply, state}
   end
 
-  def handle_call({:truncate, epoch}, _from, state) do
+  def handle_call({:truncate, epoch, base_byte}, _from, state) do
     {:ok, local} = Local.truncate(state.local, Local.offsets(state.local).next)
+    {:ok, local} = Local.reset_to(local, base_byte)
     Meta.update!(state.dir, state.partition_index, &%{&1 | epoch: epoch})
     {:reply, :ok, %{state | local: local, epoch: epoch}}
+  end
+
+  def handle_call({:trim, base_byte}, _from, state) do
+    case Local.trim_bytes(state.local, base_byte) do
+      {:ok, local} -> {:reply, :ok, %{state | local: local}}
+      {:error, _reason, local} -> {:reply, :ok, %{state | local: local}}
+    end
   end
 
   def handle_call({:read_range, offset, length}, _from, state) do

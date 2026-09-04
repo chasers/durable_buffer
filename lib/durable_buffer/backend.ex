@@ -41,17 +41,33 @@ defmodule DurableBuffer.Backend do
   @type limit_fun :: (-> non_neg_integer())
 
   @typedoc """
+  A retention policy: keep at most `:ms` of age, at most `:bytes` on disk,
+  or both. A `nil` bound is not applied. At least one is always set, because
+  `DurableBuffer.trim/2` refuses a buffer that declares neither.
+  """
+  @type policy :: %{ms: pos_integer() | nil, bytes: pos_integer() | nil}
+
+  @typedoc """
+  What retention has to work with for one partition: the commit time of the
+  oldest retained batch, and the bytes it retains. `:oldest_ms` is `nil`
+  when the partition is empty or cannot date its head.
+  """
+  @type retention_status :: %{oldest_ms: integer() | nil, bytes: non_neg_integer()}
+
+  @typedoc """
   Options accepted by `c:stream/3`.
 
     * `:limit` — a `t:limit_fun/0` bounding the read at the durable offset,
       or `nil` for an ungated read.
     * `:from` — first logical entry offset to yield, inclusive.
     * `:with_offsets` — yield `{offset, payload}` instead of `payload`.
+    * `:name` — the buffer's name, so a backend that raises can name it.
   """
   @type stream_opts :: [
           limit: limit_fun() | nil,
           from: non_neg_integer(),
-          with_offsets: boolean()
+          with_offsets: boolean(),
+          name: atom() | nil
         ]
 
   @callback init_config(keyword()) :: config()
@@ -71,6 +87,10 @@ defmodule DurableBuffer.Backend do
               Enumerable.t()
   @callback durable_offset(state()) :: non_neg_integer()
   @callback offsets(state()) :: %{first: non_neg_integer(), next: non_neg_integer()}
+  @callback trim(state(), upto :: non_neg_integer()) ::
+              {:ok, state()} | {:error, term(), state()}
+  @callback retention_point(state(), policy()) :: {:ok, non_neg_integer()} | :none
+  @callback retention_status(state()) :: retention_status()
   @callback truncate(state(), next_offset :: non_neg_integer()) :: {:ok, state()}
   @callback close(state()) :: :ok
 
@@ -78,7 +98,10 @@ defmodule DurableBuffer.Backend do
                       handle_message: 2,
                       stream: 3,
                       durable_offset: 1,
-                      offsets: 1
+                      offsets: 1,
+                      trim: 2,
+                      retention_point: 2,
+                      retention_status: 1
 
   @doc """
   Normalizes a `{module, opts}` backend spec into `{module, config}`.
@@ -90,6 +113,15 @@ defmodule DurableBuffer.Backend do
 
   def normalize(module) when is_atom(module) do
     normalize({module, []})
+  end
+
+  @doc """
+  Whether `module` can apply a retention policy and report on it.
+  """
+  @spec applies_retention?(module()) :: boolean()
+  def applies_retention?(module) do
+    function_exported?(module, :retention_point, 2) and
+      function_exported?(module, :retention_status, 1)
   end
 
   @doc """

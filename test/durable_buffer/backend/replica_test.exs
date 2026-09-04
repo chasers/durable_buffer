@@ -624,4 +624,82 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {payloads, _valid, _rest} = batch |> IO.iodata_to_binary() |> DurableBuffer.WAL.decode_all()
     {module.offsets(state).next, length(payloads)}
   end
+
+  test "a replica below the primary's trimmed base is rebased and resynced", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+
+    config =
+      Replica.init_config(
+        dir: primary_dir,
+        replica_dir: replica_dir,
+        replicas: [node()],
+        ack: :all,
+        rpc_timeout: 5000
+      )
+
+    {:ok, state} = Replica.open(config, 0)
+
+    state =
+      Enum.reduce(~w(a b c d e), state, fn payload, state ->
+        {batch, bytes} = encode_batch([payload])
+        {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
+        state
+      end)
+
+    {:ok, state} = Replica.trim(state, 3)
+    assert Replica.offsets(state) == %{first: 3, next: 5}
+    assert :ok = Replica.close(state)
+
+    GenServer.stop(DurableBuffer.Replica.writer_pid(replica_dir, 0, true))
+    File.rm!(Local.wal_path(replica_dir, 0))
+    File.rm(Path.join(replica_dir, "p0.meta"))
+
+    {:ok, state} = Replica.open(config, 0)
+    {batch, bytes} = encode_batch(["f"])
+
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
+
+    assert File.read!(Local.wal_path(replica_dir, 0)) ==
+             File.read!(Local.wal_path(primary_dir, 0))
+
+    assert Enum.to_list(Replica.stream(config, 0)) == ~w(d e f)
+    assert :ok = Replica.close(state)
+  end
+
+  defp await(check, attempts \\ 200) do
+    cond do
+      check.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(10) && await(check, attempts - 1)
+    end
+  end
+
+  test "a trim reaches the replica and reclaims its bytes", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+
+    config =
+      Replica.init_config(dir: primary_dir, replica_dir: replica_dir, replicas: [node()])
+
+    {:ok, state} = Replica.open(config, 0)
+
+    state =
+      Enum.reduce(~w(a b c d), state, fn payload, state ->
+        {batch, bytes} = encode_batch([payload])
+        {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
+        state
+      end)
+
+    before = File.stat!(Local.wal_path(replica_dir, 0)).size
+    {:ok, state} = Replica.trim(state, 2)
+
+    assert await(fn -> File.stat!(Local.wal_path(replica_dir, 0)).size < before end)
+
+    assert File.read!(Local.wal_path(replica_dir, 0)) ==
+             File.read!(Local.wal_path(primary_dir, 0))
+
+    {batch, bytes} = encode_batch(["e"])
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
+    assert Enum.to_list(Replica.stream(config, 0)) == ~w(c d e)
+    assert :ok = Replica.close(state)
+  end
 end

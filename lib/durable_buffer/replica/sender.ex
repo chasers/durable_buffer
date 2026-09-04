@@ -41,6 +41,8 @@ defmodule DurableBuffer.Replica.Sender do
 
   require Logger
 
+  alias DurableBuffer.Meta
+
   @connect_retry_ms 1000
   @resync_chunk_bytes 1024 * 1024
 
@@ -90,6 +92,7 @@ defmodule DurableBuffer.Replica.Sender do
        partition_index: Keyword.fetch!(opts, :partition_index),
        primary_dir: Keyword.fetch!(opts, :primary_dir),
        primary_tail: Keyword.fetch!(opts, :primary_tail),
+       primary_base: 0,
        epoch: Keyword.fetch!(opts, :epoch),
        rpc_timeout: Keyword.fetch!(opts, :rpc_timeout),
        max_bytes: Keyword.fetch!(opts, :max_bytes),
@@ -142,6 +145,7 @@ defmodule DurableBuffer.Replica.Sender do
       state
       | epoch: epoch,
         primary_tail: 0,
+        primary_base: 0,
         queue: :queue.new(),
         queued_bytes: 0,
         watermark: {0, 0}
@@ -155,7 +159,15 @@ defmodule DurableBuffer.Replica.Sender do
     case attach(state) do
       {:ok, writer, remote_tail} ->
         monitor = Process.monitor(writer)
-        state = %{state | writer: writer, monitor: monitor, attach_ref: make_ref()}
+
+        state = %{
+          state
+          | writer: writer,
+            monitor: monitor,
+            attach_ref: make_ref(),
+            primary_base: primary_base(state)
+        }
+
         {:noreply, reconcile(state, remote_tail)}
 
       :error ->
@@ -179,7 +191,11 @@ defmodule DurableBuffer.Replica.Sender do
         {:noreply, ensure_progress_check(state)}
 
       true ->
-        case :file.pread(state.resync_fd, cursor, min(@resync_chunk_bytes, target - cursor)) do
+        case :file.pread(
+               state.resync_fd,
+               cursor - state.primary_base,
+               min(@resync_chunk_bytes, target - cursor)
+             ) do
           {:ok, data} when byte_size(data) > 0 ->
             send(state.writer, {:replicate, state.attach_ref, state.epoch, cursor, data, self()})
             send(self(), :resync_step)
@@ -288,6 +304,15 @@ defmodule DurableBuffer.Replica.Sender do
 
         wipe_and_resync(state)
 
+      remote_offset < state.primary_base ->
+        Logger.info(
+          "DurableBuffer replica sender to #{inspect(state.node)} " <>
+            "(#{state.dir} p#{state.partition_index}) is below the primary's trimmed " <>
+            "base; discarding it and resyncing from offset #{state.primary_base}"
+        )
+
+        wipe_and_resync(state)
+
       remote_offset < next_needed(state) ->
         state |> note_adopted() |> start_resync(remote_offset)
 
@@ -312,9 +337,13 @@ defmodule DurableBuffer.Replica.Sender do
 
   defp wipe_and_resync(state) do
     case truncate_remote(state) do
-      :ok -> state |> note_adopted() |> start_resync(0)
+      :ok -> state |> note_adopted() |> start_resync(state.primary_base)
       :error -> force_reattach(state)
     end
+  end
+
+  defp primary_base(state) do
+    Meta.load(state.primary_dir, state.partition_index).base_byte_offset
   end
 
   defp note_adopted(state) do
@@ -331,6 +360,9 @@ defmodule DurableBuffer.Replica.Sender do
 
   defp start_resync(state, cursor) do
     path = DurableBuffer.Backend.Local.wal_path(state.primary_dir, state.partition_index)
+    base = primary_base(state)
+    cursor = max(cursor, base)
+    state = %{state | primary_base: base}
 
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
@@ -356,7 +388,7 @@ defmodule DurableBuffer.Replica.Sender do
       state.node,
       DurableBuffer.Replica,
       :truncate,
-      [state.dir, state.partition_index, state.epoch],
+      [state.dir, state.partition_index, state.epoch, state.primary_base],
       state.rpc_timeout
     )
   catch

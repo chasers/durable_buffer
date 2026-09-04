@@ -45,7 +45,10 @@ DurableBuffer.stream(:events, user_id, with_offsets: true)        # {offset, pay
 
 DurableBuffer.offsets(:events, user_id)                           # %{first:, durable:, next:}
 
-:ok = DurableBuffer.truncate(:events, user_id)                    # drop consumed data
+:ok = DurableBuffer.trim(:events, user_id)                        # apply the policy
+:ok = DurableBuffer.trim(:events, user_id, upto: 5_000)           # explicit point
+DurableBuffer.retention(:events, user_id)                         # %{oldest_age_ms:, bytes:}
+:ok = DurableBuffer.truncate(:events, user_id)                    # drop everything
 :ok = DurableBuffer.truncate_all(:events)
 ```
 
@@ -69,17 +72,148 @@ than resetting to zero, so a resumed consumer can never silently read
 different data at the same offset. They survive a restart: a partition
 recovers its count from the WAL on open.
 
-Use `:first` to detect that a resume point predates retention and fall back
-to a full resync, instead of silently replaying from the trim point.
+Compare a resume point against `:first` to detect that it predates
+retention. `stream/3` checks it too, and raises
+`DurableBuffer.OutOfRangeError` rather than replaying from the trim point.
+
+### Consumer positions
+
+The buffer does not track consumers. It records no positions for them, and
+their positions do not gate retention. A consumer keeps its own cursor, the
+way an SSE client carries `Last-Event-ID` and a Kafka consumer stores its
+offset outside the log:
+
+```elixir
+from = MyApp.Cursor.load("worker-1") || 0
+
+try do
+  for {offset, payload} <-
+        DurableBuffer.stream(:events, user_id, from: from, with_offsets: true) do
+    handle(payload)
+    MyApp.Cursor.save("worker-1", offset + 1)
+  end
+rescue
+  error in DurableBuffer.OutOfRangeError -> resync_from(error.first)
+end
+```
+
+**A read below `:first` raises.** Starting at the retained base instead
+would hand the consumer a contiguous-looking stream with a hole in it, and
+nothing else protects a consumer that falls behind the retention window.
+`DurableBuffer.OutOfRangeError` names the offset asked for and the oldest
+one retained, so the caller resyncs deliberately. `stream/3` reads the
+bounds before it builds the stream, so the raise lands at the call rather
+than part-way through iterating.
+
+### Retention
+
+Declare a window and let the buffer pick the trim point:
+
+```elixir
+{DurableBuffer,
+ name: :events,
+ backend: {DurableBuffer.Backend.Local, dir: "/var/lib/events"},
+ retention_ms: :timer.hours(24 * 7),
+ retention_bytes: 10 * 1024 * 1024 * 1024}
+```
+
+```elixir
+:ok = DurableBuffer.trim(:events, user_id)              # apply the policy
+:ok = DurableBuffer.trim(:events, user_id, upto: 5_000) # explicit point
+```
+
+Whichever bound binds first decides: "7 days" does not bound disk under a
+traffic spike, and "10 GB" does not bound age on a quiet one. A buffer that
+declares neither returns `{:error, :no_retention_policy}` — the buffer
+tracks no consumers, so with no policy there is nothing to compute a point
+from. Nothing to drop is `:ok`, not an error.
+
+**Retention runs on its own.** Declaring a bound turns on a per-partition
+timer, so a buffer honours its window without anyone calling `trim/2`.
+`retention_interval_ms` controls it (default 60 s) and `:infinity` turns it
+off. Partitions start on a random offset inside the first interval, so they
+do not all trim at the same instant. The timed trim goes through the same
+committer as every other unit of work, so it queues behind pending commits
+rather than pre-empting them — a trim landing during a load spike takes its
+turn. Call `trim/2` yourself only to trim sooner than the next tick.
+
+`DurableBuffer.retention/2` reports what the policy has to work with:
+
+```elixir
+{:ok, %{oldest_age_ms: 604_012, bytes: 8_431_923_712}} =
+  DurableBuffer.retention(:events, user_id)
+```
+
+Alert on `:oldest_age_ms`. It should sit near `retention_ms` on a busy
+partition, and climbing well past it is what a stalled time retention looks
+like from outside. It is `nil` only for an empty partition.
+
+**Where the timestamps live.** In the seek index, one per group commit,
+alongside the offset and byte position that record already carries. That
+costs 8 bytes per *batch* and no extra write on the commit path. The index
+is `datasync`ed on an interval (`index_sync_ms`, default 5 s), not per
+commit, so a crash leaves only the last few seconds of commits undated.
+
+Undated data is treated as **just written**. A partition backfills any
+retained range its index cannot date with the current time when it opens,
+so a lost index makes old data look young and never the reverse. A lost
+index therefore *delays* retention; it never causes an early trim.
+
+Both bounds resolve through the index, so both go coarse while it rebuilds
+— a cut can only land on a surviving record's boundary. `retention_bytes`
+recovers first, because it needs only byte positions and every new commit
+adds one. `retention_ms` additionally waits out the backfilled timestamp on
+the head, which is the case worth setting a size bound alongside it for.
+
+`upto:` is exclusive: every entry below it is dropped and becomes the new
+`:first`. A trim past the durable offset is refused with
+`{:error, :not_durable}`; a policy point is clamped to it instead.
+
+The local backend cuts exactly at an explicit point, and on the batch
+boundary at or below a policy point. It copies the retained suffix
+to a sibling file, `datasync`s it and renames over the WAL, so a crash
+mid-trim leaves the original intact; the cost is proportional to the bytes
+*kept*, which is cheap exactly when trimming is routine. S3 stores immutable
+segments, so it drops only segments lying entirely below the point and
+`:first` lands on a segment boundary at or below it.
+
+**A trim does not reach the replication wire.** Batches are stamped with
+*logical* byte offsets, which count from the first byte ever written rather
+than from the start of the file, so trimming the head moves
+`base_byte_offset` and leaves every stamped number alone. No epoch bump, no
+resync, and the seek index needs no rebuild. The primary passes its new base
+on to each replica as an advisory, best-effort `:erpc` — a replica that
+misses it simply keeps more data than it needs.
+
+The one case that needs care is a replica whose tail falls *below* the
+primary's base, because it was down while the primary appended and then
+trimmed. Nobody has the bytes in between, so the sender discards that
+replica's copy, rebases it on the primary's base, and streams forward from
+there.
 
 `from:` seeks rather than scans. The local backend keeps a sparse index
-(`p<index>.idx`, one 20-byte record per group commit) and binary-searches it
-for the last batch at or before the wanted offset. The index is a pure
-cache: it is written on the commit path but never `datasync`ed, and any
-record the WAL does not back is dropped when the partition opens. A missing,
-stale, torn or corrupt index costs a scan from the start of the log — never
-a wrong answer. S3 needs no index at all: its segment keys *are* offsets, so
-a seek picks the floor key from the listing it already does.
+(`p<index>.idx`, one 28-byte record per group commit: first offset, byte
+position, commit time) and binary-searches it for the last batch at or
+before the wanted offset. All three fields rise together, because commits
+are ordered, so a search by time or by size is the same binary search — which
+is what retention uses.
+
+For reads the index is a pure cache. Any record the WAL does not back is
+dropped when the partition opens — past its tail, below its retained base,
+or torn. A seek result pointing below the base is ignored as well, since a
+crash between the index write and the synced metadata beside it can leave
+the base advanced and stale records behind. A missing, stale, torn or
+corrupt index costs a scan from the start of the log — never a wrong
+answer.
+
+For retention it is a cache that can only *delay* a trim, never cause an
+early one: a range the index cannot date is backfilled as just written. A
+trim carries the timestamp of the batch it cut into over to the new head, so
+the head keeps its real age instead of resetting.
+
+S3 needs no index at all: its segment keys *are* offsets, so a seek picks the
+floor key from the listing it already does, and that listing carries
+`LastModified` and `Size` for retention.
 
 The `partition_key` (any term) is hashed to one of a fixed number of
 partitions (default `System.schedulers_online()`). Each partition has its own
@@ -98,6 +232,13 @@ use more partitions to saturate your disk.
 | `:flush_delay_ms` | 0 (adaptive) | Dwell before committing a batch started while idle. Default is adaptive: 0 normally, growing to 2 ms automatically when commit completions are slow (fsync/PUT-bound) and batches are concurrent. An explicit value fixes the dwell |
 | `:max_inflight_commits` | 32 | For backends with pipelined commits (currently `Backend.Replica`): batches committing concurrently per partition; replies stay in order |
 | `:heal_timeout` | 5 s | `Backend.Replica` only: how long `open/2` waits for a replica to report its tail before it opens without healing from that node |
+| `:retention_ms` | none | Keep at most this much history per partition. `trim/2` with no options drops batches that committed longer ago |
+| `:retention_bytes` | none | Keep at most this many bytes per partition. Whichever bound binds first decides |
+| `:retention_interval_ms` | 60 s | How often each partition applies its policy on its own. Declaring a bound turns the timer on; `:infinity` turns it off and leaves `trim/2` manual. Must be a positive integer or `:infinity` |
+
+Retention resolves both bounds through the seek index, so a buffer that sets
+a bound cannot also set `index: false` on the local backend — that
+combination raises rather than growing without limit in silence.
 
 ### Tuning for small payloads
 
@@ -136,11 +277,27 @@ Append-only WAL file per partition (`p<index>.wal`), one write + one
 `:file.datasync/1` per group commit. Entries are framed as
 `<<len::32, crc32::32, payload>>`; torn tails from crashes are detected by
 CRC and truncated on open. Two sidecars sit next to it: `p<index>.meta`
-(epoch and retention bounds) and `p<index>.idx` (the sparse seek index).
+(epoch and the retained bases) and `p<index>.idx` (the sparse seek index).
+A third, `p<index>.trim`, exists only while a trim is in flight.
+
+**A trim is two durable steps**, the WAL rewrite and the new base in
+`p<index>.meta`, so a crash can land between them. Before the rewrite the
+base it is moving to goes into `p<index>.trim`; after the metadata is
+written it is removed. On open, a leftover `p<index>.trim` says a trim was
+interrupted, and the presence of the WAL's own temporary file says which
+side of the rename the crash fell on: still there means the rewrite never
+landed and the old base stands, gone means it did and the new base is
+adopted. `p<index>.meta` is itself written to a sibling and renamed, so it
+is never a zero-byte file with the bases reset to zero.
 
 `fsync: false` skips the `datasync` — commits then survive a BEAM crash but
 not an OS crash or power loss. Defaults to `true` for this backend: with a
 single copy, the fsync *is* the durability.
+
+`index_sync_ms` (default 5 s) is how often the seek index is `datasync`ed.
+It is append-only, so one sync covers every record since the last, and the
+cost stays off the per-commit path. A crash then leaves at most that much
+data undated, which retention reads as young.
 
 ### Replicated
 
@@ -324,7 +481,9 @@ caller latency distributions, and small-payload tuning — are in
 Each script prints an aggregate **throughput** grid (ops/s and MB/s over a
 payload-size × caller-concurrency matrix, measured with timed concurrent
 loops), a **mixed append + stream** grid (readers re-streaming partitions
-while writers append), and Benchee **caller latency** distributions
+while writers append), a **stream-only** grid (the read path with no
+writers), a **seek** grid (time to the first entry of a `from:` read at
+increasing depth), and Benchee **caller latency** distributions
 (median / p99) at several concurrency levels.
 
 ```sh

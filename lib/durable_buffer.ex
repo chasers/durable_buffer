@@ -14,7 +14,7 @@ defmodule DurableBuffer do
 
   Then append from any process:
 
-      :ok = DurableBuffer.append(:events, user_id, payload)
+      {:ok, offset} = DurableBuffer.append(:events, user_id, payload)
 
   `append/3` returns once the payload is durable per the backend's guarantee.
   All appends that arrive at a partition while a commit is in flight are
@@ -24,6 +24,12 @@ defmodule DurableBuffer do
   prefer `append_batch/4`, which moves a whole list of payloads in one call.
   The `partition_key` is hashed to one of a fixed set of partitions; each
   partition commits independently and in parallel.
+
+  Data is kept for a window rather than forever. Declare `retention_ms`,
+  `retention_bytes`, or both, and each partition applies the policy on a
+  timer; whichever bound binds first decides. The buffer tracks no
+  consumers, so a consumer keeps its own cursor and `stream/3` raises
+  `DurableBuffer.OutOfRangeError` if that cursor falls outside the window.
 
   Backends:
 
@@ -58,6 +64,18 @@ defmodule DurableBuffer do
       (currently `DurableBuffer.Backend.Replica`), how many batches may be
       committing concurrently per partition, default 32. Callers are always
       replied to in order
+    * `:retention_ms` — keep at most this much history per partition. A
+      `trim/2` with no options drops batches that committed longer ago
+    * `:retention_bytes` — keep at most this many bytes per partition. Set
+      both bounds and whichever binds first decides. A size bound needs no
+      timestamps, so an index that cannot *date* its records still bounds
+      the disk; it does resolve through the index's byte positions, so a
+      lost index makes it coarse until new commits rebuild them
+    * `:retention_interval_ms` — how often each partition applies its
+      retention policy on its own, default 60_000. Declaring a bound turns
+      the timer on; `:infinity` turns it off and leaves `trim/2` manual.
+      Partitions start on a random offset within the first interval, so
+      they do not all trim at once
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -155,8 +173,11 @@ defmodule DurableBuffer do
 
   Options:
 
-    * `:from` — start at this logical offset, inclusive. Resume a consumer
-      with `from: last_acked + 1`.
+    * `:from` — start at this logical offset, inclusive. A consumer keeps
+      its own cursor and resumes with `from: last_processed + 1`. An offset
+      below `offsets/2`'s `:first` raises `DurableBuffer.OutOfRangeError`
+      rather than silently starting at the base, so a consumer that fell
+      outside the retention window resyncs deliberately.
     * `:with_offsets` — yield `{offset, payload}` instead of `payload`.
     * `:dirty` — read the whole local WAL, including batches that have not
       met the policy and may still fail. Recovery tooling wants this;
@@ -166,6 +187,7 @@ defmodule DurableBuffer do
   def stream(name, partition_key, opts \\ []) do
     %{backend: {backend, backend_config}} = buffer = config(name)
     index = partition_index(name, partition_key)
+    :ok = check_in_range(buffer, name, index, Keyword.get(opts, :from))
 
     if Backend.gates_reads?(backend) or Backend.tracks_offsets?(backend) do
       backend.stream(backend_config, index, stream_opts(buffer, index, backend, opts))
@@ -182,9 +204,10 @@ defmodule DurableBuffer do
       durability guarantee. This is where a reader's view ends.
     * `:next` — where the next append lands.
 
-  On a quiet buffer `:durable` and `:next` are equal. Use `:first` to detect
-  that a resume point predates retention and fall back to a full resync,
-  rather than silently replaying from the trim point.
+  On a quiet buffer `:durable` and `:next` are equal. Compare a resume point
+  against `:first` to detect that it predates retention. `stream/3` checks
+  it too, and raises `DurableBuffer.OutOfRangeError` rather than replaying
+  from the trim point.
   """
   @spec offsets(atom(), term()) :: %{
           first: non_neg_integer(),
@@ -226,6 +249,73 @@ defmodule DurableBuffer do
 
     :ok
   end
+
+  @doc """
+  Drops entries from the head of `partition_key`'s partition.
+
+      :ok = DurableBuffer.trim(:events, user_id)              # apply the policy
+      :ok = DurableBuffer.trim(:events, user_id, upto: 5_000) # explicit point
+
+  With no options the buffer's `:retention_ms` and `:retention_bytes` decide
+  the point, and whichever bound binds first wins. A buffer that declares
+  neither returns `{:error, :no_retention_policy}` — the buffer tracks no
+  consumers, so with no policy there is nothing to compute a point from.
+  Nothing to drop is `:ok`, not an error.
+
+  A buffer that declares a bound already applies it: each partition runs the
+  policy every `:retention_interval_ms`, so calling this is for trimming
+  sooner than the next tick. The timed trim goes through the committer like
+  every other unit of work, so it takes its turn behind pending commits
+  rather than pre-empting them.
+
+  `upto:` is exclusive: every entry *below* it is dropped, and `offsets/2`
+  reports it as the new `:first`. A trim past the durable offset is refused
+  with `{:error, :not_durable}`; a policy point is clamped to it instead.
+
+  The local and replicated backends cut on the batch boundary at or below
+  the point for a policy trim, and exactly at `upto` for an explicit one.
+  S3 stores immutable segments, so it drops only segments that lie entirely
+  below the trim point.
+  """
+  @spec trim(atom(), term(), keyword()) :: :ok | {:error, term()}
+  def trim(name, partition_key, opts \\ []) do
+    name
+    |> partition_server(partition_key)
+    |> Partition.trim(Keyword.get(opts, :upto, :policy))
+  end
+
+  @doc """
+  Reports what retention has to work with for `partition_key`'s partition.
+
+    * `:oldest_age_ms` — how long ago the oldest retained batch committed,
+      or `nil` for an empty partition.
+    * `:bytes` — bytes retained.
+
+  Alert on `:oldest_age_ms`. It should sit near `:retention_ms` on a busy
+  partition, and climbing well past it is what a stalled time retention
+  looks like from outside.
+
+  It is never `nil` for a partition holding data: a range the seek index
+  cannot date is backfilled as written now when the partition opens, so an
+  undated head reads as young rather than as unknown. That is deliberate —
+  it errs toward keeping data — but it means the age, not a `nil`, is the
+  signal worth watching.
+  """
+  @spec retention(atom(), term()) ::
+          {:ok, %{oldest_age_ms: non_neg_integer() | nil, bytes: non_neg_integer()}}
+          | {:error, term()}
+  def retention(name, partition_key) do
+    case name |> partition_server(partition_key) |> Partition.retention_status() do
+      {:ok, %{oldest_ms: oldest_ms, bytes: bytes}} ->
+        {:ok, %{oldest_age_ms: age_ms(oldest_ms), bytes: bytes}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp age_ms(nil), do: nil
+  defp age_ms(oldest_ms), do: max(System.system_time(:millisecond) - oldest_ms, 0)
 
   @doc """
   Reports each replica's replication state for `partition_key`'s partition.
@@ -284,12 +374,30 @@ defmodule DurableBuffer do
   Returns the buffer's resolved configuration.
   """
   @spec config(atom()) :: %{
+          name: atom(),
           partitions: pos_integer(),
           backend: {module(), map()},
-          durable_offsets: :atomics.atomics_ref()
+          durable_offsets: :atomics.atomics_ref(),
+          retention: DurableBuffer.Backend.policy()
         }
   def config(name) do
     :persistent_term.get({DurableBuffer, name})
+  end
+
+  defp check_in_range(_buffer, _name, _index, nil), do: :ok
+
+  defp check_in_range(buffer, name, index, from) do
+    first = :atomics.get(Map.fetch!(buffer, :durable_offsets), index * 4 + 4)
+
+    if from < first do
+      raise DurableBuffer.OutOfRangeError,
+        name: name,
+        partition_index: index,
+        requested: from,
+        first: first
+    end
+
+    :ok
   end
 
   defp stream_opts(buffer, index, backend, opts) do
@@ -303,6 +411,7 @@ defmodule DurableBuffer do
     opts
     |> Keyword.take([:from, :with_offsets])
     |> Keyword.put(:limit, limit)
+    |> Keyword.put(:name, Map.get(buffer, :name))
   end
 
   defp read_limit(buffer, index) do

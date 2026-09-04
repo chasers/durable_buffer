@@ -11,3 +11,5 @@ Replication_noepoch	VIOLATED
 Replication_notailcheck	VIOLATED
 Replication_quorum	PASS
 Replication_staletruncate	VIOLATED
+Replication_trim	PASS
+Replication_trimskew	VIOLATED
