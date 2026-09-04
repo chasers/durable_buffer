@@ -260,3 +260,43 @@ parallel      average     median     99th %
 
 At 64 parallel callers the median is ~2× PUT latency: a caller lands mid-PUT,
 waits for it to finish, then rides the next group commit.
+
+## Replication transport
+
+`mix run bench/transport_bench.exs`
+
+Append throughput and caller latency for each transport, with and without an
+unrelated load on the distribution channel between the same node pair. The
+hog is four processes shipping 4 MiB `:erpc` payloads to the replica node —
+traffic replication has nothing to do with, which is the point. `HOGS`
+(default `0,4`) sets the counts to measure.
+
+Both nodes run on this host, so this measures contention for one socket and
+the scheduler, not a saturated network. Two runs, 64 KiB payloads, 8
+partitions:
+
+| transport | hogs | ops/s | p50 us | p99 us |
+|---|---|---|---|---|
+| distribution | 0 | 24489 / 24411 | 338 / 314 | 3636 / 2908 |
+| distribution | 4 | 6840 / 10114 | 4074 / 3620 | 22424 / 12423 |
+| gen_rpc | 0 | 31982 / 18286 | 432 / 395 | 2119 / 2053 |
+| gen_rpc | 4 | 9894 / 10635 | 647 / 506 | 5603 / 2748 |
+
+**Throughput does not separate them.** The two runs disagree on which is
+faster idle, and land within 5% of each other under load. Do not read
+anything into the ops/s column.
+
+**Latency does, and it is large.** Under contention distribution's p50 goes
+from ~320 us to ~3800 us and its p99 from ~3300 us to ~17000 us. gen_rpc's
+p50 goes from ~410 us to ~580 us and its p99 stays near 4000 us. Both runs
+agree: gen_rpc holds close to its idle latency where distribution does not.
+
+That is the mechanism showing up exactly where it should. Head-of-line
+blocking delays individual commits behind whatever else is on the socket;
+it does not stop bytes moving in aggregate. A commit waits, so the caller
+waits.
+
+The effect in a real cluster is larger than this table and not only about
+appends. On loopback the hog competes for a scheduler; on a real link it
+competes for a NIC, and the same queue carries the cluster heartbeat, whose
+delay reads as a node going down.

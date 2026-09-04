@@ -526,6 +526,19 @@ Ordering comes from `ordered_cast/4`, which gen_rpc serialises per
 gets its own connection and its own order, and partitions never block each
 other.
 
+**When it is worth it.** `bench/transport_bench.exs` puts an unrelated load
+on the distribution channel between the same pair and measures both
+transports. Throughput does not separate them. Caller latency does: under
+contention distribution's p50 rises about 12x and its p99 about 5x, while
+gen_rpc stays near its idle numbers. See [bench/README.md](bench/README.md).
+
+That is head-of-line blocking doing what it does — it delays individual
+commits behind other traffic rather than reducing aggregate bytes. Reach for
+gen_rpc when the node pair carries anything besides replication and you care
+about append latency, or when a delayed cluster heartbeat would be costly.
+Stay on distribution when the pair is quiet, or when the extra port, the
+separate TLS configuration and the git dependency are not worth it.
+
 ### S3
 
 ```elixir
