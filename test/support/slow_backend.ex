@@ -34,7 +34,7 @@ defmodule DurableBuffer.Test.SlowBackend do
   end
 
   @impl DurableBuffer.Backend
-  def commit(state, batch, _byte_size) do
+  def commit(state, batch, _byte_size, _span) do
     Process.sleep(state.commit_sleep)
     binary = IO.iodata_to_binary(batch)
 

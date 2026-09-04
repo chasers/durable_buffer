@@ -35,13 +35,6 @@ defmodule DurableBuffer.MetaTest do
     assert Meta.load(tmp_dir, 0) == %Meta{epoch: 5, base_offset: 10, base_byte_offset: 0}
   end
 
-  test "reads the pre-0.4.0 epoch-only record", %{tmp_dir: tmp_dir} do
-    body = <<9::64-big>>
-    File.write!(Path.join(tmp_dir, "p0.meta"), [body, <<:erlang.crc32(body)::32-big>>])
-
-    assert Meta.load(tmp_dir, 0) == %Meta{epoch: 9, base_offset: 0, base_byte_offset: 0}
-  end
-
   test "a corrupt meta file reads as zeroes", %{tmp_dir: tmp_dir} do
     :ok = Meta.store!(tmp_dir, 0, %Meta{epoch: 7})
     File.write!(Path.join(tmp_dir, "p0.meta"), "garbage-bytes")

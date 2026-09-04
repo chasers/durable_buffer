@@ -321,4 +321,79 @@ defmodule DurableBufferTest do
       assert Enum.to_list(DurableBuffer.stream(name, "k")) == []
     end
   end
+
+  describe "seeking with from:" do
+    setup %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+
+      for chunk <- Enum.chunk_every(0..29, 3) do
+        {:ok, _range} =
+          DurableBuffer.append_batch(name, "k", Enum.map(chunk, &"entry-#{&1}"))
+      end
+
+      %{name: name, dir: tmp_dir}
+    end
+
+    test "lands on a batch boundary", %{name: name} do
+      assert Enum.take(DurableBuffer.stream(name, "k", from: 9), 2) == ["entry-9", "entry-10"]
+    end
+
+    test "lands mid-batch", %{name: name} do
+      assert Enum.take(DurableBuffer.stream(name, "k", from: 10), 2) == ["entry-10", "entry-11"]
+    end
+
+    test "labels the suffix with the right offsets", %{name: name} do
+      assert Enum.take(DurableBuffer.stream(name, "k", from: 25, with_offsets: true), 2) ==
+               [{25, "entry-25"}, {26, "entry-26"}]
+    end
+
+    test "returns the whole suffix from every offset", %{name: name} do
+      for from <- 0..30 do
+        assert Enum.to_list(DurableBuffer.stream(name, "k", from: from)) ==
+                 Enum.map(from..29//1, &"entry-#{&1}")
+      end
+    end
+
+    test "is correct without an index", %{name: name, dir: dir} do
+      File.rm!(Path.join(dir, "p0.idx"))
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 25)) ==
+               Enum.map(25..29, &"entry-#{&1}")
+    end
+
+    test "is correct with a corrupt index", %{name: name, dir: dir} do
+      File.write!(Path.join(dir, "p0.idx"), :crypto.strong_rand_bytes(200))
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 25)) ==
+               Enum.map(25..29, &"entry-#{&1}")
+    end
+
+    test "is correct with a truncated index", %{name: name, dir: dir} do
+      path = Path.join(dir, "p0.idx")
+      contents = File.read!(path)
+      File.write!(path, binary_part(contents, 0, 30))
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 25)) ==
+               Enum.map(25..29, &"entry-#{&1}")
+    end
+  end
+
+  test "an index ahead of the WAL is trimmed on open", %{tmp_dir: tmp_dir} do
+    name = start_buffer(tmp_dir, partitions: 1)
+    {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ["a", "b", "c"])
+    stop_supervised!({DurableBuffer, name})
+
+    index = Path.join(tmp_dir, "p0.idx")
+    before = File.stat!(index).size
+    dangling = <<99::64-big, 999_999::64-big>>
+
+    File.write!(index, [File.read!(index), dangling, <<:erlang.crc32(dangling)::32-big>>], [
+      :binary
+    ])
+
+    name = start_buffer(tmp_dir, name: name, partitions: 1)
+    assert File.stat!(index).size == before
+
+    assert Enum.to_list(DurableBuffer.stream(name, "k", from: 1)) == ["b", "c"]
+  end
 end
