@@ -701,6 +701,23 @@ defmodule DurableBufferTest do
       end
     end
 
+    test "a trim while the stream sits unenumerated raises", %{name: name} do
+      stream = DurableBuffer.stream(name, "k", from: 6)
+      :ok = DurableBuffer.trim(name, "k", upto: 8)
+
+      assert_raise DurableBuffer.OutOfRangeError, fn -> Enum.to_list(stream) end
+    end
+
+    test "a trim below the stream's start still reads correctly", %{tmp_dir: tmp_dir} do
+      name = start_buffer(Path.join(tmp_dir, "racing"), partitions: 1)
+      {:ok, 0..9} = DurableBuffer.append_batch(name, "k", Enum.map(0..9, &"e#{&1}"))
+
+      stream = DurableBuffer.stream(name, "k", from: 6)
+      :ok = DurableBuffer.trim(name, "k", upto: 3)
+
+      assert Enum.to_list(stream) == ~w(e6 e7 e8 e9)
+    end
+
     test "a truncate puts every earlier offset out of range", %{tmp_dir: tmp_dir} do
       name = start_buffer(Path.join(tmp_dir, "truncated"), partitions: 1)
       {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))

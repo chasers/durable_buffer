@@ -61,9 +61,10 @@ defmodule DurableBuffer do
     * `:retention_ms` — keep at most this much history per partition. A
       `trim/2` with no options drops batches that committed longer ago
     * `:retention_bytes` — keep at most this many bytes per partition. Set
-      both bounds and whichever binds first decides; a size bound needs no
-      timestamps, so it still holds when a rebuilt seek index cannot date
-      the head
+      both bounds and whichever binds first decides. A size bound needs no
+      timestamps, so an index that cannot *date* its records still bounds
+      the disk; it does resolve through the index's byte positions, so a
+      lost index makes it coarse until new commits rebuild them
     * `:retention_interval_ms` — how often each partition applies its
       retention policy on its own, default 60_000. Declaring a bound turns
       the timer on; `:infinity` turns it off and leaves `trim/2` manual.
@@ -281,13 +282,18 @@ defmodule DurableBuffer do
   Reports what retention has to work with for `partition_key`'s partition.
 
     * `:oldest_age_ms` — how long ago the oldest retained batch committed,
-      or `nil` when the partition is empty or cannot date its head.
+      or `nil` for an empty partition.
     * `:bytes` — bytes retained.
 
-  Use `:oldest_age_ms` to see a stalled time retention. It should sit near
-  `:retention_ms` on a busy partition. A `nil` means the seek index cannot
-  date the head, so time retention is waiting for the index to be rebuilt
-  while size retention keeps bounding the disk.
+  Alert on `:oldest_age_ms`. It should sit near `:retention_ms` on a busy
+  partition, and climbing well past it is what a stalled time retention
+  looks like from outside.
+
+  It is never `nil` for a partition holding data: a range the seek index
+  cannot date is backfilled as written now when the partition opens, so an
+  undated head reads as young rather than as unknown. That is deliberate —
+  it errs toward keeping data — but it means the age, not a `nil`, is the
+  signal worth watching.
   """
   @spec retention(atom(), term()) ::
           {:ok, %{oldest_age_ms: non_neg_integer() | nil, bytes: non_neg_integer()}}
@@ -362,6 +368,7 @@ defmodule DurableBuffer do
   Returns the buffer's resolved configuration.
   """
   @spec config(atom()) :: %{
+          name: atom(),
           partitions: pos_integer(),
           backend: {module(), map()},
           durable_offsets: :atomics.atomics_ref(),
@@ -398,6 +405,7 @@ defmodule DurableBuffer do
     opts
     |> Keyword.take([:from, :with_offsets])
     |> Keyword.put(:limit, limit)
+    |> Keyword.put(:name, Map.get(buffer, :name))
   end
 
   defp read_limit(buffer, index) do

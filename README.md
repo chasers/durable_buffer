@@ -144,9 +144,9 @@ turn. Call `trim/2` yourself only to trim sooner than the next tick.
   DurableBuffer.retention(:events, user_id)
 ```
 
-Watch `:oldest_age_ms`. It should sit near `retention_ms` on a busy
-partition. A `nil` means the seek index cannot date the head, so time
-retention is stalled while size retention keeps bounding the disk.
+Alert on `:oldest_age_ms`. It should sit near `retention_ms` on a busy
+partition, and climbing well past it is what a stalled time retention looks
+like from outside. It is `nil` only for an empty partition.
 
 **Where the timestamps live.** In the seek index, one per group commit,
 alongside the offset and byte position that record already carries. That
@@ -156,9 +156,14 @@ commit, so a crash leaves only the last few seconds of commits undated.
 
 Undated data is treated as **just written**. A partition backfills any
 retained range its index cannot date with the current time when it opens,
-so a lost index makes old data look young and never the reverse. That is
-also why `retention_bytes` is worth setting: it needs no timestamps at all,
-so it keeps bounding the disk while a rebuilt index catches up.
+so a lost index makes old data look young and never the reverse. A lost
+index therefore *delays* retention; it never causes an early trim.
+
+Both bounds resolve through the index, so both go coarse while it rebuilds
+— a cut can only land on a surviving record's boundary. `retention_bytes`
+recovers first, because it needs only byte positions and every new commit
+adds one. `retention_ms` additionally waits out the backfilled timestamp on
+the head, which is the case worth setting a size bound alongside it for.
 
 `upto:` is exclusive: every entry below it is dropped and becomes the new
 `:first`. A trim past the durable offset is refused with
@@ -229,7 +234,11 @@ use more partitions to saturate your disk.
 | `:heal_timeout` | 5 s | `Backend.Replica` only: how long `open/2` waits for a replica to report its tail before it opens without healing from that node |
 | `:retention_ms` | none | Keep at most this much history per partition. `trim/2` with no options drops batches that committed longer ago |
 | `:retention_bytes` | none | Keep at most this many bytes per partition. Whichever bound binds first decides |
-| `:retention_interval_ms` | 60 s | How often each partition applies its policy on its own. Declaring a bound turns the timer on; `:infinity` turns it off and leaves `trim/2` manual |
+| `:retention_interval_ms` | 60 s | How often each partition applies its policy on its own. Declaring a bound turns the timer on; `:infinity` turns it off and leaves `trim/2` manual. Must be a positive integer or `:infinity` |
+
+Retention resolves both bounds through the seek index, so a buffer that sets
+a bound cannot also set `index: false` on the local backend — that
+combination raises rather than growing without limit in silence.
 
 ### Tuning for small payloads
 
@@ -268,7 +277,18 @@ Append-only WAL file per partition (`p<index>.wal`), one write + one
 `:file.datasync/1` per group commit. Entries are framed as
 `<<len::32, crc32::32, payload>>`; torn tails from crashes are detected by
 CRC and truncated on open. Two sidecars sit next to it: `p<index>.meta`
-(epoch and retention bounds) and `p<index>.idx` (the sparse seek index).
+(epoch and the retained bases) and `p<index>.idx` (the sparse seek index).
+A third, `p<index>.trim`, exists only while a trim is in flight.
+
+**A trim is two durable steps**, the WAL rewrite and the new base in
+`p<index>.meta`, so a crash can land between them. Before the rewrite the
+base it is moving to goes into `p<index>.trim`; after the metadata is
+written it is removed. On open, a leftover `p<index>.trim` says a trim was
+interrupted, and the presence of the WAL's own temporary file says which
+side of the rename the crash fell on: still there means the rewrite never
+landed and the old base stands, gone means it did and the new base is
+adopted. `p<index>.meta` is itself written to a sibling and renamed, so it
+is never a zero-byte file with the bases reset to zero.
 
 `fsync: false` skips the `datasync` — commits then survive a BEAM crash but
 not an OS crash or power loss. Defaults to `true` for this backend: with a

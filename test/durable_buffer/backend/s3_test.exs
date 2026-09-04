@@ -238,8 +238,8 @@ defmodule DurableBuffer.Backend.S3Test do
       assert point == 4
     end
 
-    test "is a no-op point while neither bound is exceeded", %{state: state} do
-      assert {:ok, 0} = S3.retention_point(state, %{ms: 60_000, bytes: 1_000_000})
+    test "reports :none while neither bound is exceeded", %{state: state} do
+      assert :none = S3.retention_point(state, %{ms: 60_000, bytes: 1_000_000})
     end
 
     test "reports the oldest segment's age and the bytes held", %{store: store, state: state} do

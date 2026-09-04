@@ -40,6 +40,7 @@ defmodule DurableBuffer.Backend.Local do
   def open(config, partition_index) do
     path = wal_path(config.dir, partition_index)
     File.mkdir_p!(Path.dirname(path))
+    :ok = recover_trim!(config.dir, partition_index, path)
     {physical, entry_count} = WAL.recover!(path)
     meta = Meta.load(config.dir, partition_index)
     {:ok, fd} = :file.open(path, [:append, :raw, :binary])
@@ -60,6 +61,30 @@ defmodule DurableBuffer.Backend.Local do
        index_synced_at: System.monotonic_time(:millisecond)
      }}
   end
+
+  defp recover_trim!(dir, partition_index, path) do
+    case Meta.pending(dir, partition_index) do
+      nil ->
+        :ok
+
+      pending ->
+        if File.exists?(trim_path(path)) do
+          _ignored = File.rm(trim_path(path))
+        else
+          Meta.update!(dir, partition_index, fn meta ->
+            %{
+              meta
+              | base_offset: pending.base_offset,
+                base_byte_offset: pending.base_byte_offset
+            }
+          end)
+        end
+
+        Meta.clear_pending(dir, partition_index)
+    end
+  end
+
+  defp trim_path(path), do: path <> ".trim"
 
   defp open_index(%{index: false}, _partition_index, _meta, _physical) do
     %{fd: nil, path: nil}
@@ -92,9 +117,14 @@ defmodule DurableBuffer.Backend.Local do
   boundary at or below the exact point. When they disagree the higher point
   wins: whichever bound binds first is the one that decides.
 
-  A bound the index cannot answer for is skipped rather than guessed. Time
-  retention therefore stalls while the index is being rebuilt, and size
-  retention keeps bounding the disk in the meantime.
+  A bound the index cannot answer for is skipped rather than guessed, so a
+  lost index delays a trim and never causes an early one.
+
+  Both bounds resolve through the index, so both go coarse while it is
+  rebuilt — a cut can only land on a surviving record's boundary. Size
+  retention recovers first, because it needs only byte positions and every
+  new commit adds one; time retention additionally waits out the backfilled
+  timestamp on the head.
   """
   @impl DurableBuffer.Backend
   @spec retention_point(map(), map()) :: {:ok, non_neg_integer()} | :none
@@ -134,9 +164,9 @@ defmodule DurableBuffer.Backend.Local do
   What retention has to work with: the commit time of the oldest retained
   batch, and the bytes retained.
 
-  `oldest_ms` is `nil` for an empty partition, and for one whose index
-  cannot date its head — which is what a stalled time retention looks like
-  from outside.
+  `oldest_ms` is `nil` only for an empty partition. A head the index cannot
+  date is backfilled as written now when the partition opens, so it reads as
+  young rather than as unknown.
   """
   @impl DurableBuffer.Backend
   @spec retention_status(map()) :: %{oldest_ms: integer() | nil, bytes: non_neg_integer()}
@@ -279,10 +309,30 @@ defmodule DurableBuffer.Backend.Local do
     stream_file(path)
   end
 
+  @doc """
+  Streams the partition's payloads, resolving the retained base when the
+  stream is enumerated rather than when it is built.
+
+  A trim between the two moves the file's contents. Resolving eagerly would
+  leave the physical start pointing at the middle of a frame, and every
+  read after it misaligned — which decodes as nothing at all rather than as
+  an error. So the base is read here, inside the enumeration:
+
+    * The requested offset is still retained — the physical start is
+      recomputed against the new base and the read is correct.
+    * It was trimmed away while the stream sat unenumerated —
+      `DurableBuffer.OutOfRangeError`, the same error `DurableBuffer.stream/3`
+      raises when it can see the problem before the stream is built.
+  """
   @impl DurableBuffer.Backend
   def stream(config, partition_index, opts) do
+    Stream.flat_map([:build], fn :build -> build_stream(config, partition_index, opts) end)
+  end
+
+  defp build_stream(config, partition_index, opts) do
     meta = Meta.load(config.dir, partition_index)
     from = Keyword.get(opts, :from)
+    :ok = check_retained(opts, partition_index, from, meta.base_offset)
     {start_byte, start_offset} = start_at(config.dir, partition_index, meta, from)
 
     config.dir
@@ -293,6 +343,18 @@ defmodule DurableBuffer.Backend.Local do
     )
     |> project(start_offset, from, Keyword.get(opts, :with_offsets, false))
   end
+
+  defp check_retained(_opts, _partition_index, nil, _base_offset), do: :ok
+
+  defp check_retained(opts, partition_index, from, base_offset) when from < base_offset do
+    raise DurableBuffer.OutOfRangeError,
+      name: Keyword.get(opts, :name),
+      partition_index: partition_index,
+      requested: from,
+      first: base_offset
+  end
+
+  defp check_retained(_opts, _partition_index, _from, _base_offset), do: :ok
 
   defp physical_limit(nil, _base_byte), do: nil
   defp physical_limit(limit_fun, base_byte), do: fn -> limit_fun.() - base_byte end
@@ -411,9 +473,7 @@ defmodule DurableBuffer.Backend.Local do
           rewrite(state, base_byte - state.base_byte, state.base_offset, state.entry_count)
 
         {_physical, retained} = WAL.recover!(state.path)
-        dropped = state.entry_count - retained
-
-        {:ok, %{state | base_offset: state.base_offset + dropped, entry_count: retained}}
+        {:ok, %{state | entry_count: retained}}
     end
   end
 
@@ -458,15 +518,24 @@ defmodule DurableBuffer.Backend.Local do
   end
 
   defp rewrite(state, cut, base_offset, entry_count) do
-    temp = state.path <> ".trim"
+    temp = trim_path(state.path)
+    base_byte = state.base_byte + cut
+
+    :ok =
+      Meta.store_pending!(state.dir, state.partition_index, %Meta{
+        base_offset: base_offset,
+        base_byte_offset: base_byte
+      })
+
     :ok = :file.close(state.fd)
     :ok = copy_suffix(state.path, temp, cut)
     :ok = File.rename(temp, state.path)
-    base_byte = state.base_byte + cut
 
     Meta.update!(state.dir, state.partition_index, fn meta ->
       %{meta | base_offset: base_offset, base_byte_offset: base_byte}
     end)
+
+    :ok = Meta.clear_pending(state.dir, state.partition_index)
 
     {:ok, fd} = :file.open(state.path, [:append, :raw, :binary])
 

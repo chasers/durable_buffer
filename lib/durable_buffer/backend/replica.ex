@@ -255,9 +255,16 @@ defmodule DurableBuffer.Backend.Replica do
 
   A trim never reaches the replication wire as a data change: logical byte
   offsets do not move, so a replica that has not yet trimmed still accepts
-  the same batches at the same offsets. Propagation is advisory and
-  best-effort, exactly like the truncate `:erpc`, and only reclaims space. A
-  replica that misses it keeps more data than it needs, which is safe.
+  the same batches at the same offsets. Propagation only reclaims space: a
+  replica that misses it keeps more data than it needs, and the next trim
+  carries a base that supersedes the one it missed.
+
+  So propagation is a **cast**, not a call. It runs inside the committer,
+  and retention applies itself on a timer, so a blocking round trip per
+  replica would put every replica's latency — and `rpc_timeout` for a hung
+  one — in front of the primary's commits, on a schedule. A truncate still
+  blocks, because `await_replicas/3` is a guarantee callers depend on and a
+  truncate is rare.
   """
   @impl DurableBuffer.Backend
   @spec trim(map(), non_neg_integer()) :: {:ok, map()} | {:error, term(), map()}
@@ -368,12 +375,11 @@ defmodule DurableBuffer.Backend.Replica do
   end
 
   defp trim_replica(state, node, base_byte) do
-    :erpc.call(
+    :erpc.cast(
       node,
       DurableBuffer.Replica,
       :trim,
-      [state.config.replica_dir, state.partition_index, base_byte],
-      state.config.rpc_timeout
+      [state.config.replica_dir, state.partition_index, base_byte]
     )
   catch
     _kind, _reason -> :error

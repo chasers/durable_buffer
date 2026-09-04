@@ -46,6 +46,10 @@ defmodule DurableBuffer.Backend.Local.Index do
   Retained data the surviving records do not date is then backfilled as
   written now. That errs toward keeping data: a lost index makes old data
   look young, never the reverse.
+
+  Both steps read only the first record on the clean-restart path, where
+  nothing is below the base and the head is already dated. A full read and
+  rewrite happens only when there is something to change.
   """
   @spec open(
           Path.t(),
@@ -224,12 +228,18 @@ defmodule DurableBuffer.Backend.Local.Index do
   end
 
   defp trim_path(path, upto, base_byte) do
-    {dropped, kept} =
-      path
-      |> read_all()
-      |> Enum.split_while(fn {first_offset, _byte_pos, _commit_ms} -> first_offset < upto end)
+    case first_record(path) do
+      {:ok, {first_offset, _byte_pos, _commit_ms}} when first_offset < upto ->
+        {dropped, kept} =
+          path
+          |> read_all()
+          |> Enum.split_while(fn {offset, _byte_pos, _commit_ms} -> offset < upto end)
 
-    File.write!(path, Enum.map(head_dated(kept, dropped, upto, base_byte), &encode/1))
+        File.write!(path, Enum.map(head_dated(kept, dropped, upto, base_byte), &encode/1))
+
+      _nothing_below_upto ->
+        :ok
+    end
   end
 
   defp head_dated([{upto, _byte_pos, _commit_ms} | _rest] = kept, _dropped, upto, _base_byte) do
@@ -246,16 +256,29 @@ defmodule DurableBuffer.Backend.Local.Index do
 
   defp backfill(path, base_offset, base_byte, wal_tail) do
     if wal_tail > base_byte do
-      case read_all(path) do
-        [{^base_offset, _byte_pos, _commit_ms} | _rest] ->
+      case first_record(path) do
+        {:ok, {^base_offset, _byte_pos, _commit_ms}} ->
           :ok
 
-        records ->
+        _undated_head ->
+          records = read_all(path)
           File.write!(path, Enum.map([{base_offset, base_byte, now_ms()} | records], &encode/1))
       end
     end
 
     :ok
+  end
+
+  defp first_record(path) do
+    with {:ok, %{size: size}} <- File.stat(path),
+         records when records > 0 <- div(size, @record_size),
+         {:ok, fd} <- :file.open(path, [:read, :raw, :binary]) do
+      found = read_record(fd, 0)
+      :ok = :file.close(fd)
+      found
+    else
+      _unusable -> :error
+    end
   end
 
   defp reopen(handle) do

@@ -666,6 +666,14 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     assert :ok = Replica.close(state)
   end
 
+  defp await(check, attempts \\ 200) do
+    cond do
+      check.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(10) && await(check, attempts - 1)
+    end
+  end
+
   test "a trim reaches the replica and reclaims its bytes", %{tmp_dir: tmp_dir} do
     {primary_dir, replica_dir} = dirs(tmp_dir)
 
@@ -684,7 +692,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     before = File.stat!(Local.wal_path(replica_dir, 0)).size
     {:ok, state} = Replica.trim(state, 2)
 
-    assert File.stat!(Local.wal_path(replica_dir, 0)).size < before
+    assert await(fn -> File.stat!(Local.wal_path(replica_dir, 0)).size < before end)
 
     assert File.read!(Local.wal_path(replica_dir, 0)) ==
              File.read!(Local.wal_path(primary_dir, 0))

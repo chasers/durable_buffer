@@ -61,11 +61,13 @@ defmodule DurableBuffer.Backend do
       or `nil` for an ungated read.
     * `:from` — first logical entry offset to yield, inclusive.
     * `:with_offsets` — yield `{offset, payload}` instead of `payload`.
+    * `:name` — the buffer's name, so a backend that raises can name it.
   """
   @type stream_opts :: [
           limit: limit_fun() | nil,
           from: non_neg_integer(),
-          with_offsets: boolean()
+          with_offsets: boolean(),
+          name: atom() | nil
         ]
 
   @callback init_config(keyword()) :: config()

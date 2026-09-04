@@ -217,9 +217,10 @@ defmodule DurableBuffer.Backend.S3 do
   defp time_point(segments, ms) do
     cutoff = System.system_time(:millisecond) - ms
 
-    case Enum.find(segments, &(&1.modified_ms != nil and &1.modified_ms >= cutoff)) do
-      nil -> offset_from_key(List.last(segments).key)
-      segment -> offset_from_key(segment.key)
+    case Enum.split_while(segments, &(&1.modified_ms != nil and &1.modified_ms < cutoff)) do
+      {[], _kept} -> nil
+      {_older, [segment | _rest]} -> offset_from_key(segment.key)
+      {_older, []} -> offset_from_key(List.last(segments).key)
     end
   end
 
@@ -227,11 +228,15 @@ defmodule DurableBuffer.Backend.S3 do
   defp size_point(_segments, nil), do: nil
 
   defp size_point(segments, bytes) do
-    case Enum.find(Enum.zip(segments, suffix_sizes(segments)), fn {_segment, kept} ->
-           kept <= bytes
-         end) do
-      nil -> offset_from_key(List.last(segments).key)
-      {segment, _kept} -> offset_from_key(segment.key)
+    suffixes = suffix_sizes(segments)
+
+    if hd(suffixes) <= bytes do
+      nil
+    else
+      case Enum.find(Enum.zip(segments, suffixes), fn {_segment, kept} -> kept <= bytes end) do
+        nil -> offset_from_key(List.last(segments).key)
+        {segment, _kept} -> offset_from_key(segment.key)
+      end
     end
   end
 
