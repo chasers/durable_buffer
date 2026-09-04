@@ -23,11 +23,13 @@ defmodule DurableBuffer.Supervisor do
     backend = DurableBuffer.Backend.normalize(Keyword.fetch!(opts, :backend))
 
     durable_offsets = :atomics.new(partitions * 4, signed: false)
+    retention = retention(opts)
 
     :persistent_term.put({DurableBuffer, name}, %{
       partitions: partitions,
       backend: backend,
-      durable_offsets: durable_offsets
+      durable_offsets: durable_offsets,
+      retention: retention
     })
 
     children =
@@ -44,7 +46,8 @@ defmodule DurableBuffer.Supervisor do
             name: DurableBuffer.partition_name(name, index),
             backend: backend,
             partition_index: index,
-            durable_offsets: durable_offsets
+            durable_offsets: durable_offsets,
+            retention: retention
           )
 
         Supervisor.child_spec({DurableBuffer.Partition, partition_opts},
@@ -53,5 +56,25 @@ defmodule DurableBuffer.Supervisor do
       end
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp retention(opts) do
+    %{
+      ms: bound!(opts, :retention_ms),
+      bytes: bound!(opts, :retention_bytes)
+    }
+  end
+
+  defp bound!(opts, key) do
+    case Keyword.get(opts, key) do
+      nil ->
+        nil
+
+      value when is_integer(value) and value > 0 ->
+        value
+
+      other ->
+        raise ArgumentError, "#{inspect(key)} must be a positive integer, got #{inspect(other)}"
+    end
   end
 end

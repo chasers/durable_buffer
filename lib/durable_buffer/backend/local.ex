@@ -31,7 +31,8 @@ defmodule DurableBuffer.Backend.Local do
     %{
       dir: Keyword.fetch!(opts, :dir),
       fsync: Keyword.get(opts, :fsync, true),
-      index: Keyword.get(opts, :index, true)
+      index: Keyword.get(opts, :index, true),
+      index_sync_ms: Keyword.get(opts, :index_sync_ms, 5_000)
     }
   end
 
@@ -54,7 +55,9 @@ defmodule DurableBuffer.Backend.Local do
        partition_index: partition_index,
        base_offset: meta.base_offset,
        entry_count: entry_count,
-       index: open_index(config, partition_index, meta, physical)
+       index: open_index(config, partition_index, meta, physical),
+       index_sync_ms: config.index_sync_ms,
+       index_synced_at: System.monotonic_time(:millisecond)
      }}
   end
 
@@ -67,7 +70,8 @@ defmodule DurableBuffer.Backend.Local do
       config.dir,
       partition_index,
       meta.base_byte_offset + physical,
-      meta.base_offset
+      meta.base_offset,
+      meta.base_byte_offset
     )
   end
 
@@ -80,15 +84,99 @@ defmodule DurableBuffer.Backend.Local do
     %{first: state.base_offset, next: state.base_offset + state.entry_count}
   end
 
+  @doc """
+  The offset a retention policy would cut at, or `:none` when neither bound
+  is exceeded.
+
+  Both bounds resolve through the seek index, so both cut on a batch
+  boundary at or below the exact point. When they disagree the higher point
+  wins: whichever bound binds first is the one that decides.
+
+  A bound the index cannot answer for is skipped rather than guessed. Time
+  retention therefore stalls while the index is being rebuilt, and size
+  retention keeps bounding the disk in the meantime.
+  """
+  @impl DurableBuffer.Backend
+  @spec retention_point(map(), map()) :: {:ok, non_neg_integer()} | :none
+  def retention_point(state, policy) do
+    case Enum.reject(
+           [time_point(state, policy[:ms]), size_point(state, policy[:bytes])],
+           &is_nil/1
+         ) do
+      [] -> :none
+      points -> {:ok, Enum.max(points)}
+    end
+  end
+
+  defp time_point(_state, nil), do: nil
+
+  defp time_point(state, ms) do
+    cutoff = System.system_time(:millisecond) - ms
+
+    case Index.seek_time(state.dir, state.partition_index, cutoff) do
+      {:ok, upto} -> upto
+      :unknown -> nil
+    end
+  end
+
+  defp size_point(_state, nil), do: nil
+
+  defp size_point(state, bytes) do
+    if state.offset - state.base_byte > bytes do
+      case Index.seek_byte(state.dir, state.partition_index, state.offset - bytes) do
+        {:ok, upto} -> upto
+        :unknown -> nil
+      end
+    end
+  end
+
+  @doc """
+  What retention has to work with: the commit time of the oldest retained
+  batch, and the bytes retained.
+
+  `oldest_ms` is `nil` for an empty partition, and for one whose index
+  cannot date its head — which is what a stalled time retention looks like
+  from outside.
+  """
+  @impl DurableBuffer.Backend
+  @spec retention_status(map()) :: %{oldest_ms: integer() | nil, bytes: non_neg_integer()}
+  def retention_status(state) do
+    %{oldest_ms: oldest_ms(state), bytes: state.offset - state.base_byte}
+  end
+
+  defp oldest_ms(%{entry_count: 0}), do: nil
+
+  defp oldest_ms(state) do
+    case Index.oldest(state.dir, state.partition_index) do
+      {:ok, commit_ms} -> commit_ms
+      :unknown -> nil
+    end
+  end
+
   @impl DurableBuffer.Backend
   def commit(state, batch, byte_size, {first_offset, count}) do
     with :ok <- :file.write(state.fd, batch),
          :ok <- sync(state) do
-      Index.append(state.index, first_offset, state.offset)
+      Index.append(state.index, first_offset, state.offset, System.system_time(:millisecond))
+
+      state = sync_index(state)
 
       {:ok, %{state | offset: state.offset + byte_size, entry_count: state.entry_count + count}}
     else
       {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp sync_index(%{index_sync_ms: :infinity} = state), do: state
+
+  defp sync_index(state) do
+    now = System.monotonic_time(:millisecond)
+
+    if now - state.index_synced_at >= state.index_sync_ms do
+      :ok = Index.sync(state.index)
+      %{state | index_synced_at: now}
+    else
+      state
     end
   end
 
@@ -389,7 +477,7 @@ defmodule DurableBuffer.Backend.Local do
          base_byte: base_byte,
          base_offset: base_offset,
          entry_count: entry_count,
-         index: Index.trim(state.index, base_offset)
+         index: Index.trim(state.index, base_offset, base_byte)
      }}
   end
 

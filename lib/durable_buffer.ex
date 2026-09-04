@@ -58,6 +58,12 @@ defmodule DurableBuffer do
       (currently `DurableBuffer.Backend.Replica`), how many batches may be
       committing concurrently per partition, default 32. Callers are always
       replied to in order
+    * `:retention_ms` — keep at most this much history per partition. A
+      `trim/2` with no options drops batches that committed longer ago
+    * `:retention_bytes` — keep at most this many bytes per partition. Set
+      both bounds and whichever binds first decides; a size bound needs no
+      timestamps, so it still holds when a rebuilt seek index cannot date
+      the head
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -228,29 +234,60 @@ defmodule DurableBuffer do
   end
 
   @doc """
-  Drops entries from the head of `partition_key`'s partition, up to but not
-  including the logical offset `upto`.
+  Drops entries from the head of `partition_key`'s partition.
 
-      :ok = DurableBuffer.trim(:events, user_id, upto: 5_000)
+      :ok = DurableBuffer.trim(:events, user_id)              # apply the policy
+      :ok = DurableBuffer.trim(:events, user_id, upto: 5_000) # explicit point
+
+  With no options the buffer's `:retention_ms` and `:retention_bytes` decide
+  the point, and whichever bound binds first wins. A buffer that declares
+  neither returns `{:error, :no_retention_policy}` — the buffer tracks no
+  consumers, so with no policy there is nothing to compute a point from.
+  Nothing to drop is `:ok`, not an error.
 
   `upto:` is exclusive: every entry *below* it is dropped, and `offsets/2`
   reports it as the new `:first`. A trim past the durable offset is refused
-  with `{:error, :not_durable}`.
+  with `{:error, :not_durable}`; a policy point is clamped to it instead.
 
-  The buffer does not track consumers, so it cannot pick the point for you.
-  A consumer keeps its own cursor and detects a resume point below `:first`
-  from `offsets/2`.
-
-  The local and replicated backends cut exactly at `upto`. S3 stores
-  immutable segments, so it drops only segments that lie entirely below the
-  trim point and `:first` lands on a segment boundary at or below it.
+  The local and replicated backends cut on the batch boundary at or below
+  the point for a policy trim, and exactly at `upto` for an explicit one.
+  S3 stores immutable segments, so it drops only segments that lie entirely
+  below the trim point.
   """
   @spec trim(atom(), term(), keyword()) :: :ok | {:error, term()}
-  def trim(name, partition_key, opts) do
+  def trim(name, partition_key, opts \\ []) do
     name
     |> partition_server(partition_key)
-    |> Partition.trim(Keyword.fetch!(opts, :upto))
+    |> Partition.trim(Keyword.get(opts, :upto, :policy))
   end
+
+  @doc """
+  Reports what retention has to work with for `partition_key`'s partition.
+
+    * `:oldest_age_ms` — how long ago the oldest retained batch committed,
+      or `nil` when the partition is empty or cannot date its head.
+    * `:bytes` — bytes retained.
+
+  Use `:oldest_age_ms` to see a stalled time retention. It should sit near
+  `:retention_ms` on a busy partition. A `nil` means the seek index cannot
+  date the head, so time retention is waiting for the index to be rebuilt
+  while size retention keeps bounding the disk.
+  """
+  @spec retention(atom(), term()) ::
+          {:ok, %{oldest_age_ms: non_neg_integer() | nil, bytes: non_neg_integer()}}
+          | {:error, term()}
+  def retention(name, partition_key) do
+    case name |> partition_server(partition_key) |> Partition.retention_status() do
+      {:ok, %{oldest_ms: oldest_ms, bytes: bytes}} ->
+        {:ok, %{oldest_age_ms: age_ms(oldest_ms), bytes: bytes}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp age_ms(nil), do: nil
+  defp age_ms(oldest_ms), do: max(System.system_time(:millisecond) - oldest_ms, 0)
 
   @doc """
   Reports each replica's replication state for `partition_key`'s partition.
@@ -311,7 +348,8 @@ defmodule DurableBuffer do
   @spec config(atom()) :: %{
           partitions: pos_integer(),
           backend: {module(), map()},
-          durable_offsets: :atomics.atomics_ref()
+          durable_offsets: :atomics.atomics_ref(),
+          retention: DurableBuffer.Backend.policy()
         }
   def config(name) do
     :persistent_term.get({DurableBuffer, name})

@@ -238,6 +238,18 @@ defmodule DurableBuffer.Backend.Replica do
   def offsets(state), do: Local.offsets(state.local)
 
   @doc """
+  The primary's own retention point. Replicas mirror bytes and follow the
+  base the primary propagates, so the policy is decided in one place.
+  """
+  @impl DurableBuffer.Backend
+  @spec retention_point(map(), map()) :: {:ok, non_neg_integer()} | :none
+  def retention_point(state, policy), do: Local.retention_point(state.local, policy)
+
+  @impl DurableBuffer.Backend
+  @spec retention_status(map()) :: %{oldest_ms: integer() | nil, bytes: non_neg_integer()}
+  def retention_status(state), do: Local.retention_status(state.local)
+
+  @doc """
   Drops every entry below `upto` locally, then passes the resulting logical
   byte base on to every replica.
 

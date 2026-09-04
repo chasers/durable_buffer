@@ -203,4 +203,51 @@ defmodule DurableBuffer.Backend.S3Test do
     assert Enum.to_list(S3.stream(config, 0, from: 4, with_offsets: true)) ==
              [{4, "e"}, {5, "f"}]
   end
+
+  describe "retention_point/2" do
+    setup do
+      {config, store} = start_backend()
+      {:ok, state} = S3.open(config, 0)
+
+      state =
+        Enum.reduce([["a", "b"], ["c", "d"], ["e", "f"]], state, fn payloads, state ->
+          {batch, bytes} = encode_batch(payloads)
+          {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+          state
+        end)
+
+      %{config: config, store: store, state: state}
+    end
+
+    test "cuts at the oldest segment written after the cutoff", %{store: store, state: state} do
+      FakeS3.age(store, "buffers/test/p0/000000000000.wal", 60_000)
+      FakeS3.age(store, "buffers/test/p0/000000000002.wal", 60_000)
+
+      assert {:ok, 4} = S3.retention_point(state, %{ms: 30_000, bytes: nil})
+    end
+
+    test "keeps the newest segment when every one is older", %{store: store, state: state} do
+      FakeS3.age(store, "buffers/test/p0/", 60_000)
+
+      assert {:ok, 4} = S3.retention_point(state, %{ms: 30_000, bytes: nil})
+    end
+
+    test "cuts to leave no more than retention_bytes", %{state: state} do
+      {:ok, point} = S3.retention_point(state, %{ms: nil, bytes: 30})
+
+      assert point == 4
+    end
+
+    test "is a no-op point while neither bound is exceeded", %{state: state} do
+      assert {:ok, 0} = S3.retention_point(state, %{ms: 60_000, bytes: 1_000_000})
+    end
+
+    test "reports the oldest segment's age and the bytes held", %{store: store, state: state} do
+      FakeS3.age(store, "buffers/test/p0/000000000000.wal", 60_000)
+
+      assert %{oldest_ms: oldest_ms, bytes: bytes} = S3.retention_status(state)
+      assert System.system_time(:millisecond) - oldest_ms >= 60_000
+      assert bytes == 6 * (8 + 1)
+    end
+  end
 end

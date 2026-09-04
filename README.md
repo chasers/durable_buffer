@@ -45,7 +45,9 @@ DurableBuffer.stream(:events, user_id, with_offsets: true)        # {offset, pay
 
 DurableBuffer.offsets(:events, user_id)                           # %{first:, durable:, next:}
 
-:ok = DurableBuffer.trim(:events, user_id, upto: 5_000)           # drop the head
+:ok = DurableBuffer.trim(:events, user_id)                        # apply the policy
+:ok = DurableBuffer.trim(:events, user_id, upto: 5_000)           # explicit point
+DurableBuffer.retention(:events, user_id)                         # %{oldest_age_ms:, bytes:}
 :ok = DurableBuffer.truncate(:events, user_id)                    # drop everything
 :ok = DurableBuffer.truncate_all(:events)
 ```
@@ -96,20 +98,56 @@ rather than replaying silently from the trim point.
 
 ### Retention
 
-Trim the head of a partition at an explicit offset:
+Declare a window and let the buffer pick the trim point:
 
 ```elixir
-:ok = DurableBuffer.trim(:events, user_id, upto: 5_000)
+{DurableBuffer,
+ name: :events,
+ backend: {DurableBuffer.Backend.Local, dir: "/var/lib/events"},
+ retention_ms: :timer.hours(24 * 7),
+ retention_bytes: 10 * 1024 * 1024 * 1024}
 ```
 
-The buffer tracks no consumers, so it cannot pick the point for you. Pick
-one from a cursor your application owns, or from a policy of your own.
+```elixir
+:ok = DurableBuffer.trim(:events, user_id)              # apply the policy
+:ok = DurableBuffer.trim(:events, user_id, upto: 5_000) # explicit point
+```
+
+Whichever bound binds first decides: "7 days" does not bound disk under a
+traffic spike, and "10 GB" does not bound age on a quiet one. A buffer that
+declares neither returns `{:error, :no_retention_policy}` — the buffer
+tracks no consumers, so with no policy there is nothing to compute a point
+from. Nothing to drop is `:ok`, not an error.
+
+`DurableBuffer.retention/2` reports what the policy has to work with:
+
+```elixir
+{:ok, %{oldest_age_ms: 604_012, bytes: 8_431_923_712}} =
+  DurableBuffer.retention(:events, user_id)
+```
+
+Watch `:oldest_age_ms`. It should sit near `retention_ms` on a busy
+partition. A `nil` means the seek index cannot date the head, so time
+retention is stalled while size retention keeps bounding the disk.
+
+**Where the timestamps live.** In the seek index, one per group commit,
+alongside the offset and byte position that record already carries. That
+costs 8 bytes per *batch* and no extra write on the commit path. The index
+is `datasync`ed on an interval (`index_sync_ms`, default 5 s), not per
+commit, so a crash leaves only the last few seconds of commits undated.
+
+Undated data is treated as **just written**. A partition backfills any
+retained range its index cannot date with the current time when it opens,
+so a lost index makes old data look young and never the reverse. That is
+also why `retention_bytes` is worth setting: it needs no timestamps at all,
+so it keeps bounding the disk while a rebuilt index catches up.
 
 `upto:` is exclusive: every entry below it is dropped and becomes the new
 `:first`. A trim past the durable offset is refused with
-`{:error, :not_durable}`.
+`{:error, :not_durable}`; a policy point is clamped to it instead.
 
-The local backend cuts exactly at the point. It copies the retained suffix
+The local backend cuts exactly at an explicit point, and on the batch
+boundary at or below a policy point. It copies the retained suffix
 to a sibling file, `datasync`s it and renames over the WAL, so a crash
 mid-trim leaves the original intact; the cost is proportional to the bytes
 *kept*, which is cheap exactly when trimming is routine. S3 stores immutable
@@ -131,17 +169,28 @@ replica's copy, rebases it on the primary's base, and streams forward from
 there.
 
 `from:` seeks rather than scans. The local backend keeps a sparse index
-(`p<index>.idx`, one 20-byte record per group commit) and binary-searches it
-for the last batch at or before the wanted offset. The index is a pure
-cache: it is written on the commit path but never `datasync`ed, and any
-record the WAL does not back is dropped when the partition opens — past its
-tail, below its retained base, or torn. A seek result pointing below the
-base is ignored as well, since the index is written without a `datasync`
-while the metadata beside it is synced, and a crash between the two can
-leave the base advanced and stale records behind. A missing, stale, torn or
+(`p<index>.idx`, one 28-byte record per group commit: first offset, byte
+position, commit time) and binary-searches it for the last batch at or
+before the wanted offset. All three fields rise together, because commits
+are ordered, so a search by time or by size is the same binary search — which
+is what retention uses.
+
+For reads the index is a pure cache. Any record the WAL does not back is
+dropped when the partition opens — past its tail, below its retained base,
+or torn. A seek result pointing below the base is ignored as well, since a
+crash between the index write and the synced metadata beside it can leave
+the base advanced and stale records behind. A missing, stale, torn or
 corrupt index costs a scan from the start of the log — never a wrong
-answer. S3 needs no index at all: its segment keys *are* offsets, so
-a seek picks the floor key from the listing it already does.
+answer.
+
+For retention it is a cache that can only *delay* a trim, never cause an
+early one: a range the index cannot date is backfilled as just written. A
+trim carries the timestamp of the batch it cut into over to the new head, so
+the head keeps its real age instead of resetting.
+
+S3 needs no index at all: its segment keys *are* offsets, so a seek picks the
+floor key from the listing it already does, and that listing carries
+`LastModified` and `Size` for retention.
 
 The `partition_key` (any term) is hashed to one of a fixed number of
 partitions (default `System.schedulers_online()`). Each partition has its own
@@ -160,6 +209,8 @@ use more partitions to saturate your disk.
 | `:flush_delay_ms` | 0 (adaptive) | Dwell before committing a batch started while idle. Default is adaptive: 0 normally, growing to 2 ms automatically when commit completions are slow (fsync/PUT-bound) and batches are concurrent. An explicit value fixes the dwell |
 | `:max_inflight_commits` | 32 | For backends with pipelined commits (currently `Backend.Replica`): batches committing concurrently per partition; replies stay in order |
 | `:heal_timeout` | 5 s | `Backend.Replica` only: how long `open/2` waits for a replica to report its tail before it opens without healing from that node |
+| `:retention_ms` | none | Keep at most this much history per partition. `trim/2` with no options drops batches that committed longer ago |
+| `:retention_bytes` | none | Keep at most this many bytes per partition. Whichever bound binds first decides |
 
 ### Tuning for small payloads
 
@@ -203,6 +254,11 @@ CRC and truncated on open. Two sidecars sit next to it: `p<index>.meta`
 `fsync: false` skips the `datasync` — commits then survive a BEAM crash but
 not an OS crash or power loss. Defaults to `true` for this backend: with a
 single copy, the fsync *is* the durability.
+
+`index_sync_ms` (default 5 s) is how often the seek index is `datasync`ed.
+It is append-only, so one sync covers every record since the last, and the
+cost stays off the per-commit path. A crash then leaves at most that much
+data undated, which retention reads as young.
 
 ### Replicated
 

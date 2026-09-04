@@ -67,12 +67,23 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   @doc """
-  Drops every entry below `upto`. Ordered against commits and truncates
-  like every other unit of work here.
+  Drops every entry below `upto`, or applies the retention policy when
+  `upto` is `:policy`. Ordered against commits and truncates like every
+  other unit of work here, so a trim takes its turn rather than pre-empting
+  a commit.
   """
-  @spec request_trim(GenServer.server(), GenServer.from(), non_neg_integer()) :: :ok
+  @spec request_trim(GenServer.server(), GenServer.from(), non_neg_integer() | :policy) :: :ok
   def request_trim(server, from, upto) do
     GenServer.cast(server, {:trim, from, upto})
+  end
+
+  @doc """
+  Reports what retention has to work with, for backends that can say.
+  Returns `{:error, :unsupported}` for the others.
+  """
+  @spec request_retention_status(GenServer.server(), GenServer.from()) :: :ok
+  def request_retention_status(server, from) do
+    GenServer.cast(server, {:retention_status, from})
   end
 
   @doc """
@@ -98,6 +109,7 @@ defmodule DurableBuffer.Partition.Committer do
       max_inflight: Keyword.get(opts, :max_inflight_commits, 32),
       partition_index: partition_index,
       durable_offsets: Keyword.get(opts, :durable_offsets),
+      retention: Keyword.get(opts, :retention, %{ms: nil, bytes: nil}),
       publishes_offset?: Keyword.get(opts, :durable_offsets) != nil,
       next_offset: seed_next_offset(backend, backend_state),
       durable_logical: seed_next_offset(backend, backend_state),
@@ -175,7 +187,7 @@ defmodule DurableBuffer.Partition.Committer do
         {:error, reason, backend_state} -> {{:error, reason}, backend_state}
       end
 
-    state = reply_units(%{state | backend_state: backend_state}, units, reply)
+    state = %{state | backend_state: backend_state}
 
     state =
       if reply == :ok do
@@ -184,6 +196,7 @@ defmodule DurableBuffer.Partition.Committer do
         %{state | next_offset: rewind(reply, assigned_from, next_offset)}
       end
 
+    state = reply_units(state, units, reply)
     send(state.writer, :commit_done)
     {:noreply, publish_offset(state)}
   end
@@ -202,6 +215,18 @@ defmodule DurableBuffer.Partition.Committer do
     {:noreply, %{state | async_error: nil}}
   end
 
+  def handle_cast({:retention_status, from}, state) do
+    reply =
+      if Backend.applies_retention?(state.backend) do
+        {:ok, state.backend.retention_status(state.backend_state)}
+      else
+        {:error, :unsupported}
+      end
+
+    GenServer.reply(from, reply)
+    {:noreply, state}
+  end
+
   def handle_cast({:replica_status, from}, state) do
     reply =
       if function_exported?(state.backend, :status, 1) do
@@ -212,6 +237,31 @@ defmodule DurableBuffer.Partition.Committer do
 
     GenServer.reply(from, reply)
     {:noreply, state}
+  end
+
+  def handle_cast({:trim, from, :policy}, state) do
+    state = if function_exported?(state.backend, :trim, 2), do: drain(state), else: state
+
+    cond do
+      not Backend.applies_retention?(state.backend) or
+          not function_exported?(state.backend, :trim, 2) ->
+        GenServer.reply(from, {:error, :unsupported})
+        {:noreply, state}
+
+      state.retention.ms == nil and state.retention.bytes == nil ->
+        GenServer.reply(from, {:error, :no_retention_policy})
+        {:noreply, state}
+
+      true ->
+        case state.backend.retention_point(state.backend_state, state.retention) do
+          :none ->
+            GenServer.reply(from, :ok)
+            {:noreply, state}
+
+          {:ok, upto} ->
+            apply_trim(state, from, min(upto, state.durable_logical))
+        end
+    end
   end
 
   def handle_cast({:trim, from, upto}, state) do
@@ -227,21 +277,7 @@ defmodule DurableBuffer.Partition.Committer do
         {:noreply, state}
 
       true ->
-        {reply, backend_state} =
-          case state.backend.trim(state.backend_state, upto) do
-            {:ok, backend_state} -> {:ok, backend_state}
-            {:error, reason, backend_state} -> {{:error, reason}, backend_state}
-          end
-
-        state =
-          publish_offset(%{
-            state
-            | backend_state: backend_state,
-              base_offset: seed_base_offset(state.backend, backend_state)
-          })
-
-        GenServer.reply(from, reply)
-        {:noreply, state}
+        apply_trim(state, from, upto)
     end
   end
 
@@ -260,6 +296,24 @@ defmodule DurableBuffer.Partition.Committer do
       })
 
     GenServer.reply(from, :ok)
+    {:noreply, state}
+  end
+
+  defp apply_trim(state, from, upto) do
+    {reply, backend_state} =
+      case state.backend.trim(state.backend_state, upto) do
+        {:ok, backend_state} -> {:ok, backend_state}
+        {:error, reason, backend_state} -> {{:error, reason}, backend_state}
+      end
+
+    state =
+      publish_offset(%{
+        state
+        | backend_state: backend_state,
+          base_offset: seed_base_offset(state.backend, backend_state)
+      })
+
+    GenServer.reply(from, reply)
     {:noreply, state}
   end
 
@@ -420,6 +474,8 @@ defmodule DurableBuffer.Partition.Committer do
   defp unit_reply(:ok, :range, first, count), do: {:ok, first..(first + count - 1)}
 
   defp reply_units(state, units, reply) do
+    state = publish_offset(state)
+
     Enum.each(units, fn
       {:entries, nil, _entries, _count, _shape, _first} ->
         :ok

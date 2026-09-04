@@ -483,6 +483,96 @@ defmodule DurableBufferTest do
     assert %{epoch: 0} = DurableBuffer.replica_status(name, "k") |> elem(1) |> Map.fetch!(node())
   end
 
+  describe "retention policy" do
+    test "refuses to guess when the buffer declares no policy", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+
+      assert {:error, :no_retention_policy} = DurableBuffer.trim(name, "k")
+      assert %{first: 0} = DurableBuffer.offsets(name, "k")
+    end
+
+    test "trims the head down to retention_bytes", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1, retention_bytes: 250)
+      payload = String.duplicate("x", 92)
+
+      for _ <- 1..10, do: {:ok, _offset} = DurableBuffer.append(name, "k", payload)
+
+      assert :ok = DurableBuffer.trim(name, "k")
+
+      assert %{first: 8, next: 10} = DurableBuffer.offsets(name, "k")
+      assert {:ok, %{bytes: 200}} = DurableBuffer.retention(name, "k")
+      assert length(Enum.to_list(DurableBuffer.stream(name, "k"))) == 2
+    end
+
+    test "keeps everything while the bound is not exceeded", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1, retention_bytes: 1_000_000)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+
+      assert :ok = DurableBuffer.trim(name, "k")
+      assert %{first: 0, next: 3} = DurableBuffer.offsets(name, "k")
+    end
+
+    test "trims batches older than retention_ms", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1, retention_ms: 50)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+      Process.sleep(150)
+      {:ok, 3..5} = DurableBuffer.append_batch(name, "k", ~w(d e f))
+
+      assert :ok = DurableBuffer.trim(name, "k")
+
+      assert %{first: 3, next: 6} = DurableBuffer.offsets(name, "k")
+      assert Enum.to_list(DurableBuffer.stream(name, "k")) == ~w(d e f)
+    end
+
+    test "applies whichever bound binds first", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1, retention_ms: 50, retention_bytes: 10_000_000)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+      Process.sleep(150)
+      {:ok, 3..5} = DurableBuffer.append_batch(name, "k", ~w(d e f))
+
+      assert :ok = DurableBuffer.trim(name, "k")
+      assert %{first: 3} = DurableBuffer.offsets(name, "k")
+    end
+
+    test "reports the head's age and the bytes retained", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      assert {:ok, %{oldest_age_ms: nil, bytes: 0}} = DurableBuffer.retention(name, "k")
+
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+
+      assert {:ok, %{oldest_age_ms: age, bytes: bytes}} = DurableBuffer.retention(name, "k")
+      assert age >= 0 and age < 5_000
+      assert bytes == 3 * (8 + 1)
+    end
+
+    test "survives a restart with the head's age intact", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+      {:ok, %{oldest_age_ms: before}} = DurableBuffer.retention(name, "k")
+      stop_supervised!({DurableBuffer, name})
+
+      name = start_buffer(tmp_dir, name: name, partitions: 1)
+
+      assert {:ok, %{oldest_age_ms: age}} = DurableBuffer.retention(name, "k")
+      assert age >= before
+    end
+
+    test "rejects a bound that is not a positive integer", %{tmp_dir: tmp_dir} do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: message}, _stacktrace}} =
+               DurableBuffer.start_link(
+                 name: :"buffer_#{System.unique_integer([:positive])}",
+                 backend: {DurableBuffer.Backend.Local, dir: tmp_dir},
+                 partitions: 1,
+                 retention_ms: 0
+               )
+
+      assert message =~ ":retention_ms must be a positive integer"
+    end
+  end
+
   describe "review regressions" do
     test "a pre-trim index never mislabels offsets", %{tmp_dir: tmp_dir} do
       name = start_buffer(tmp_dir, partitions: 1)

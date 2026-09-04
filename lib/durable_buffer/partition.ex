@@ -91,11 +91,21 @@ defmodule DurableBuffer.Partition do
   end
 
   @doc """
-  Drops every entry below `upto`.
+  Drops every entry below `upto`, or applies the buffer's retention policy
+  when `upto` is `:policy`.
   """
-  @spec trim(GenServer.server(), non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  @spec trim(GenServer.server(), non_neg_integer() | :policy, timeout()) ::
+          :ok | {:error, term()}
   def trim(server, upto, timeout \\ :infinity) do
     GenServer.call(server, {:trim, upto}, timeout)
+  end
+
+  @doc """
+  Reports what retention has to work with for this partition.
+  """
+  @spec retention_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
+  def retention_status(server, timeout \\ :infinity) do
+    GenServer.call(server, :retention_status, timeout)
   end
 
   @doc """
@@ -116,7 +126,7 @@ defmodule DurableBuffer.Partition do
         backend,
         config,
         partition_index,
-        Keyword.take(opts, [:max_inflight_commits, :durable_offsets])
+        Keyword.take(opts, [:max_inflight_commits, :durable_offsets, :retention])
       )
 
     {:ok,
@@ -165,6 +175,11 @@ defmodule DurableBuffer.Partition do
 
   def handle_call(:replica_status, from, state) do
     Committer.request_replica_status(state.committer, from)
+    {:noreply, state}
+  end
+
+  def handle_call(:retention_status, from, state) do
+    Committer.request_retention_status(state.committer, from)
     {:noreply, state}
   end
 

@@ -187,6 +187,76 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   @doc """
+  The offset a retention policy would cut at, or `:none` when neither bound
+  is exceeded.
+
+  Segments are objects, so the LIST that `trim/2` already does carries both
+  bounds: `LastModified` dates a segment and `Size` measures it. No extra
+  request, and no state of our own to keep.
+
+  Age comes from when a segment was written, not from when its entries were
+  produced. The two differ by at most one group commit.
+  """
+  @impl DurableBuffer.Backend
+  @spec retention_point(map(), map()) :: {:ok, non_neg_integer()} | :none
+  def retention_point(state, policy) do
+    segments = list_objects(state.req, state.config, state.partition_index)
+
+    case Enum.reject(
+           [time_point(segments, policy[:ms]), size_point(segments, policy[:bytes])],
+           &is_nil/1
+         ) do
+      [] -> :none
+      points -> {:ok, Enum.max(points)}
+    end
+  end
+
+  defp time_point([], _ms), do: nil
+  defp time_point(_segments, nil), do: nil
+
+  defp time_point(segments, ms) do
+    cutoff = System.system_time(:millisecond) - ms
+
+    case Enum.find(segments, &(&1.modified_ms != nil and &1.modified_ms >= cutoff)) do
+      nil -> offset_from_key(List.last(segments).key)
+      segment -> offset_from_key(segment.key)
+    end
+  end
+
+  defp size_point([], _bytes), do: nil
+  defp size_point(_segments, nil), do: nil
+
+  defp size_point(segments, bytes) do
+    case Enum.find(Enum.zip(segments, suffix_sizes(segments)), fn {_segment, kept} ->
+           kept <= bytes
+         end) do
+      nil -> offset_from_key(List.last(segments).key)
+      {segment, _kept} -> offset_from_key(segment.key)
+    end
+  end
+
+  defp suffix_sizes(segments) do
+    segments
+    |> Enum.reverse()
+    |> Enum.scan(0, fn segment, total -> total + segment.size end)
+    |> Enum.reverse()
+  end
+
+  @impl DurableBuffer.Backend
+  @spec retention_status(map()) :: %{oldest_ms: integer() | nil, bytes: non_neg_integer()}
+  def retention_status(state) do
+    segments = list_objects(state.req, state.config, state.partition_index)
+
+    %{
+      oldest_ms: oldest_ms(segments),
+      bytes: segments |> Enum.map(& &1.size) |> Enum.sum()
+    }
+  end
+
+  defp oldest_ms([segment | _rest]), do: segment.modified_ms
+  defp oldest_ms([]), do: nil
+
+  @doc """
   Deletes every segment that lies entirely below `upto`.
 
   Segments are immutable objects, so a partly-covered one is kept whole.
@@ -219,6 +289,23 @@ defmodule DurableBuffer.Backend.S3 do
 
     :ok = store_base(state.req, state.config, state.partition_index, first)
     {:ok, %{state | first_offset: first}}
+  end
+
+  defp describe(content) do
+    %{
+      key: Map.fetch!(content, "Key"),
+      modified_ms: modified_ms(Map.get(content, "LastModified")),
+      size: content |> Map.get("Size", "0") |> String.to_integer()
+    }
+  end
+
+  defp modified_ms(nil), do: nil
+
+  defp modified_ms(stamp) do
+    case DateTime.from_iso8601(stamp) do
+      {:ok, datetime, _offset} -> DateTime.to_unix(datetime, :millisecond)
+      {:error, _reason} -> nil
+    end
   end
 
   defp segment_ends(keys, next_offset) do
@@ -317,8 +404,15 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   defp list_keys(req, config, partition_index) do
-    list_prefix(req, config, partition_prefix(config, partition_index), nil, [])
-    |> Enum.filter(&String.ends_with?(&1, ".wal"))
+    req
+    |> list_objects(config, partition_index)
+    |> Enum.map(& &1.key)
+  end
+
+  defp list_objects(req, config, partition_index) do
+    req
+    |> list_prefix(config, partition_prefix(config, partition_index), nil, [])
+    |> Enum.filter(&String.ends_with?(&1.key, ".wal"))
   end
 
   defp list_prefix(req, config, prefix, continuation_token, acc) do
@@ -338,20 +432,20 @@ defmodule DurableBuffer.Backend.S3 do
 
     %{"ListBucketResult" => result} = body
 
-    keys =
+    objects =
       result
       |> Map.get("Contents", [])
       |> List.wrap()
-      |> Enum.map(&Map.fetch!(&1, "Key"))
+      |> Enum.map(&describe/1)
 
-    acc = acc ++ keys
+    acc = acc ++ objects
 
     case result do
       %{"IsTruncated" => "true", "NextContinuationToken" => token} ->
         list_prefix(req, config, prefix, token, acc)
 
       _result ->
-        Enum.sort(acc)
+        Enum.sort_by(acc, & &1.key)
     end
   end
 end
