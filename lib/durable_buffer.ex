@@ -64,6 +64,11 @@ defmodule DurableBuffer do
       both bounds and whichever binds first decides; a size bound needs no
       timestamps, so it still holds when a rebuilt seek index cannot date
       the head
+    * `:retention_interval_ms` — how often each partition applies its
+      retention policy on its own, default 60_000. Declaring a bound turns
+      the timer on; `:infinity` turns it off and leaves `trim/2` manual.
+      Partitions start on a random offset within the first interval, so
+      they do not all trim at once
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -244,6 +249,12 @@ defmodule DurableBuffer do
   neither returns `{:error, :no_retention_policy}` — the buffer tracks no
   consumers, so with no policy there is nothing to compute a point from.
   Nothing to drop is `:ok`, not an error.
+
+  A buffer that declares a bound already applies it: each partition runs the
+  policy every `:retention_interval_ms`, so calling this is for trimming
+  sooner than the next tick. The timed trim goes through the committer like
+  every other unit of work, so it takes its turn behind pending commits
+  rather than pre-empting them.
 
   `upto:` is exclusive: every entry *below* it is dropped, and `offsets/2`
   reports it as the new `:first`. A trim past the durable offset is refused

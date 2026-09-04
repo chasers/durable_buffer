@@ -39,6 +39,8 @@ defmodule DurableBuffer.Partition.Committer do
 
   use GenServer
 
+  require Logger
+
   alias DurableBuffer.Backend
 
   def start_link(backend, config, partition_index, opts \\ []) do
@@ -71,8 +73,12 @@ defmodule DurableBuffer.Partition.Committer do
   `upto` is `:policy`. Ordered against commits and truncates like every
   other unit of work here, so a trim takes its turn rather than pre-empting
   a commit.
+
+  A `nil` `from` is the partition's own retention timer, which has nobody to
+  answer. Failures are logged instead of returned.
   """
-  @spec request_trim(GenServer.server(), GenServer.from(), non_neg_integer() | :policy) :: :ok
+  @spec request_trim(GenServer.server(), GenServer.from() | nil, non_neg_integer() | :policy) ::
+          :ok
   def request_trim(server, from, upto) do
     GenServer.cast(server, {:trim, from, upto})
   end
@@ -245,17 +251,17 @@ defmodule DurableBuffer.Partition.Committer do
     cond do
       not Backend.applies_retention?(state.backend) or
           not function_exported?(state.backend, :trim, 2) ->
-        GenServer.reply(from, {:error, :unsupported})
+        answer(from, {:error, :unsupported})
         {:noreply, state}
 
       state.retention.ms == nil and state.retention.bytes == nil ->
-        GenServer.reply(from, {:error, :no_retention_policy})
+        answer(from, {:error, :no_retention_policy})
         {:noreply, state}
 
       true ->
         case state.backend.retention_point(state.backend_state, state.retention) do
           :none ->
-            GenServer.reply(from, :ok)
+            answer(from, :ok)
             {:noreply, state}
 
           {:ok, upto} ->
@@ -269,11 +275,11 @@ defmodule DurableBuffer.Partition.Committer do
 
     cond do
       not function_exported?(state.backend, :trim, 2) ->
-        GenServer.reply(from, {:error, :unsupported})
+        answer(from, {:error, :unsupported})
         {:noreply, state}
 
       upto > state.durable_logical ->
-        GenServer.reply(from, {:error, :not_durable})
+        answer(from, {:error, :not_durable})
         {:noreply, state}
 
       true ->
@@ -313,9 +319,17 @@ defmodule DurableBuffer.Partition.Committer do
           base_offset: seed_base_offset(state.backend, backend_state)
       })
 
-    GenServer.reply(from, reply)
+    answer(from, reply)
     {:noreply, state}
   end
+
+  defp answer(nil, :ok), do: :ok
+
+  defp answer(nil, {:error, reason}) do
+    Logger.warning("durable_buffer: automatic retention trim failed: #{inspect(reason)}")
+  end
+
+  defp answer(from, reply), do: GenServer.reply(from, reply)
 
   @impl GenServer
   def handle_info({:backend, message}, state) do

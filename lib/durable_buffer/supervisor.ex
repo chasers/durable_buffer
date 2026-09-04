@@ -40,7 +40,8 @@ defmodule DurableBuffer.Supervisor do
             :max_batch_bytes,
             :max_batch_entries,
             :flush_delay_ms,
-            :max_inflight_commits
+            :max_inflight_commits,
+            :retention_interval_ms
           ])
           |> Keyword.merge(
             name: DurableBuffer.partition_name(name, index),

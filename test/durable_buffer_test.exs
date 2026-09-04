@@ -20,6 +20,23 @@ defmodule DurableBufferTest do
     name
   end
 
+  defp eventually(check, attempts \\ 100) do
+    cond do
+      check.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(10) && eventually(check, attempts - 1)
+    end
+  end
+
+  defp append_until(name, payload, stop, count) do
+    if :atomics.get(stop, 1) == 1 do
+      count
+    else
+      {:ok, _offset} = DurableBuffer.append(name, "k", payload)
+      append_until(name, payload, stop, count + 1)
+    end
+  end
+
   test "append then stream round-trips through the keyed partition", %{tmp_dir: tmp_dir} do
     name = start_buffer(tmp_dir)
 
@@ -556,6 +573,75 @@ defmodule DurableBufferTest do
 
       assert {:ok, %{oldest_age_ms: age}} = DurableBuffer.retention(name, "k")
       assert age >= before
+    end
+
+    test "applies itself on a timer without anyone calling trim", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          partitions: 1,
+          retention_bytes: 250,
+          retention_interval_ms: 20
+        )
+
+      payload = String.duplicate("x", 92)
+      for _ <- 1..10, do: {:ok, _offset} = DurableBuffer.append(name, "k", payload)
+
+      assert eventually(fn -> DurableBuffer.offsets(name, "k").first == 8 end)
+      assert {:ok, %{bytes: 200}} = DurableBuffer.retention(name, "k")
+    end
+
+    test "stays off when the buffer declares no bound", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1, retention_interval_ms: 20)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+
+      Process.sleep(100)
+      assert %{first: 0, next: 3} = DurableBuffer.offsets(name, "k")
+    end
+
+    test "stays off at :infinity even with a bound", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          partitions: 1,
+          retention_bytes: 10,
+          retention_interval_ms: :infinity
+        )
+
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+
+      Process.sleep(100)
+      assert %{first: 0, next: 3} = DurableBuffer.offsets(name, "k")
+      assert :ok = DurableBuffer.trim(name, "k")
+    end
+
+    test "a timed trim does not stall writers", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          partitions: 1,
+          retention_bytes: 4_096,
+          retention_interval_ms: 5
+        )
+
+      payload = String.duplicate("x", 256)
+      stop = :atomics.new(1, signed: false)
+
+      writers =
+        for _ <- 1..8 do
+          Task.async(fn -> append_until(name, payload, stop, 0) end)
+        end
+
+      Process.sleep(500)
+      :atomics.put(stop, 1, 1)
+      appended = writers |> Task.await_many(10_000) |> Enum.sum()
+
+      assert appended > 0
+      assert %{first: first, next: next} = DurableBuffer.offsets(name, "k")
+      assert first > 0
+      assert next > first
+
+      assert eventually(fn ->
+               {:ok, %{bytes: bytes}} = DurableBuffer.retention(name, "k")
+               bytes <= 4_096
+             end)
     end
 
     test "rejects a bound that is not a positive integer", %{tmp_dir: tmp_dir} do

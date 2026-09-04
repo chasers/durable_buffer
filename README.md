@@ -119,6 +119,15 @@ declares neither returns `{:error, :no_retention_policy}` — the buffer
 tracks no consumers, so with no policy there is nothing to compute a point
 from. Nothing to drop is `:ok`, not an error.
 
+**Retention runs on its own.** Declaring a bound turns on a per-partition
+timer, so a buffer honours its window without anyone calling `trim/2`.
+`retention_interval_ms` controls it (default 60 s) and `:infinity` turns it
+off. Partitions start on a random offset inside the first interval, so they
+do not all trim at the same instant. The timed trim goes through the same
+committer as every other unit of work, so it queues behind pending commits
+rather than pre-empting them — a trim landing during a load spike takes its
+turn. Call `trim/2` yourself only to trim sooner than the next tick.
+
 `DurableBuffer.retention/2` reports what the policy has to work with:
 
 ```elixir
@@ -211,6 +220,7 @@ use more partitions to saturate your disk.
 | `:heal_timeout` | 5 s | `Backend.Replica` only: how long `open/2` waits for a replica to report its tail before it opens without healing from that node |
 | `:retention_ms` | none | Keep at most this much history per partition. `trim/2` with no options drops batches that committed longer ago |
 | `:retention_bytes` | none | Keep at most this many bytes per partition. Whichever bound binds first decides |
+| `:retention_interval_ms` | 60 s | How often each partition applies its policy on its own. Declaring a bound turns the timer on; `:infinity` turns it off and leaves `trim/2` manual |
 
 ### Tuning for small payloads
 
