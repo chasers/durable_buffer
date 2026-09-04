@@ -19,8 +19,9 @@ defmodule DurableBuffer.Backend.Replica do
     * a positive integer — that many acks
 
   A commit that reaches its ack target completes as soon as the target is
-  met; stragglers keep replicating in the background. Reads (`stream/2`)
-  are served from the local WAL. A failed local write is always an error
+  met; stragglers keep replicating in the background. Reads are served from
+  the local WAL, gated at `durable_offset/1` so a reader never sees a batch
+  that has not met the ack policy. A failed local write is always an error
   regardless of policy, since reads depend on the local copy.
 
   By default this backend does **not** fsync (`fsync: false`): durability is
@@ -106,6 +107,11 @@ defmodule DurableBuffer.Backend.Replica do
     local = heal(config, partition_index, epoch, local, tails)
     adopted = for {node, {^epoch, _offset}} <- tails, into: %{}, do: {node, epoch}
 
+    watermarks =
+      for {node, {^epoch, _offset} = tail} <- tails,
+          into: %{local: {epoch, Local.offset(local)}},
+          do: {node, tail}
+
     senders =
       Map.new(config.replicas, fn node ->
         {:ok, sender} =
@@ -131,7 +137,7 @@ defmodule DurableBuffer.Backend.Replica do
        config: config,
        partition_index: partition_index,
        epoch: epoch,
-       watermarks: %{},
+       watermarks: watermarks,
        adopted: adopted,
        senders: senders,
        pending: [],
@@ -216,6 +222,36 @@ defmodule DurableBuffer.Backend.Replica do
   @impl DurableBuffer.Backend
   def stream(config, partition_index) do
     Local.stream(local_config(config), partition_index)
+  end
+
+  @impl DurableBuffer.Backend
+  def stream(config, partition_index, limit_fun) do
+    Local.stream(local_config(config), partition_index, limit_fun)
+  end
+
+  @doc """
+  Byte offset through which the ack policy is met.
+
+  Take every member watermark on the current epoch, sort them descending,
+  and read off the `needed_acks`-th. That is the furthest offset `ack:`
+  members agree on, which is exactly what a commit waits for. Reads are
+  gated here, so a reader never sees a batch that has not met the policy —
+  one that may still fail with `:insufficient_acks`, or that a primary crash
+  can erase.
+  """
+  @impl DurableBuffer.Backend
+  @spec durable_offset(map()) :: non_neg_integer()
+  def durable_offset(state) do
+    offsets =
+      for {_member, {epoch, offset}} <- state.watermarks, epoch == state.epoch, do: offset
+
+    case Enum.sort(offsets, :desc) do
+      sorted when length(sorted) >= state.config.needed_acks ->
+        Enum.at(sorted, state.config.needed_acks - 1)
+
+      _too_few ->
+        0
+    end
   end
 
   @impl DurableBuffer.Backend

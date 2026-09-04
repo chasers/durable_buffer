@@ -24,6 +24,11 @@ defmodule DurableBuffer.Partition.Committer do
   batching would pay via `{:dwell_hint, ms}` messages — 0 below 2 ms, 1 ms
   from 2 ms, 2 ms from 4 ms — sent only when the recommendation changes.
   The writer uses the hint as its adaptive flush dwell.
+
+  After every commit, completion and truncate the committer publishes the
+  backend's durable byte offset into the buffer's `:atomics` array, at the
+  slot for its partition. `DurableBuffer.stream/3` reads that slot to gate
+  reads without sending the committer a message.
   """
 
   use GenServer
@@ -81,20 +86,26 @@ defmodule DurableBuffer.Partition.Committer do
     Process.flag(:trap_exit, true)
     {:ok, backend_state} = backend.open(config, partition_index)
 
-    {:ok,
-     %{
-       backend: backend,
-       backend_state: backend_state,
-       writer: writer,
-       async_error: nil,
-       async?: Backend.async?(backend),
-       max_inflight: Keyword.get(opts, :max_inflight_commits, 32),
-       pending: :queue.new(),
-       completed: %{},
-       deferred_credits: 0,
-       completion_ewma_ms: 0.0,
-       dwell_hint: 0
-     }}
+    state = %{
+      backend: backend,
+      backend_state: backend_state,
+      writer: writer,
+      async_error: nil,
+      async?: Backend.async?(backend),
+      max_inflight: Keyword.get(opts, :max_inflight_commits, 32),
+      partition_index: partition_index,
+      durable_offsets: Keyword.get(opts, :durable_offsets),
+      publishes_offset?:
+        Keyword.get(opts, :durable_offsets) != nil and
+          function_exported?(backend, :durable_offset, 1),
+      pending: :queue.new(),
+      completed: %{},
+      deferred_credits: 0,
+      completion_ewma_ms: 0.0,
+      dwell_hint: 0
+    }
+
+    {:ok, publish_offset(state)}
   end
 
   @impl GenServer
@@ -126,7 +137,7 @@ defmodule DurableBuffer.Partition.Committer do
         %{state | deferred_credits: state.deferred_credits + 1}
       end
 
-    {:noreply, flush(state)}
+    {:noreply, publish_offset(flush(state))}
   end
 
   def handle_cast({:commit, units, byte_size}, state) do
@@ -140,7 +151,7 @@ defmodule DurableBuffer.Partition.Committer do
 
     state = reply_units(%{state | backend_state: backend_state}, units, reply)
     send(state.writer, :commit_done)
-    {:noreply, state}
+    {:noreply, publish_offset(state)}
   end
 
   def handle_cast({:sync, from}, %{async?: true} = state) do
@@ -161,12 +172,12 @@ defmodule DurableBuffer.Partition.Committer do
     state = drain(state)
     {:ok, backend_state} = state.backend.truncate(state.backend_state)
     GenServer.reply(from, :ok)
-    {:noreply, %{state | backend_state: backend_state, async_error: nil}}
+    {:noreply, publish_offset(%{state | backend_state: backend_state, async_error: nil})}
   end
 
   @impl GenServer
   def handle_info({:backend, message}, state) do
-    {:noreply, handle_backend_message(state, message)}
+    {:noreply, publish_offset(handle_backend_message(state, message))}
   end
 
   def handle_info({:EXIT, pid, reason}, %{writer: pid} = state) do
@@ -188,6 +199,18 @@ defmodule DurableBuffer.Partition.Committer do
   @impl GenServer
   def terminate(_reason, state) do
     state.backend.close(state.backend_state)
+  end
+
+  defp publish_offset(%{publishes_offset?: false} = state), do: state
+
+  defp publish_offset(state) do
+    :atomics.put(
+      state.durable_offsets,
+      state.partition_index + 1,
+      state.backend.durable_offset(state.backend_state)
+    )
+
+    state
   end
 
   defp handle_backend_message(state, message) do

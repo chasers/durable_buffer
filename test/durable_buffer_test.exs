@@ -168,4 +168,66 @@ defmodule DurableBufferTest do
     {:ok, status} = DurableBuffer.replica_status(name, "user-1")
     assert %{adopted_epoch: 1, epoch: 1, promotable?: true} = Map.fetch!(status, node())
   end
+
+  describe "reads gated at the durable offset" do
+    test "hides a batch that never met the ack policy", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          backend:
+            {DurableBuffer.Backend.Replica,
+             dir: Path.join(tmp_dir, "primary"),
+             replica_dir: Path.join(tmp_dir, "replica"),
+             replicas: [:unreachable@nohost],
+             ack: :all,
+             rpc_timeout: 300,
+             heal_timeout: 300},
+          partitions: 1
+        )
+
+      assert {:error, {:insufficient_acks, 1, 2}} =
+               DurableBuffer.append(name, "user-1", "never-acked")
+
+      assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == []
+      assert Enum.to_list(DurableBuffer.stream(name, "user-1", dirty: true)) == ["never-acked"]
+    end
+
+    test "shows a batch once the ack policy is met", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          backend:
+            {DurableBuffer.Backend.Replica,
+             dir: Path.join(tmp_dir, "primary"),
+             replica_dir: Path.join(tmp_dir, "replica"),
+             replicas: [node()],
+             ack: :all},
+          partitions: 1
+        )
+
+      assert :ok = DurableBuffer.append(name, "user-1", "acked")
+      assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == ["acked"]
+    end
+
+    test "returns every entry across chunk boundaries", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      payload = String.duplicate("x", 1000)
+
+      for _ <- 1..200 do
+        assert :ok = DurableBuffer.append(name, "user-1", payload)
+      end
+
+      assert length(Enum.to_list(DurableBuffer.stream(name, "user-1"))) == 200
+    end
+
+    test "reads nothing back after a truncate", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+
+      assert :ok = DurableBuffer.append(name, "user-1", "before")
+      assert :ok = DurableBuffer.truncate(name, "user-1")
+
+      assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == []
+
+      assert :ok = DurableBuffer.append(name, "user-1", "after")
+      assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == ["after"]
+    end
+  end
 end

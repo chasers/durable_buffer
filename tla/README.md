@@ -48,11 +48,12 @@ property is load-bearing.
 | `Replication_loss` | dropped batches alone; the tail check heals them | PASS |
 | `Replication_nocrash` | truncate + loss, `fsync: false`, no crash | PASS |
 | `Replication_adopt` | the adopted-epoch report across a failed truncate `:erpc` | PASS |
+| `Replication_gatedread` | the same read check with `GateReads = TRUE` | PASS |
 | `Replication_heal` | `fsync: false` + crash, with the open-time heal, the attach reference and the reconcile fix | PASS |
 | `Replication` | `fsync: false` + primary crash, `AckedInPrimary` | VIOLATED — F-1 |
 | `Replication_ahead` | same, `AckedSomewhere`, heal off | VIOLATED — F-2 |
 | `Replication_staletruncate` | truncate whose `:erpc` to the replica fails | VIOLATED — F-3 |
-| `Replication_dirtyread` | reads gated on the ack policy | VIOLATED — F-4 |
+| `Replication_dirtyread` | reads ungated, `GateReads = FALSE` | VIOLATED — F-4 |
 | `Replication_notailcheck` | the writer's tail rule turned off | VIOLATED (control) |
 | `Replication_noepoch` | the epoch fence turned off in `reconcile/2` | VIOLATED (control) |
 
@@ -63,7 +64,9 @@ Invariants:
 - `AckedInPrimary` — an acked batch is still readable from the primary. Reads
   are local-only, so this is what a caller actually gets.
 - `AckedSomewhere` — an acked batch still exists on some member.
-- `ReadsAreAckDurable` — every readable byte met the ack policy.
+- `ReadsAreDurable` — every byte a reader can see is held by an ack policy's
+  worth of members. Checked against the replica WALs, not the primary's
+  watermarks, so a stale watermark fails it too.
 - `AdoptedIsHonest` — the primary never claims an epoch a replica has not
   persisted.
 - `PromotableIsClean` — a replica reported as promotable holds no

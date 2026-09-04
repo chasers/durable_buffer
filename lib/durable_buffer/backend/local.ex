@@ -7,6 +7,9 @@ defmodule DurableBuffer.Backend.Local do
   `:file.datasync/1`, so the fsync cost is shared by every entry in the batch.
   Torn tails are truncated on open.
 
+  Reads are gated at `durable_offset/1`, so a stream never returns bytes
+  whose `datasync` has not yet returned.
+
   `fsync: false` skips the `datasync`, making a commit durable only to the
   page cache — data survives a BEAM crash but not an OS crash or power
   loss. The default is `true` here; `DurableBuffer.Backend.Replica` opens
@@ -103,6 +106,20 @@ defmodule DurableBuffer.Backend.Local do
   end
 
   @impl DurableBuffer.Backend
+  def stream(config, partition_index, limit_fun) do
+    config.dir |> wal_path(partition_index) |> stream_file(limit_fun)
+  end
+
+  @doc """
+  Byte offset through which commits are durable. The write and the
+  `datasync` both succeed before `offset` advances, so it is exactly the
+  readable prefix.
+  """
+  @impl DurableBuffer.Backend
+  @spec durable_offset(map()) :: non_neg_integer()
+  def durable_offset(state), do: state.offset
+
+  @impl DurableBuffer.Backend
   def truncate(state) do
     :ok = :file.close(state.fd)
     :ok = File.rm(state.path)
@@ -118,12 +135,12 @@ defmodule DurableBuffer.Backend.Local do
   @doc """
   Lazily streams CRC-valid WAL payloads from a file, reading in chunks.
   """
-  @spec stream_file(Path.t()) :: Enumerable.t()
-  def stream_file(path) do
+  @spec stream_file(Path.t(), DurableBuffer.Backend.limit_fun() | nil) :: Enumerable.t()
+  def stream_file(path, limit_fun \\ nil) do
     Stream.resource(
       fn ->
         case :file.open(path, [:read, :raw, :binary, {:read_ahead, @read_chunk_size}]) do
-          {:ok, fd} -> {fd, <<>>}
+          {:ok, fd} -> {fd, <<>>, 0}
           {:error, :enoent} -> :done
         end
       end,
@@ -131,20 +148,32 @@ defmodule DurableBuffer.Backend.Local do
         :done ->
           {:halt, :done}
 
-        {fd, buffer} ->
-          case :file.read(fd, @read_chunk_size) do
-            {:ok, chunk} ->
-              {payloads, _valid, rest} = WAL.decode_all(buffer <> chunk)
-              {payloads, {fd, rest}}
+        {fd, buffer, position} = acc ->
+          case readable_bytes(limit_fun, position) do
+            0 ->
+              {:halt, acc}
 
-            :eof ->
-              {:halt, {fd, buffer}}
+            count ->
+              case :file.read(fd, count) do
+                {:ok, chunk} ->
+                  {payloads, _valid, rest} = WAL.decode_all(buffer <> chunk)
+                  {payloads, {fd, rest, position + byte_size(chunk)}}
+
+                :eof ->
+                  {:halt, acc}
+              end
           end
       end,
       fn
         :done -> :ok
-        {fd, _buffer} -> :file.close(fd)
+        {fd, _buffer, _position} -> :file.close(fd)
       end
     )
+  end
+
+  defp readable_bytes(nil, _position), do: @read_chunk_size
+
+  defp readable_bytes(limit_fun, position) do
+    limit_fun.() |> Kernel.-(position) |> max(0) |> min(@read_chunk_size)
   end
 end
