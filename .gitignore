@@ -25,3 +25,7 @@ durable_buffer-*.tar
 # Local planning notes.
 /.plans/
 
+
+# TLA+ model checker: the downloaded jar and its scratch directory.
+/tla/tla2tools-*.jar
+/tla/states/
