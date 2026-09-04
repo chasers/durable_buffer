@@ -26,8 +26,9 @@ CONSTANTS
     AllowCrash,     \* the primary may lose its unsynced WAL tail
     AllowLoss,      \* the channel to a writer may drop a batch
     AllowTruncate,
-    HealOnOpen      \* open/2 pulls back bytes a replica holds and the
+    HealOnOpen,     \* open/2 pulls back bytes a replica holds and the
                     \* primary lost, before the partition serves
+    GateReads       \* stream/3 stops at the durable offset
 
 VARIABLES
     pEpoch,     \* primary epoch, from DurableBuffer.Epoch
@@ -355,11 +356,27 @@ NoConflict ==
 AckedInPrimary ==
     \A id \in acked : \E i \in 1..Len(pWal) : pWal[i] = id
 
-(* stream/2 reads the local WAL through the static backend config, so it    *)
-(* never consults a watermark. Every readable byte would have to have met    *)
-(* the ack policy for a read to be ack-durable.                             *)
-ReadsAreAckDurable ==
-    \A i \in 1..Len(pWal) : DurableCount(<<pEpoch, i>>) >= NeededAcks
+(***************************************************************************)
+(* Backend.Replica.durable_offset/1: the furthest offset that NeededAcks     *)
+(* member watermarks agree on. Ungated, a reader sees the whole local WAL.   *)
+(***************************************************************************)
+DurableThrough ==
+    LET reached == {i \in 0..Len(pWal) : DurableCount(<<pEpoch, i>>) >= NeededAcks}
+    IN IF reached = {}
+         THEN 0
+         ELSE CHOOSE i \in reached : \A j \in reached : j <= i
+
+Readable == IF GateReads THEN DurableThrough ELSE Len(pWal)
+
+(* Ground truth, not the primary's belief: how many members actually hold    *)
+(* byte i in the current epoch. The primary holds every byte it can read.    *)
+HoldersOf(i) ==
+    1 + Cardinality({r \in Replicas : rEpoch[r] = pEpoch /\ Len(rWal[r]) >= i})
+
+(* Everything a reader can see is held by an ack policy's worth of members.  *)
+(* Checking against the replica WALs rather than the watermarks means a      *)
+(* stale watermark fails this too.                                          *)
+ReadsAreDurable == \A i \in 1..Readable : HoldersOf(i) >= NeededAcks
 
 (* Backend.Replica tracks the newest epoch each replica confirmed, and       *)
 (* replica_status/3 reports it. The primary must never claim an epoch a      *)

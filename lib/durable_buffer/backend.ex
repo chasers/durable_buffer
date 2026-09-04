@@ -25,6 +25,13 @@ defmodule DurableBuffer.Backend do
   @type tag :: term()
   @type result :: :ok | {:error, term()}
 
+  @typedoc """
+  Returns the byte offset through which the partition's data currently meets
+  the backend's durability guarantee. Re-evaluated as a reader advances, so
+  a stream sees data that becomes durable while it runs.
+  """
+  @type limit_fun :: (-> non_neg_integer())
+
   @callback init_config(keyword()) :: config()
   @callback open(config(), partition_index :: non_neg_integer()) :: {:ok, state()}
   @callback commit(state(), batch :: iodata(), byte_size :: non_neg_integer()) ::
@@ -33,10 +40,13 @@ defmodule DurableBuffer.Backend do
               {:done, result(), state()} | {:pending, state()}
   @callback handle_message(message :: term(), state()) :: {[{tag(), result()}], state()}
   @callback stream(config(), partition_index :: non_neg_integer()) :: Enumerable.t()
+  @callback stream(config(), partition_index :: non_neg_integer(), limit_fun()) ::
+              Enumerable.t()
+  @callback durable_offset(state()) :: non_neg_integer()
   @callback truncate(state()) :: {:ok, state()}
   @callback close(state()) :: :ok
 
-  @optional_callbacks commit_async: 4, handle_message: 2
+  @optional_callbacks commit_async: 4, handle_message: 2, stream: 3, durable_offset: 1
 
   @doc """
   Normalizes a `{module, opts}` backend spec into `{module, config}`.
@@ -48,6 +58,19 @@ defmodule DurableBuffer.Backend do
 
   def normalize(module) when is_atom(module) do
     normalize({module, []})
+  end
+
+  @doc """
+  Whether `module` can gate reads at its durable offset.
+
+  A backend that cannot is read ungated. `DurableBuffer.Backend.S3` is the
+  case that matters: an object exists only once its PUT succeeded, so its
+  reads are already exact and there is nothing to gate.
+  """
+  @spec gates_reads?(module()) :: boolean()
+  def gates_reads?(module) do
+    function_exported?(module, :stream, 3) and
+      function_exported?(module, :durable_offset, 1)
   end
 
   @doc """

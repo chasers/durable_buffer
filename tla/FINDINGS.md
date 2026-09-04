@@ -204,9 +204,10 @@ the check has teeth.
 `Replication_staletruncate` stays VIOLATED. The divergence window is real and
 still there; what changed is that the primary now knows about it.
 
-### F-4 — reads are not gated on the ack policy
+### F-4 — reads were not gated on the ack policy
 
-Config `Replication_dirtyread` (`ReadsAreAckDurable`, VIOLATED).
+Configs `Replication_dirtyread` (VIOLATED) and `Replication_gatedread`
+(PASS), the same `ReadsAreDurable` invariant with `GateReads` off and on.
 
 `Backend.Replica.stream/2` calls `Local.stream/2` with the static backend
 config. That config holds `dir` and `needed_acks`; it does not hold
@@ -218,7 +219,35 @@ second. Between those points a reader sees a batch that no replica has acked,
 that may still fail with `:insufficient_acks`, and that a primary crash can
 erase. Every readable byte fails the ack target as soon as it is written.
 
-Planned fix: `.plans/2026-09-03_02_ack-durable-reads.md`.
+**Fixed.** Each partition publishes its backend's durable byte offset into
+an `:atomics` slot after every commit, completion and truncate.
+`DurableBuffer.stream/3` reads that slot to bound the read — lock-free, no
+message to the partition. `Backend.Replica.durable_offset/1` is the
+`needed_acks`-th largest member watermark on the current epoch, which is
+exactly what a commit waits for; `Backend.Local`'s is its `offset`, which
+advances only after the write and the `datasync` both return.
+
+The limit is re-read at each chunk boundary rather than captured once, so a
+consumer that keeps pulling sees data that becomes durable while it runs. A
+stream still ends at the current end of durable data, exactly as it already
+ended at EOF. `stream/3` takes `dirty: true` for recovery tooling that wants
+the whole WAL.
+
+`ReadsAreDurable` deliberately checks the read limit against the **replica
+WALs**, not against the primary's watermarks. Checking belief against belief
+would be a tautology; this way a stale watermark fails the invariant too.
+
+`Backend.S3` is not gated and needs no gating: an object exists only once
+its PUT succeeded, so its reads are already exact. `Backend.gates_reads?/1`
+reports which backends can gate.
+
+One limit is worth stating plainly. At `open/2` the backend seeds its
+watermarks from its own WAL tail and from the replica tails it collects for
+the heal, so everything that survived a restart is immediately readable. The
+gate closes the in-flight window; it does not re-derive durability for data
+written before the restart. `Replication_gatedread` therefore models the
+crash and the heal, and the invariant holds — but the property it proves is
+about the in-flight window.
 
 ## Not modeled yet
 

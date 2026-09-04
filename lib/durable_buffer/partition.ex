@@ -106,7 +106,7 @@ defmodule DurableBuffer.Partition do
         backend,
         config,
         partition_index,
-        Keyword.take(opts, [:max_inflight_commits])
+        Keyword.take(opts, [:max_inflight_commits, :durable_offsets])
       )
 
     {:ok,

@@ -34,6 +34,7 @@ defmodule DurableBuffer do
       via `Req` + `ReqS3`
   """
 
+  alias DurableBuffer.Backend
   alias DurableBuffer.Partition
 
   @doc """
@@ -134,13 +135,31 @@ defmodule DurableBuffer do
   end
 
   @doc """
-  Lazily streams committed payloads for `partition_key`'s partition, oldest
+  Lazily streams durable payloads for `partition_key`'s partition, oldest
   first.
+
+  A reader sees only data that has met the backend's durability guarantee:
+  the ack policy for `DurableBuffer.Backend.Replica`, a returned `datasync`
+  for `DurableBuffer.Backend.Local`. The limit is re-read as the stream
+  advances, so a consumer that keeps pulling picks up data that becomes
+  durable while it runs. Like any read of a file that is still being
+  written, the stream ends at the current end of durable data.
+
+  Pass `dirty: true` to read the whole local WAL instead, including batches
+  that have not met the policy and may still fail. Recovery tooling wants
+  this; ordinary consumers do not.
   """
-  @spec stream(atom(), term()) :: Enumerable.t()
-  def stream(name, partition_key) do
-    %{backend: {backend, backend_config}} = config(name)
-    backend.stream(backend_config, partition_index(name, partition_key))
+  @spec stream(atom(), term(), keyword()) :: Enumerable.t()
+  def stream(name, partition_key, opts \\ []) do
+    %{backend: {backend, backend_config}} = buffer = config(name)
+    index = partition_index(name, partition_key)
+    limit = read_limit(buffer, index)
+
+    if Keyword.get(opts, :dirty, false) or limit == nil or not Backend.gates_reads?(backend) do
+      backend.stream(backend_config, index)
+    else
+      backend.stream(backend_config, index, limit)
+    end
   end
 
   @doc """
@@ -223,9 +242,20 @@ defmodule DurableBuffer do
   @doc """
   Returns the buffer's resolved configuration.
   """
-  @spec config(atom()) :: %{partitions: pos_integer(), backend: {module(), map()}}
+  @spec config(atom()) :: %{
+          partitions: pos_integer(),
+          backend: {module(), map()},
+          durable_offsets: :atomics.atomics_ref()
+        }
   def config(name) do
     :persistent_term.get({DurableBuffer, name})
+  end
+
+  defp read_limit(buffer, index) do
+    case Map.get(buffer, :durable_offsets) do
+      nil -> nil
+      offsets -> fn -> :atomics.get(offsets, index + 1) end
+    end
   end
 
   defp await_adoption(name, partition_key, deadline) do

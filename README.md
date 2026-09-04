@@ -38,7 +38,8 @@ Append, read, and trim:
                                                             # from async entries
 :ok = DurableBuffer.sync_all(:events)
 
-DurableBuffer.stream(:events, user_id) |> Enum.to_list()    # oldest first
+DurableBuffer.stream(:events, user_id) |> Enum.to_list()    # oldest first,
+                                                            # durable only
 
 :ok = DurableBuffer.truncate(:events, user_id)              # drop consumed data
 :ok = DurableBuffer.truncate_all(:events)
@@ -213,12 +214,24 @@ satisfy a new-epoch target, but it is not safe to promote. Use
 `replica_status/3` to see which replicas have adopted the current epoch, or
 `await_replicas/3` to block until they all have.
 
-**Reads:** `stream/2` reads the local WAL of the primary and is *not* gated
-on the ack policy. A reader can see a batch that no replica has acked yet,
-that may still fail with `:insufficient_acks`, and that a primary crash can
-erase. This is a known gap with a fix planned —
-`.plans/2026-09-03_02_ack-durable-reads.md`, and F-4 in
-[`tla/FINDINGS.md`](tla/FINDINGS.md).
+**Reads:** `stream/3` reads the primary's local WAL, gated at the durable
+offset — the `ack:`-th largest replica watermark, which is exactly what a
+commit waits for. A reader never sees a batch that has not met the policy,
+so it never sees one that may still fail with `:insufficient_acks`. The
+limit is re-read as the stream advances, so a consumer that keeps pulling
+picks up data that becomes durable while it runs; like any read of a file
+still being written, the stream ends at the current end of durable data.
+
+Each partition publishes its durable offset into an `:atomics` slot, so a
+reader takes it lock-free and sends the partition no message.
+
+Pass `dirty: true` to read the whole local WAL instead, for recovery
+tooling:
+
+```elixir
+DurableBuffer.stream(:events, user_id)               # durable only
+DurableBuffer.stream(:events, user_id, dirty: true)  # everything on disk
+```
 
 **Durability model:** by default the replicated backend does *not* fsync
 (`fsync: false`) — durability is the ack policy itself, data held on N
@@ -245,6 +258,8 @@ toggles it in `replica_bench.exs`.
 Uses [`req_s3`](https://hex.pm/packages/req_s3). Each group commit uploads
 one immutable segment object (`<prefix>/p<partition>/<seq>.wal`), so
 durability is exactly PUT success and there is no torn-write recovery to do.
+Reads need no durability gate for the same reason: an object exists only
+once its PUT succeeded.
 Credentials come from `req_options` or the standard `AWS_*` environment
 variables; point `aws_endpoint_url_s3:` at MinIO or another S3-compatible
 store. In tests, pass `req_options: [plug: {Req.Test, YourStub}]`.
