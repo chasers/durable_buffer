@@ -79,20 +79,34 @@ defmodule DurableBuffer.TransportDistributedTest do
     :erpc.call(replica_node, Enum, :to_list, [stream])
   end
 
-  defp open(ctx, transport, suffix) do
+  defp open(ctx, transport, suffix, opts \\ []) do
     primary_dir = Path.join([ctx.tmp_dir, suffix, "primary"])
     replica_dir = Path.join([ctx.tmp_dir, suffix, "replica"])
 
     config =
       Replica.init_config(
-        dir: primary_dir,
-        replica_dir: replica_dir,
-        replicas: [ctx.replica_node],
-        transport: transport
+        Keyword.merge(
+          [
+            dir: primary_dir,
+            replica_dir: replica_dir,
+            replicas: [ctx.replica_node],
+            transport: transport
+          ],
+          opts
+        )
       )
 
     {:ok, state} = Replica.open(config, 0)
     {state, replica_dir}
+  end
+
+  defp await_replica(replica_node, replica_dir, count, attempts \\ 100) do
+    if length(replica_entries(replica_node, replica_dir)) >= count or attempts == 0 do
+      :ok
+    else
+      Process.sleep(50)
+      await_replica(replica_node, replica_dir, count, attempts - 1)
+    end
   end
 
   for transport <- @transports do
@@ -108,13 +122,15 @@ defmodule DurableBuffer.TransportDistributedTest do
         assert :ok = Replica.close(state)
       end
 
-      test "a run of batches arrives in the order it was sent", ctx do
-        {state, replica_dir} = open(ctx, @transport, "ordered")
+      test "a deep pipeline of batches arrives in the order it was sent", ctx do
+        {state, replica_dir} = open(ctx, @transport, "ordered", ack: 1)
 
-        payloads = for index <- 1..200, do: "entry-#{index}"
+        payloads = for index <- 1..500, do: "entry-#{index}"
 
         state =
           Enum.reduce(payloads, state, fn payload, state -> commit!(state, [payload]) end)
+
+        await_replica(ctx.replica_node, replica_dir, length(payloads))
 
         assert replica_entries(ctx.replica_node, replica_dir) == payloads
         assert :ok = Replica.close(state)

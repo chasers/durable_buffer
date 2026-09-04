@@ -32,9 +32,15 @@ defmodule DurableBuffer.Transport.GenRPC do
       blocks the sender when the distribution buffer fills.
       `:gen_rpc.ordered_cast/4` does not block the caller: it hands the
       payload to gen_rpc's client process, whose mailbox is unbounded, and
-      the TCP send blocks that process instead. In-flight bytes stay bounded
-      — `max_sender_bytes` still caps the unacked queue and the sender drops
-      it and re-attaches on overflow — but the bytes wait somewhere else.
+      the TCP send blocks that process instead. So the bytes wait in that
+      mailbox rather than in this one. `max_sender_bytes` bounds them — it
+      caps the sender's unacked queue on the live path and the
+      unacknowledged resync window on the catch-up path — but a replica far
+      behind still parks up to that much in gen_rpc's mailbox.
+    * **A whitelist, if the node already runs gen_rpc.** With
+      `rpc_module_control` set to `:whitelist`, the acceptor discards a
+      batch whose module is not listed, at debug level, while `send_batch/6`
+      still returns `:ok`. Add `DurableBuffer.Replica` to the list.
 
   ## Ordering
 
@@ -54,30 +60,54 @@ defmodule DurableBuffer.Transport.GenRPC do
 
   Because the acceptor blocks, `DurableBuffer.Replica.replicate/7` does the
   least possible work: it resolves the writer and sends it one message.
+
+  ## Why the call is `apply/3`
+
+  `:gen_rpc` is not a declared dependency, so a literal call warns at
+  compile time in every project that does not add it — and fails outright
+  in one that builds with `warnings_as_errors`.
   """
 
   @behaviour DurableBuffer.Transport
 
   @doc """
-  Returns whether `:gen_rpc` is available in this runtime.
+  Returns whether `:gen_rpc` is loaded **and started**.
+
+  Both halves matter. A loaded but unstarted `:gen_rpc` has no registry
+  table, so the first `ordered_cast/4` raises from deep inside the library
+  rather than failing here — which is the deferred failure the
+  `init_config/1` guard exists to prevent.
   """
   @spec available?() :: boolean()
   def available? do
-    Code.ensure_loaded?(:gen_rpc) and function_exported?(:gen_rpc, :ordered_cast, 4)
+    Code.ensure_loaded?(:gen_rpc) and function_exported?(:gen_rpc, :ordered_cast, 4) and
+      started?()
+  end
+
+  defp started? do
+    Enum.any?(Application.started_applications(), &match?({:gen_rpc, _desc, _vsn}, &1))
   end
 
   @impl DurableBuffer.Transport
-  def channel(node, dir, partition_index, _writer), do: {node, dir, partition_index}
+  def channel(node, dir, partition_index, _writer) do
+    if available?() do
+      {:ok, {node, dir, partition_index}}
+    else
+      {:error, :gen_rpc_not_running}
+    end
+  end
 
   @impl DurableBuffer.Transport
   def send_batch({node, dir, partition_index}, ref, epoch, offset, batch, reply_to) do
-    :gen_rpc.ordered_cast(
+    apply(:gen_rpc, :ordered_cast, [
       {node, {dir, partition_index}},
       DurableBuffer.Replica,
       :replicate,
       [dir, partition_index, ref, epoch, offset, batch, reply_to]
-    )
+    ])
 
     :ok
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 end

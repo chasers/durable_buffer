@@ -11,6 +11,10 @@ defmodule DurableBuffer.FailingTransport do
     * `:no_channel` — `channel/4` returns `{:error, :simulated}`
     * `:nil_channel` — `channel/4` succeeds with `nil`, which is a legal
       opaque channel value and must not be read as "not attached"
+    * `:blackhole` — every `send_batch/6` succeeds and delivers nothing, so
+      no ack ever comes back. Models a transport that does not block the
+      caller, which is what makes the sender's own resync window the only
+      thing bounding in-flight bytes. `sent_bytes/1` reports the total.
   """
 
   @behaviour DurableBuffer.Transport
@@ -23,6 +27,29 @@ defmodule DurableBuffer.FailingTransport do
   end
 
   defp mode(dir), do: :persistent_term.get({__MODULE__, dir}, :ok)
+
+  @spec sent_bytes(Path.t()) :: non_neg_integer()
+  def sent_bytes(dir) do
+    case :persistent_term.get({__MODULE__, :sent, dir}, nil) do
+      nil -> 0
+      counter -> :counters.get(counter, 1)
+    end
+  end
+
+  defp count_sent(dir, bytes) do
+    counter =
+      case :persistent_term.get({__MODULE__, :sent, dir}, nil) do
+        nil ->
+          counter = :counters.new(1, [:atomics])
+          :persistent_term.put({__MODULE__, :sent, dir}, counter)
+          counter
+
+        counter ->
+          counter
+      end
+
+    :counters.add(counter, 1, bytes)
+  end
 
   @impl DurableBuffer.Transport
   def channel(node, dir, partition_index, writer) do
@@ -48,9 +75,18 @@ defmodule DurableBuffer.FailingTransport do
       end
 
     case dir && mode(dir) do
-      :error -> {:error, :simulated}
-      :raise -> raise "simulated transport failure"
-      _other -> forward(channel, ref, epoch, offset, batch, reply_to)
+      :error ->
+        {:error, :simulated}
+
+      :raise ->
+        raise "simulated transport failure"
+
+      :blackhole ->
+        count_sent(dir, byte_size(batch))
+        :ok
+
+      _other ->
+        forward(channel, ref, epoch, offset, batch, reply_to)
     end
   end
 

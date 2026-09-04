@@ -59,14 +59,22 @@ defmodule DurableBuffer.Replica do
   end
 
   @doc """
-  Hands one replicated batch to the writer for `{dir, partition_index}`,
-  starting the writer if needed.
+  Hands one replicated batch to the already-running writer for
+  `{dir, partition_index}`.
 
   This is the replica-side end of a `DurableBuffer.Transport` that has no
   pid-to-pid messaging, such as `DurableBuffer.Transport.GenRPC`. It sends
   the same `:replicate` message the writer would receive over distribution,
   so the writer's group-commit drain is unaffected, and the ack goes
   straight back to `reply_to` over distribution.
+
+  It does **not** start a writer. `attach/3` starts one, with the primary's
+  configured `fsync`, and a sender attaches before it sends anything. A
+  batch that arrives with no writer running therefore means the writer died
+  after the attach, so dropping it is right: the sender's monitor fires and
+  it re-attaches, which starts the writer with the correct setting and
+  resyncs. Starting one here would pick the `fsync: true` default and
+  silently datasync every batch against an explicit `fsync: false`.
 
   It does the least possible work on purpose. `:gen_rpc.ordered_cast/4`
   blocks its acceptor until this returns, and that acceptor is what keeps
@@ -82,8 +90,14 @@ defmodule DurableBuffer.Replica do
           pid()
         ) :: :ok
   def replicate(dir, partition_index, ref, epoch, offset, batch, reply_to) do
-    writer = ensure_writer(dir, partition_index)
-    send(writer, {:replicate, ref, epoch, offset, batch, reply_to})
+    case Registry.lookup(DurableBuffer.Registry, {:replica_writer, dir, partition_index}) do
+      [{writer, _value}] ->
+        send(writer, {:replicate, ref, epoch, offset, batch, reply_to})
+
+      [] ->
+        :ok
+    end
+
     :ok
   end
 

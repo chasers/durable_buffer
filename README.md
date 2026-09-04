@@ -465,6 +465,16 @@ A transport must deliver batches to one replica in the order they were sent.
 A replica appends a batch only when it lands exactly at its WAL tail, so a
 reordered pair costs a full resync.
 
+A transport reports a failure rather than raising: `channel/4` and
+`send_batch/6` both return `{:error, reason}`, and the sender heals by
+re-attaching. It catches a raise too, but a transport that raises on an
+ordinary dead peer produces log lines that read like a bug.
+
+`max_sender_bytes` bounds in-flight bytes on both paths — the unacked queue
+while live, and the unacknowledged window while resyncing a replica that is
+behind. The resync bound matters most for a transport that does not block
+its caller, which is every transport except distribution.
+
 ##### gen_rpc
 
 `DurableBuffer.Transport.GenRPC` gives each node pair a dedicated TCP
@@ -502,9 +512,14 @@ What it costs:
   the sender when the distribution buffer fills. `:gen_rpc.ordered_cast/4`
   does not block the caller: it hands the payload to gen_rpc's client
   process, whose mailbox is unbounded, and the TCP send blocks that process
-  instead. In-flight bytes stay bounded — `max_sender_bytes` still caps the
-  unacked queue, and the sender drops it and re-attaches on overflow — but
-  the bytes wait somewhere else.
+  instead. So the bytes wait in that mailbox rather than in the sender.
+  `max_sender_bytes` is what bounds them: it caps the unacked queue on the
+  live path and the unacknowledged resync window on the catch-up path. A
+  replica far behind still parks up to that much in gen_rpc's mailbox.
+* **A whitelist, if the node already runs gen_rpc.** With
+  `rpc_module_control` set to `:whitelist`, the acceptor discards a batch
+  whose module is not listed — at debug level, while the send still
+  reports success. Add `DurableBuffer.Replica` to the list.
 
 Ordering comes from `ordered_cast/4`, which gen_rpc serialises per
 `{node, tag}`. The tag is `{replica_dir, partition}`, so each partition
