@@ -29,21 +29,48 @@ children = [
 Append, read, and trim:
 
 ```elixir
-:ok = DurableBuffer.append(:events, user_id, payload)      # blocks until durable
-:ok = DurableBuffer.append_batch(:events, user_id, payloads) # N payloads, one call,
-                                                            # one reply after commit
-:ok = DurableBuffer.append_async(:events, user_id, payload) # enqueue, don't wait
-:ok = DurableBuffer.sync(:events, user_id)                  # await pending appends;
-                                                            # also surfaces commit errors
-                                                            # from async entries
+{:ok, offset} = DurableBuffer.append(:events, user_id, payload)   # blocks until durable
+{:ok, first..last} =
+  DurableBuffer.append_batch(:events, user_id, payloads)          # N payloads, one call,
+                                                                  # one reply after commit
+:ok = DurableBuffer.append_async(:events, user_id, payload)       # enqueue, don't wait
+:ok = DurableBuffer.sync(:events, user_id)                        # await pending appends;
+                                                                  # also surfaces commit
+                                                                  # errors from async entries
 :ok = DurableBuffer.sync_all(:events)
 
-DurableBuffer.stream(:events, user_id) |> Enum.to_list()    # oldest first,
-                                                            # durable only
+DurableBuffer.stream(:events, user_id) |> Enum.to_list()          # oldest first, durable only
+DurableBuffer.stream(:events, user_id, from: 42)                  # resume at an offset
+DurableBuffer.stream(:events, user_id, with_offsets: true)        # {offset, payload}
 
-:ok = DurableBuffer.truncate(:events, user_id)              # drop consumed data
+DurableBuffer.offsets(:events, user_id)                           # %{first:, durable:, next:}
+
+:ok = DurableBuffer.truncate(:events, user_id)                    # drop consumed data
 :ok = DurableBuffer.truncate_all(:events)
 ```
+
+### Logical offsets
+
+Every committed entry gets a monotonic `offset` — 0, 1, 2, … — assigned in
+commit-submission order, which is also caller-reply order. The offset an
+append returns is the entry's true position in the partition log, so it is
+usable directly as a resume point or as an SSE `id:` field.
+
+`offsets/2` reports three bounds:
+
+| key | meaning |
+|---|---|
+| `:first` | oldest offset still retained |
+| `:durable` | end of what a reader can see |
+| `:next` | where the next append lands |
+
+Offsets never repeat. `truncate/3` advances `:first` past `:next` rather
+than resetting to zero, so a resumed consumer can never silently read
+different data at the same offset. They survive a restart: a partition
+recovers its count from the WAL on open.
+
+Use `:first` to detect that a resume point predates retention and fall back
+to a full resync, instead of silently replaying from the trim point.
 
 The `partition_key` (any term) is hashed to one of a fixed number of
 partitions (default `System.schedulers_online()`). Each partition has its own
@@ -141,8 +168,9 @@ unreachable replica delays startup; a replica that does not answer is not
 consulted.
 
 Every batch is stamped with `{epoch, offset}` — a per-partition epoch that
-increments on truncate (persisted in a `p<index>.meta` sidecar file) and the
-WAL byte offset where the batch starts. A replica appends a batch only when
+increments on truncate (persisted in the `p<index>.meta` sidecar alongside
+the retention bounds, see `DurableBuffer.Meta`) and the WAL byte offset
+where the batch starts. A replica appends a batch only when
 it lands exactly at its own WAL tail, so it can never diverge silently, and
 every failure heals the same way: the sender re-attaches, compares the
 replica's tail against the primary's WAL, and streams the replica the
@@ -256,13 +284,20 @@ toggles it in `replica_bench.exs`.
 ```
 
 Uses [`req_s3`](https://hex.pm/packages/req_s3). Each group commit uploads
-one immutable segment object (`<prefix>/p<partition>/<seq>.wal`), so
-durability is exactly PUT success and there is no torn-write recovery to do.
+one immutable segment object (`<prefix>/p<partition>/<offset>.wal`, keyed by
+the segment's first logical entry offset), so durability is exactly PUT
+success and there is no torn-write recovery to do.
 Reads need no durability gate for the same reason: an object exists only
 once its PUT succeeded.
 Credentials come from `req_options` or the standard `AWS_*` environment
 variables; point `aws_endpoint_url_s3:` at MinIO or another S3-compatible
 store. In tests, pass `req_options: [plug: {Req.Test, YourStub}]`.
+
+**Upgrading an S3 buffer to 0.4.0:** segment keys changed meaning. Before
+0.4.0 they were a commit counter; now they are the segment's first logical
+entry offset. An existing bucket would be misread, since a counter of 1 does
+not mean one entry. Drain the partition (`truncate/3`) before upgrading —
+there is no migration.
 
 S3's high PUT latency is where group commit matters most: while one PUT is
 in flight, every arriving append queues into the next segment, so throughput

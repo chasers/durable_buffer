@@ -51,23 +51,25 @@ defmodule DurableBuffer.WAL do
   @doc """
   Reads a WAL file, truncating any torn tail in place.
 
-  Returns the byte offset at which the next entry should be appended. Missing
-  files are treated as empty logs.
+  Returns `{byte_offset, entry_count}` — where the next entry should be
+  appended, and how many CRC-valid entries the file holds. The count seeds
+  logical offset assignment on open. Missing files are treated as empty
+  logs.
   """
-  @spec recover!(Path.t()) :: non_neg_integer()
+  @spec recover!(Path.t()) :: {non_neg_integer(), non_neg_integer()}
   def recover!(path) do
     case File.read(path) do
       {:ok, contents} ->
-        {_payloads, valid, rest} = decode_all(contents)
+        {payloads, valid, rest} = decode_all(contents)
 
         if rest != "" do
           truncate!(path, valid)
         end
 
-        valid
+        {valid, length(payloads)}
 
       {:error, :enoent} ->
-        0
+        {0, 0}
     end
   end
 

@@ -66,7 +66,7 @@ defmodule DurableBuffer.Backend.LocalTest do
     {batch, bytes} = encode_batch(["gone"])
     {:ok, state} = Local.commit(state, batch, bytes)
 
-    assert {:ok, state} = Local.truncate(state)
+    assert {:ok, state} = Local.truncate(state, 0)
     assert Enum.to_list(Local.stream(config, 0)) == []
 
     {batch, bytes} = encode_batch(["fresh"])
@@ -99,7 +99,7 @@ defmodule DurableBuffer.Backend.LocalTest do
     {_config, state} = open(tmp_dir)
     assert Local.offset(state) == bytes
 
-    {:ok, state} = Local.truncate(state)
+    {:ok, state} = Local.truncate(state, 0)
     assert Local.offset(state) == 0
     assert :ok = Local.close(state)
   end

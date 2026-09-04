@@ -37,7 +37,7 @@ defmodule DurableBuffer.S3IntegrationTest do
         Task.async(fn -> DurableBuffer.append(name, "key", "entry-#{index}") end)
       end
 
-    assert Enum.all?(Task.await_many(tasks, 10_000), &(&1 == :ok))
+    assert Enum.all?(Task.await_many(tasks, 10_000), &match?({:ok, _}, &1))
 
     segments = map_size(FakeS3.objects(store))
     assert segments < 30

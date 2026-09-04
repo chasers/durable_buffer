@@ -13,7 +13,7 @@ defmodule DurableBuffer.Partition.CommitterTest do
 
   defp submit(committer) do
     {entry, bytes} = WAL.encode("payload")
-    :ok = Committer.commit(committer, [{:entries, nil, [entry]}], bytes)
+    :ok = Committer.commit(committer, [{:entries, nil, [entry], 1, :offset}], bytes)
     assert_receive {:submitted, tag, ^committer}
     tag
   end

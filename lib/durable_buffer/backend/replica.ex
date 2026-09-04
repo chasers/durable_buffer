@@ -34,7 +34,7 @@ defmodule DurableBuffer.Backend.Replica do
   cost when many partitions share a disk.
 
   Every batch is stamped with `{epoch, offset}` — the partition's epoch
-  (bumped on truncate, persisted via `DurableBuffer.Epoch`) and the WAL byte
+  (bumped on truncate, persisted via `DurableBuffer.Meta`) and the WAL byte
   offset at which the batch starts. Replica writers append a batch only when
   it lands exactly at their tail, so a replica that missed a batch or a
   truncate rejects everything after the gap instead of diverging silently.
@@ -69,7 +69,7 @@ defmodule DurableBuffer.Backend.Replica do
   require Logger
 
   alias DurableBuffer.Backend.Local
-  alias DurableBuffer.Epoch
+  alias DurableBuffer.Meta
   alias DurableBuffer.Replica.Sender
   alias DurableBuffer.WAL
 
@@ -102,7 +102,7 @@ defmodule DurableBuffer.Backend.Replica do
   @impl DurableBuffer.Backend
   def open(config, partition_index) do
     {:ok, local} = Local.open(local_config(config), partition_index)
-    epoch = Epoch.load(config.dir, partition_index)
+    epoch = Meta.epoch(config.dir, partition_index)
     tails = remote_tails(config, partition_index)
     local = heal(config, partition_index, epoch, local, tails)
     adopted = for {node, {^epoch, _offset}} <- tails, into: %{}, do: {node, epoch}
@@ -225,9 +225,17 @@ defmodule DurableBuffer.Backend.Replica do
   end
 
   @impl DurableBuffer.Backend
-  def stream(config, partition_index, limit_fun) do
-    Local.stream(local_config(config), partition_index, limit_fun)
+  def stream(config, partition_index, opts) do
+    Local.stream(local_config(config), partition_index, opts)
   end
+
+  @doc """
+  Logical entry offsets as of `open/2` or the last `truncate/1`, from the
+  local WAL.
+  """
+  @impl DurableBuffer.Backend
+  @spec offsets(map()) :: %{first: non_neg_integer(), next: non_neg_integer()}
+  def offsets(state), do: Local.offsets(state.local)
 
   @doc """
   Byte offset through which the ack policy is met.
@@ -255,10 +263,10 @@ defmodule DurableBuffer.Backend.Replica do
   end
 
   @impl DurableBuffer.Backend
-  def truncate(state) do
+  def truncate(state, next) do
     epoch = state.epoch + 1
-    Epoch.store!(state.config.dir, state.partition_index, epoch)
-    {:ok, local} = Local.truncate(state.local)
+    Meta.update!(state.config.dir, state.partition_index, &%{&1 | epoch: epoch})
+    {:ok, local} = Local.truncate(state.local, next)
 
     Enum.each(state.senders, fn {_node, sender} -> Sender.reset(sender, epoch) end)
 
