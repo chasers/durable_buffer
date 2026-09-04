@@ -19,6 +19,7 @@ defmodule DurableBuffer.Backend.Local do
 
   @behaviour DurableBuffer.Backend
 
+  alias DurableBuffer.Meta
   alias DurableBuffer.WAL
 
   @read_chunk_size 65_536
@@ -32,9 +33,33 @@ defmodule DurableBuffer.Backend.Local do
   def open(config, partition_index) do
     path = wal_path(config.dir, partition_index)
     File.mkdir_p!(Path.dirname(path))
-    offset = WAL.recover!(path)
+    {offset, entry_count} = WAL.recover!(path)
+    meta = Meta.load(config.dir, partition_index)
     {:ok, fd} = :file.open(path, [:append, :raw, :binary])
-    {:ok, %{fd: fd, path: path, offset: offset, fsync: config.fsync}}
+
+    {:ok,
+     %{
+       fd: fd,
+       path: path,
+       offset: offset,
+       fsync: config.fsync,
+       dir: config.dir,
+       partition_index: partition_index,
+       base_offset: meta.base_offset,
+       entry_count: entry_count
+     }}
+  end
+
+  @doc """
+  Logical entry offsets as of `open/2` or the last `truncate/1`.
+
+  `DurableBuffer.Partition.Committer` seeds its offset counter from this and
+  assigns every offset after it, so these do not track later commits.
+  """
+  @impl DurableBuffer.Backend
+  @spec offsets(map()) :: %{first: non_neg_integer(), next: non_neg_integer()}
+  def offsets(state) do
+    %{first: state.base_offset, next: state.base_offset + state.entry_count}
   end
 
   @impl DurableBuffer.Backend
@@ -106,8 +131,30 @@ defmodule DurableBuffer.Backend.Local do
   end
 
   @impl DurableBuffer.Backend
-  def stream(config, partition_index, limit_fun) do
-    config.dir |> wal_path(partition_index) |> stream_file(limit_fun)
+  def stream(config, partition_index, opts) do
+    base = Meta.load(config.dir, partition_index).base_offset
+
+    config.dir
+    |> wal_path(partition_index)
+    |> stream_file(Keyword.get(opts, :limit))
+    |> project(base, Keyword.get(opts, :from), Keyword.get(opts, :with_offsets, false))
+  end
+
+  defp project(stream, _base, nil, false), do: stream
+
+  defp project(stream, base, from, with_offsets?) do
+    stream
+    |> Stream.with_index(base)
+    |> drop_below(from)
+    |> Stream.map(fn {payload, offset} ->
+      if with_offsets?, do: {offset, payload}, else: payload
+    end)
+  end
+
+  defp drop_below(stream, nil), do: stream
+
+  defp drop_below(stream, from) do
+    Stream.drop_while(stream, fn {_payload, offset} -> offset < from end)
   end
 
   @doc """
@@ -120,11 +167,16 @@ defmodule DurableBuffer.Backend.Local do
   def durable_offset(state), do: state.offset
 
   @impl DurableBuffer.Backend
-  def truncate(state) do
+  def truncate(state, next) do
     :ok = :file.close(state.fd)
     :ok = File.rm(state.path)
+
+    Meta.update!(state.dir, state.partition_index, fn meta ->
+      %{meta | base_offset: next, base_byte_offset: 0}
+    end)
+
     {:ok, fd} = :file.open(state.path, [:append, :raw, :binary])
-    {:ok, %{state | fd: fd, offset: 0}}
+    {:ok, %{state | fd: fd, offset: 0, base_offset: next, entry_count: 0}}
   end
 
   @impl DurableBuffer.Backend

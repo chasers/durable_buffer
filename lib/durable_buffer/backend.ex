@@ -32,6 +32,20 @@ defmodule DurableBuffer.Backend do
   """
   @type limit_fun :: (-> non_neg_integer())
 
+  @typedoc """
+  Options accepted by `c:stream/3`.
+
+    * `:limit` — a `t:limit_fun/0` bounding the read at the durable offset,
+      or `nil` for an ungated read.
+    * `:from` — first logical entry offset to yield, inclusive.
+    * `:with_offsets` — yield `{offset, payload}` instead of `payload`.
+  """
+  @type stream_opts :: [
+          limit: limit_fun() | nil,
+          from: non_neg_integer(),
+          with_offsets: boolean()
+        ]
+
   @callback init_config(keyword()) :: config()
   @callback open(config(), partition_index :: non_neg_integer()) :: {:ok, state()}
   @callback commit(state(), batch :: iodata(), byte_size :: non_neg_integer()) ::
@@ -40,13 +54,18 @@ defmodule DurableBuffer.Backend do
               {:done, result(), state()} | {:pending, state()}
   @callback handle_message(message :: term(), state()) :: {[{tag(), result()}], state()}
   @callback stream(config(), partition_index :: non_neg_integer()) :: Enumerable.t()
-  @callback stream(config(), partition_index :: non_neg_integer(), limit_fun()) ::
+  @callback stream(config(), partition_index :: non_neg_integer(), opts :: keyword()) ::
               Enumerable.t()
   @callback durable_offset(state()) :: non_neg_integer()
-  @callback truncate(state()) :: {:ok, state()}
+  @callback offsets(state()) :: %{first: non_neg_integer(), next: non_neg_integer()}
+  @callback truncate(state(), next_offset :: non_neg_integer()) :: {:ok, state()}
   @callback close(state()) :: :ok
 
-  @optional_callbacks commit_async: 4, handle_message: 2, stream: 3, durable_offset: 1
+  @optional_callbacks commit_async: 4,
+                      handle_message: 2,
+                      stream: 3,
+                      durable_offset: 1,
+                      offsets: 1
 
   @doc """
   Normalizes a `{module, opts}` backend spec into `{module, config}`.
@@ -58,6 +77,14 @@ defmodule DurableBuffer.Backend do
 
   def normalize(module) when is_atom(module) do
     normalize({module, []})
+  end
+
+  @doc """
+  Whether `module` assigns and recovers logical entry offsets.
+  """
+  @spec tracks_offsets?(module()) :: boolean()
+  def tracks_offsets?(module) do
+    function_exported?(module, :offsets, 1) and function_exported?(module, :stream, 3)
   end
 
   @doc """

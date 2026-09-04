@@ -25,10 +25,16 @@ defmodule DurableBuffer.Partition.Committer do
   from 2 ms, 2 ms from 4 ms — sent only when the recommendation changes.
   The writer uses the hint as its adaptive flush dwell.
 
-  After every commit, completion and truncate the committer publishes the
-  backend's durable byte offset into the buffer's `:atomics` array, at the
-  slot for its partition. `DurableBuffer.stream/3` reads that slot to gate
-  reads without sending the committer a message.
+  The committer also assigns every entry a logical offset. Offsets are
+  handed out in commit-submission order, which is also caller-reply order,
+  so the offset an append returns is the entry's true log position. The
+  counter is seeded from the backend at open and after every truncate.
+
+  After every commit, completion and truncate it publishes four numbers into
+  the buffer's `:atomics` array, in the four slots for its partition: the
+  durable byte offset, the durable logical offset, the next logical offset,
+  and the base offset. `DurableBuffer.stream/3` and `offsets/2` read those
+  slots without sending the committer a message.
   """
 
   use GenServer
@@ -95,9 +101,10 @@ defmodule DurableBuffer.Partition.Committer do
       max_inflight: Keyword.get(opts, :max_inflight_commits, 32),
       partition_index: partition_index,
       durable_offsets: Keyword.get(opts, :durable_offsets),
-      publishes_offset?:
-        Keyword.get(opts, :durable_offsets) != nil and
-          function_exported?(backend, :durable_offset, 1),
+      publishes_offset?: Keyword.get(opts, :durable_offsets) != nil,
+      next_offset: seed_next_offset(backend, backend_state),
+      durable_logical: seed_next_offset(backend, backend_state),
+      base_offset: seed_base_offset(backend, backend_state),
       pending: :queue.new(),
       completed: %{},
       deferred_credits: 0,
@@ -110,7 +117,10 @@ defmodule DurableBuffer.Partition.Committer do
 
   @impl GenServer
   def handle_cast({:commit, units, byte_size}, %{async?: true} = state) do
-    batch = for {:entries, _from, entries} <- units, do: entries
+    assigned_from = state.next_offset
+    {units, next_offset} = assign_offsets(units, assigned_from)
+    state = %{state | next_offset: next_offset}
+    batch = for {:entries, _from, entries, _count, _shape, _first} <- units, do: entries
     tag = make_ref()
 
     state =
@@ -119,7 +129,8 @@ defmodule DurableBuffer.Partition.Committer do
           %{
             state
             | backend_state: backend_state,
-              completed: Map.put(state.completed, tag, result)
+              completed: Map.put(state.completed, tag, result),
+              next_offset: rewind(result, assigned_from, next_offset)
           }
 
         {:pending, backend_state} ->
@@ -127,7 +138,11 @@ defmodule DurableBuffer.Partition.Committer do
       end
 
     submitted_at = System.monotonic_time(:millisecond)
-    state = %{state | pending: :queue.in({:commit, tag, units, submitted_at}, state.pending)}
+
+    state = %{
+      state
+      | pending: :queue.in({:commit, tag, units, submitted_at, next_offset}, state.pending)
+    }
 
     state =
       if :queue.len(state.pending) <= state.max_inflight do
@@ -141,7 +156,10 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   def handle_cast({:commit, units, byte_size}, state) do
-    batch = for {:entries, _from, entries} <- units, do: entries
+    assigned_from = state.next_offset
+    {units, next_offset} = assign_offsets(units, assigned_from)
+    state = %{state | next_offset: next_offset}
+    batch = for {:entries, _from, entries, _count, _shape, _first} <- units, do: entries
 
     {reply, backend_state} =
       case state.backend.commit(state.backend_state, batch, byte_size) do
@@ -150,6 +168,14 @@ defmodule DurableBuffer.Partition.Committer do
       end
 
     state = reply_units(%{state | backend_state: backend_state}, units, reply)
+
+    state =
+      if reply == :ok do
+        %{state | durable_logical: next_offset}
+      else
+        %{state | next_offset: rewind(reply, assigned_from, next_offset)}
+      end
+
     send(state.writer, :commit_done)
     {:noreply, publish_offset(state)}
   end
@@ -170,9 +196,19 @@ defmodule DurableBuffer.Partition.Committer do
 
   def handle_cast({:truncate, from}, state) do
     state = drain(state)
-    {:ok, backend_state} = state.backend.truncate(state.backend_state)
+    {:ok, backend_state} = state.backend.truncate(state.backend_state, state.next_offset)
     GenServer.reply(from, :ok)
-    {:noreply, publish_offset(%{state | backend_state: backend_state, async_error: nil})}
+
+    state = %{
+      state
+      | backend_state: backend_state,
+        async_error: nil,
+        next_offset: seed_next_offset(state.backend, backend_state),
+        durable_logical: seed_next_offset(state.backend, backend_state),
+        base_offset: seed_base_offset(state.backend, backend_state)
+    }
+
+    {:noreply, publish_offset(state)}
   end
 
   @impl GenServer
@@ -204,13 +240,22 @@ defmodule DurableBuffer.Partition.Committer do
   defp publish_offset(%{publishes_offset?: false} = state), do: state
 
   defp publish_offset(state) do
-    :atomics.put(
-      state.durable_offsets,
-      state.partition_index + 1,
-      state.backend.durable_offset(state.backend_state)
-    )
+    slot = state.partition_index * 4
+
+    :atomics.put(state.durable_offsets, slot + 1, byte_durable_offset(state))
+    :atomics.put(state.durable_offsets, slot + 2, state.durable_logical)
+    :atomics.put(state.durable_offsets, slot + 3, state.next_offset)
+    :atomics.put(state.durable_offsets, slot + 4, state.base_offset)
 
     state
+  end
+
+  defp byte_durable_offset(state) do
+    if function_exported?(state.backend, :durable_offset, 1) do
+      state.backend.durable_offset(state.backend_state)
+    else
+      0
+    end
   end
 
   defp handle_backend_message(state, message) do
@@ -227,15 +272,17 @@ defmodule DurableBuffer.Partition.Committer do
 
   defp flush(state) do
     case :queue.peek(state.pending) do
-      {:value, {:commit, tag, units, submitted_at}} ->
+      {:value, {:commit, tag, units, submitted_at, logical_end}} ->
         case Map.pop(state.completed, tag) do
           {nil, _completed} ->
             state
 
           {result, completed} ->
             {_head, pending} = :queue.out(state.pending)
+            state = %{state | pending: pending, completed: completed}
+            state = if result == :ok, do: %{state | durable_logical: logical_end}, else: state
 
-            %{state | pending: pending, completed: completed}
+            state
             |> observe_completion(submitted_at)
             |> reply_units(units, result)
             |> release_credit()
@@ -287,11 +334,49 @@ defmodule DurableBuffer.Partition.Committer do
     end
   end
 
+  defp rewind({:error, _reason}, assigned_from, _next), do: assigned_from
+  defp rewind(_ok, _assigned_from, next), do: next
+
+  defp assign_offsets(units, next) do
+    Enum.map_reduce(units, next, fn
+      {:entries, from, entries, count, shape}, offset ->
+        {{:entries, from, entries, count, shape, offset}, offset + count}
+
+      other, offset ->
+        {other, offset}
+    end)
+  end
+
+  defp seed_next_offset(backend, backend_state) do
+    if DurableBuffer.Backend.tracks_offsets?(backend) do
+      backend.offsets(backend_state).next
+    else
+      0
+    end
+  end
+
+  defp seed_base_offset(backend, backend_state) do
+    if DurableBuffer.Backend.tracks_offsets?(backend) do
+      backend.offsets(backend_state).first
+    else
+      0
+    end
+  end
+
+  defp unit_reply({:error, _reason} = error, _shape, _first, _count), do: error
+  defp unit_reply(:ok, :offset, first, _count), do: {:ok, first}
+  defp unit_reply(:ok, :range, first, count), do: {:ok, first..(first + count - 1)}
+
   defp reply_units(state, units, reply) do
     Enum.each(units, fn
-      {:entries, nil, _entries} -> :ok
-      {:entries, from, _entries} -> GenServer.reply(from, reply)
-      {:sync, _from} -> :ok
+      {:entries, nil, _entries, _count, _shape, _first} ->
+        :ok
+
+      {:entries, from, _entries, count, shape, first} ->
+        GenServer.reply(from, unit_reply(reply, shape, first, count))
+
+      {:sync, _from} ->
+        :ok
     end)
 
     state = %{state | async_error: async_error(reply, units, state.async_error)}
@@ -299,7 +384,7 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   defp async_error({:error, reason}, units, previous) do
-    if Enum.any?(units, &match?({:entries, nil, _entries}, &1)) do
+    if Enum.any?(units, &match?({:entries, nil, _entries, _count, _shape, _first}, &1)) do
       reason
     else
       previous

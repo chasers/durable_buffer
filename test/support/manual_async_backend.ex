@@ -38,7 +38,7 @@ defmodule DurableBuffer.ManualAsyncBackend do
   def stream(_config, _partition_index), do: []
 
   @impl DurableBuffer.Backend
-  def truncate(state), do: {:ok, state}
+  def truncate(state, _next), do: {:ok, state}
 
   @impl DurableBuffer.Backend
   def close(_state), do: :ok

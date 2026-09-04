@@ -3,9 +3,10 @@ defmodule DurableBuffer.Supervisor do
   Supervision tree for one buffer instance: a fixed set of partition writers,
   one per partition, each owning its backend state.
 
-  Also owns the `:atomics` array the partitions publish their durable byte
-  offsets into, one slot per partition. `DurableBuffer.stream/3` reads it
-  lock-free to gate reads, so a reader needs no message to the partition.
+  Also owns the `:atomics` array the partitions publish their offsets into,
+  four slots each: durable byte offset, durable logical offset, next logical
+  offset, base offset. `DurableBuffer.stream/3` and `offsets/2` read it
+  lock-free, so a reader needs no message to the partition.
   """
 
   use Supervisor
@@ -21,7 +22,7 @@ defmodule DurableBuffer.Supervisor do
     partitions = Keyword.get(opts, :partitions, System.schedulers_online())
     backend = DurableBuffer.Backend.normalize(Keyword.fetch!(opts, :backend))
 
-    durable_offsets = :atomics.new(partitions, signed: false)
+    durable_offsets = :atomics.new(partitions * 4, signed: false)
 
     :persistent_term.put({DurableBuffer, name}, %{
       partitions: partitions,

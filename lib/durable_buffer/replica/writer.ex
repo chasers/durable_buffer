@@ -28,14 +28,14 @@ defmodule DurableBuffer.Replica.Writer do
   `datasync`, and one ack carrying the final watermark covers them all — so
   a deep pipeline of small batches costs one fsync, not one per batch.
 
-  The epoch is persisted next to the WAL (see `DurableBuffer.Epoch`) and
+  The epoch is persisted next to the WAL (see `DurableBuffer.Meta`) and
   adopted from the primary on truncate.
   """
 
   use GenServer
 
   alias DurableBuffer.Backend.Local
-  alias DurableBuffer.Epoch
+  alias DurableBuffer.Meta
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
@@ -93,7 +93,7 @@ defmodule DurableBuffer.Replica.Writer do
        local: local,
        dir: dir,
        partition_index: partition_index,
-       epoch: Epoch.load(dir, partition_index)
+       epoch: Meta.epoch(dir, partition_index)
      }}
   end
 
@@ -104,8 +104,8 @@ defmodule DurableBuffer.Replica.Writer do
   end
 
   def handle_call({:truncate, epoch}, _from, state) do
-    {:ok, local} = Local.truncate(state.local)
-    Epoch.store!(state.dir, state.partition_index, epoch)
+    {:ok, local} = Local.truncate(state.local, Local.offsets(state.local).next)
+    Meta.update!(state.dir, state.partition_index, &%{&1 | epoch: epoch})
     {:reply, :ok, %{state | local: local, epoch: epoch}}
   end
 

@@ -4,7 +4,7 @@ defmodule DurableBufferTest do
   @moduletag :tmp_dir
 
   defp start_buffer(tmp_dir, opts \\ []) do
-    name = :"buffer_#{System.unique_integer([:positive])}"
+    name = Keyword.get(opts, :name, :"buffer_#{System.unique_integer([:positive])}")
 
     opts =
       Keyword.merge(
@@ -23,8 +23,8 @@ defmodule DurableBufferTest do
   test "append then stream round-trips through the keyed partition", %{tmp_dir: tmp_dir} do
     name = start_buffer(tmp_dir)
 
-    assert :ok = DurableBuffer.append(name, "user-1", "first")
-    assert :ok = DurableBuffer.append(name, "user-1", "second")
+    assert {:ok, _} = DurableBuffer.append(name, "user-1", "first")
+    assert {:ok, _} = DurableBuffer.append(name, "user-1", "second")
 
     assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == ["first", "second"]
   end
@@ -36,7 +36,7 @@ defmodule DurableBufferTest do
       index = DurableBuffer.partition_index(name, key)
       assert index == DurableBuffer.partition_index(name, key)
       assert index in 0..3
-      assert :ok = DurableBuffer.append(name, key, :erlang.term_to_binary(key))
+      assert {:ok, _} = DurableBuffer.append(name, key, :erlang.term_to_binary(key))
     end
   end
 
@@ -48,7 +48,7 @@ defmodule DurableBufferTest do
         Task.async(fn -> DurableBuffer.append(name, key, "#{key}:#{index}") end)
       end
 
-    assert Enum.all?(Task.await_many(tasks, 10_000), &(&1 == :ok))
+    assert Enum.all?(Task.await_many(tasks, 10_000), &match?({:ok, _}, &1))
 
     for key <- 1..20 do
       entries =
@@ -63,8 +63,8 @@ defmodule DurableBufferTest do
   test "append_batch round-trips through the keyed partition", %{tmp_dir: tmp_dir} do
     name = start_buffer(tmp_dir)
 
-    assert :ok = DurableBuffer.append_batch(name, "user-9", ["one", "two", "three"])
-    assert :ok = DurableBuffer.append_batch(name, "user-9", [])
+    assert {:ok, _} = DurableBuffer.append_batch(name, "user-9", ["one", "two", "three"])
+    assert {:ok, _} = DurableBuffer.append_batch(name, "user-9", [])
 
     assert Enum.to_list(DurableBuffer.stream(name, "user-9")) == ["one", "two", "three"]
   end
@@ -88,11 +88,11 @@ defmodule DurableBufferTest do
     opts = [name: name, backend: {DurableBuffer.Backend.Local, dir: tmp_dir}, partitions: 2]
 
     {:ok, pid} = DurableBuffer.start_link(opts)
-    :ok = DurableBuffer.append(name, "k", "persisted")
+    {:ok, _} = DurableBuffer.append(name, "k", "persisted")
     :ok = Supervisor.stop(pid)
 
     {:ok, pid} = DurableBuffer.start_link(opts)
-    :ok = DurableBuffer.append(name, "k", "after-restart")
+    {:ok, _} = DurableBuffer.append(name, "k", "after-restart")
 
     assert Enum.to_list(DurableBuffer.stream(name, "k")) == ["persisted", "after-restart"]
     :ok = Supervisor.stop(pid)
@@ -103,8 +103,8 @@ defmodule DurableBufferTest do
 
     {key_a, key_b} = distinct_partition_keys(name)
 
-    :ok = DurableBuffer.append(name, key_a, "keep")
-    :ok = DurableBuffer.append(name, key_b, "drop")
+    {:ok, _} = DurableBuffer.append(name, key_a, "keep")
+    {:ok, _} = DurableBuffer.append(name, key_b, "drop")
 
     assert :ok = DurableBuffer.truncate(name, key_b)
 
@@ -159,7 +159,7 @@ defmodule DurableBufferTest do
         partitions: 1
       )
 
-    assert :ok = DurableBuffer.append(name, "user-1", "replicated")
+    assert {:ok, _} = DurableBuffer.append(name, "user-1", "replicated")
     assert :ok = DurableBuffer.await_replicas(name, "user-1")
 
     assert :ok = DurableBuffer.truncate(name, "user-1")
@@ -203,7 +203,7 @@ defmodule DurableBufferTest do
           partitions: 1
         )
 
-      assert :ok = DurableBuffer.append(name, "user-1", "acked")
+      assert {:ok, _} = DurableBuffer.append(name, "user-1", "acked")
       assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == ["acked"]
     end
 
@@ -212,7 +212,7 @@ defmodule DurableBufferTest do
       payload = String.duplicate("x", 1000)
 
       for _ <- 1..200 do
-        assert :ok = DurableBuffer.append(name, "user-1", payload)
+        assert {:ok, _} = DurableBuffer.append(name, "user-1", payload)
       end
 
       assert length(Enum.to_list(DurableBuffer.stream(name, "user-1"))) == 200
@@ -221,13 +221,104 @@ defmodule DurableBufferTest do
     test "reads nothing back after a truncate", %{tmp_dir: tmp_dir} do
       name = start_buffer(tmp_dir, partitions: 1)
 
-      assert :ok = DurableBuffer.append(name, "user-1", "before")
+      assert {:ok, _} = DurableBuffer.append(name, "user-1", "before")
       assert :ok = DurableBuffer.truncate(name, "user-1")
 
       assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == []
 
-      assert :ok = DurableBuffer.append(name, "user-1", "after")
+      assert {:ok, _} = DurableBuffer.append(name, "user-1", "after")
       assert Enum.to_list(DurableBuffer.stream(name, "user-1")) == ["after"]
+    end
+  end
+
+  describe "logical offsets" do
+    test "are contiguous across group commits and batches", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+
+      assert {:ok, 0} = DurableBuffer.append(name, "k", "a")
+      assert {:ok, 1..3} = DurableBuffer.append_batch(name, "k", ["b", "c", "d"])
+      assert {:ok, 4} = DurableBuffer.append(name, "k", "e")
+      assert {:ok, []} = DurableBuffer.append_batch(name, "k", [])
+      assert {:ok, 5} = DurableBuffer.append(name, "k", "f")
+    end
+
+    test "pair with their payloads", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ["a", "b", "c"])
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", with_offsets: true)) ==
+               [{0, "a"}, {1, "b"}, {2, "c"}]
+    end
+
+    test "from: returns exactly the suffix", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..4} = DurableBuffer.append_batch(name, "k", ["a", "b", "c", "d", "e"])
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 0)) == ~w(a b c d e)
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 3)) == ~w(d e)
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 5)) == []
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 99)) == []
+    end
+
+    test "survive a restart", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..1} = DurableBuffer.append_batch(name, "k", ["a", "b"])
+      stop_supervised!({DurableBuffer, name})
+
+      name = start_buffer(tmp_dir, name: name, partitions: 1)
+      assert {:ok, 2} = DurableBuffer.append(name, "k", "c")
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", with_offsets: true)) ==
+               [{0, "a"}, {1, "b"}, {2, "c"}]
+    end
+
+    test "stay monotonic across a truncate", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..1} = DurableBuffer.append_batch(name, "k", ["a", "b"])
+
+      :ok = DurableBuffer.truncate(name, "k")
+
+      assert %{first: 2, next: 2} = DurableBuffer.offsets(name, "k")
+      assert {:ok, 2} = DurableBuffer.append(name, "k", "c")
+      assert Enum.to_list(DurableBuffer.stream(name, "k", with_offsets: true)) == [{2, "c"}]
+    end
+
+    test "stay monotonic across a truncate and a restart", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..1} = DurableBuffer.append_batch(name, "k", ["a", "b"])
+      :ok = DurableBuffer.truncate(name, "k")
+      stop_supervised!({DurableBuffer, name})
+
+      name = start_buffer(tmp_dir, name: name, partitions: 1)
+      assert {:ok, 2} = DurableBuffer.append(name, "k", "c")
+    end
+
+    test "offsets/2 reports first, durable and next", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      assert DurableBuffer.offsets(name, "k") == %{first: 0, durable: 0, next: 0}
+
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ["a", "b", "c"])
+      assert DurableBuffer.offsets(name, "k") == %{first: 0, durable: 3, next: 3}
+    end
+
+    test "a commit that never met the ack policy does not advance durable", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          backend:
+            {DurableBuffer.Backend.Replica,
+             dir: Path.join(tmp_dir, "primary"),
+             replica_dir: Path.join(tmp_dir, "replica"),
+             replicas: [:unreachable@nohost],
+             ack: :all,
+             rpc_timeout: 300,
+             heal_timeout: 300},
+          partitions: 1
+        )
+
+      assert {:error, {:insufficient_acks, 1, 2}} = DurableBuffer.append(name, "k", "stuck")
+
+      assert %{first: 0, durable: 0, next: 1} = DurableBuffer.offsets(name, "k")
+      assert Enum.to_list(DurableBuffer.stream(name, "k")) == []
     end
   end
 end

@@ -76,8 +76,12 @@ defmodule DurableBuffer do
   @doc """
   Appends a payload to the partition selected by `partition_key`, blocking
   until it is durable.
+
+  Returns `{:ok, offset}` — the entry's logical position in the partition
+  log, usable with `stream/3`'s `:from` option.
   """
-  @spec append(atom(), term(), iodata(), timeout()) :: :ok | {:error, term()}
+  @spec append(atom(), term(), iodata(), timeout()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
   def append(name, partition_key, payload, timeout \\ :infinity) do
     name
     |> partition_server(partition_key)
@@ -90,9 +94,13 @@ defmodule DurableBuffer do
 
   Far cheaper than N `append/3` calls for small payloads: the messaging and
   reply cost is paid once per list, and the whole list joins one group
-  commit. An empty list is a no-op.
+  commit. An empty list is a no-op and returns `{:ok, []}`.
+
+  Returns `{:ok, first..last}` — the contiguous range of logical offsets the
+  payloads landed at.
   """
-  @spec append_batch(atom(), term(), [iodata()], timeout()) :: :ok | {:error, term()}
+  @spec append_batch(atom(), term(), [iodata()], timeout()) ::
+          {:ok, Range.t() | []} | {:error, term()}
   def append_batch(name, partition_key, payloads, timeout \\ :infinity) do
     name
     |> partition_server(partition_key)
@@ -145,21 +153,54 @@ defmodule DurableBuffer do
   durable while it runs. Like any read of a file that is still being
   written, the stream ends at the current end of durable data.
 
-  Pass `dirty: true` to read the whole local WAL instead, including batches
-  that have not met the policy and may still fail. Recovery tooling wants
-  this; ordinary consumers do not.
+  Options:
+
+    * `:from` — start at this logical offset, inclusive. Resume a consumer
+      with `from: last_acked + 1`.
+    * `:with_offsets` — yield `{offset, payload}` instead of `payload`.
+    * `:dirty` — read the whole local WAL, including batches that have not
+      met the policy and may still fail. Recovery tooling wants this;
+      ordinary consumers do not.
   """
   @spec stream(atom(), term(), keyword()) :: Enumerable.t()
   def stream(name, partition_key, opts \\ []) do
     %{backend: {backend, backend_config}} = buffer = config(name)
     index = partition_index(name, partition_key)
-    limit = read_limit(buffer, index)
 
-    if Keyword.get(opts, :dirty, false) or limit == nil or not Backend.gates_reads?(backend) do
-      backend.stream(backend_config, index)
+    if Backend.gates_reads?(backend) or Backend.tracks_offsets?(backend) do
+      backend.stream(backend_config, index, stream_opts(buffer, index, backend, opts))
     else
-      backend.stream(backend_config, index, limit)
+      backend.stream(backend_config, index)
     end
+  end
+
+  @doc """
+  Reports the partition's logical offset bounds.
+
+    * `:first` — the oldest offset still retained.
+    * `:durable` — the offset after the last entry that met the backend's
+      durability guarantee. This is where a reader's view ends.
+    * `:next` — where the next append lands.
+
+  On a quiet buffer `:durable` and `:next` are equal. Use `:first` to detect
+  that a resume point predates retention and fall back to a full resync,
+  rather than silently replaying from the trim point.
+  """
+  @spec offsets(atom(), term()) :: %{
+          first: non_neg_integer(),
+          durable: non_neg_integer(),
+          next: non_neg_integer()
+        }
+  def offsets(name, partition_key) do
+    buffer = config(name)
+    slot = partition_index(name, partition_key) * 4
+    offsets = Map.fetch!(buffer, :durable_offsets)
+
+    %{
+      first: :atomics.get(offsets, slot + 4),
+      durable: :atomics.get(offsets, slot + 2),
+      next: :atomics.get(offsets, slot + 3)
+    }
   end
 
   @doc """
@@ -251,10 +292,23 @@ defmodule DurableBuffer do
     :persistent_term.get({DurableBuffer, name})
   end
 
+  defp stream_opts(buffer, index, backend, opts) do
+    limit =
+      cond do
+        Keyword.get(opts, :dirty, false) -> nil
+        not Backend.gates_reads?(backend) -> nil
+        true -> read_limit(buffer, index)
+      end
+
+    opts
+    |> Keyword.take([:from, :with_offsets])
+    |> Keyword.put(:limit, limit)
+  end
+
   defp read_limit(buffer, index) do
     case Map.get(buffer, :durable_offsets) do
       nil -> nil
-      offsets -> fn -> :atomics.get(offsets, index + 1) end
+      offsets -> fn -> :atomics.get(offsets, index * 4 + 1) end
     end
   end
 

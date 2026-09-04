@@ -156,7 +156,7 @@ defmodule DurableBuffer.Replica.SenderTest do
     local = commit_both(local, sender, entry("pre-truncate"))
     await_watermark({0, Local.offset(local)})
 
-    {:ok, local} = Local.truncate(local)
+    {:ok, local} = Local.truncate(local, 0)
     :ok = Sender.reset(sender, 1)
     :ok = DurableBuffer.Replica.truncate(replica_dir, 0, 1)
 
@@ -197,10 +197,11 @@ defmodule DurableBuffer.Replica.SenderTest do
     await_watermark({0, byte_size(kept)})
     flush_watermarks()
 
-    GenServer.stop(DurableBuffer.Replica.writer_pid(replica_dir, 0, true))
-
-    :ok = Sender.commit(sender, 0, byte_size(kept), ahead)
     {:ok, _watermark} = DurableBuffer.Replica.commit(replica_dir, 0, 0, byte_size(kept), ahead)
+    assert replica_entries(tmp_dir) == ["on-both", "already-durable-on-the-replica"]
+
+    GenServer.stop(DurableBuffer.Replica.writer_pid(replica_dir, 0, true))
+    :ok = Sender.commit(sender, 0, byte_size(kept), ahead)
 
     assert_receive {:backend, {:watermark, _node, watermark}}, 5000
     assert watermark == {0, byte_size(kept) + byte_size(ahead)}
