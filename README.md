@@ -149,6 +149,44 @@ members (the primary included) have watermarks at or past its end — the
 same commit rule RabbitMQ's quorum queues use, generalized to the
 configurable ack policy.
 
+**Topology:** one static primary and a static list of followers. There is no
+leader election, no membership protocol, and no automatic failover. The
+`replicas:` list is configuration on the primary. Followers never accept
+writes from anyone else and are never read. The epoch increments on
+*truncate*, not on a change of leader, so it is not a leadership fencing
+token. If you need automatic failover, put it above this library.
+
+**Promoting a follower** is a manual, operator-driven procedure:
+
+1. **Stop the old primary and keep it stopped.** Nothing fences it. If it
+   comes back it re-attaches to the followers, sees data it does not have,
+   and truncates them.
+2. **Pick the most current follower.** With `ack: :all` every follower is
+   complete. With `:quorum` or an integer they can differ — compare the
+   `p<index>.wal` file sizes under `replica_dir` on each node and take the
+   largest, per partition.
+3. **Wait out a recent truncate.** A truncate whose `:erpc` to a follower
+   failed leaves that follower holding pre-truncate data until its sender
+   re-attaches. Do not promote inside that window. See F-3 in
+   [`tla/FINDINGS.md`](tla/FINDINGS.md).
+4. **Start a buffer on that node** with `dir:` set to the follower's
+   `replica_dir`, the **same** `partitions:` count, and the surviving nodes
+   as `replicas:`. A follower's WAL is written by the same `Backend.Local`
+   code as a primary's, so it needs no conversion.
+5. **Point producers at the new node.**
+
+The partition count must match. Keys are hashed with
+`:erlang.phash2(key, partitions)` into `p<index>.wal`, so a different count
+sends a key to a different file. Note also that `replica_dir` defaults to
+`dir`, and that any write the promoted follower had not acked is gone.
+
+**Reads:** `stream/2` reads the local WAL of the primary and is *not* gated
+on the ack policy. A reader can see a batch that no replica has acked yet,
+that may still fail with `:insufficient_acks`, and that a primary crash can
+erase. This is a known gap with a fix planned —
+`.plans/2026-09-03_02_ack-durable-reads.md`, and F-4 in
+[`tla/FINDINGS.md`](tla/FINDINGS.md).
+
 **Durability model:** by default the replicated backend does *not* fsync
 (`fsync: false`) — durability is the ack policy itself, data held on N
 machines, the same stance RabbitMQ streams take. Per-node crashes are
@@ -224,8 +262,27 @@ and error propagation, all three backends (S3 via a `Req.Test` fake with
 ListObjectsV2 pagination, replication via `:erpc` to the local node), and
 end-to-end restart recovery.
 
-CI runs formatting, a warnings-as-errors compile, and the test suite on
-every push and pull request.
+### TLA+ models
+
+The replication protocol is model-checked. `tla/Replication.tla` models the
+primary, the sender and the replica writer across crashes, dropped batches,
+re-attaches, resyncs and truncates.
+
+```sh
+./tla/run check                     # every config vs tla/expected.tsv
+./tla/run all                       # every config, full TLC output
+./tla/run Replication_core          # one config
+```
+
+`check` is the gate: each config's PASS/VIOLATED result must match
+`tla/expected.tsv`. A VIOLATED row is intentional — a negative control, or a
+documented finding on the code as it stands. The runner downloads
+`tla2tools.jar` on first use and needs only a JDK. See
+[`tla/README.md`](tla/README.md) for the config matrix and
+[`tla/FINDINGS.md`](tla/FINDINGS.md) for what each spec proved or found.
+
+CI runs formatting, a warnings-as-errors compile, the test suite, and the
+TLA+ gate on every push and pull request.
 
 ## Releases
 
