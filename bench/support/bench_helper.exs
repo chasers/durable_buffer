@@ -81,7 +81,7 @@ defmodule DurableBuffer.Bench do
 
   defp append_loop(name, caller, payload, deadline, count) do
     if System.monotonic_time(:millisecond) < deadline do
-      :ok = DurableBuffer.append(name, caller, payload)
+      {:ok, _offset} = DurableBuffer.append(name, caller, payload)
       append_loop(name, caller, payload, deadline, count + 1)
     else
       count
@@ -161,7 +161,7 @@ defmodule DurableBuffer.Bench do
 
   defp append_batch_loop(name, caller, payloads, batch_size, deadline, count) do
     if System.monotonic_time(:millisecond) < deadline do
-      :ok = DurableBuffer.append_batch(name, caller, payloads)
+      {:ok, _range} = DurableBuffer.append_batch(name, caller, payloads)
       append_batch_loop(name, caller, payloads, batch_size, deadline, count + batch_size)
     else
       count
@@ -272,6 +272,132 @@ defmodule DurableBuffer.Bench do
     end
   end
 
+  @default_reader_counts [1, 8, 64]
+
+  @doc """
+  Read throughput with no writers at all.
+
+  `mixed_grid/2` always measures reads against concurrent appends, so it
+  cannot say what the read path costs on its own. This fills the partition
+  once, then re-streams it with nothing else running.
+  """
+  def stream_grid(name, opts \\ []) do
+    payload_size = Keyword.get(opts, :payload_size, 4 * 1024)
+    entries = Keyword.get(opts, :entries, 20_000)
+    reader_counts = Keyword.get(opts, :reader_counts, @default_reader_counts)
+
+    duration_ms =
+      Keyword.get(
+        opts,
+        :duration_ms,
+        String.to_integer(System.get_env("BENCH_DURATION_MS", "5000"))
+      )
+
+    IO.puts("\n== Stream only: #{name}, #{format_bytes(payload_size)} payload ==")
+    IO.puts("(no writers; #{format_number(entries)} entries per partition, re-streamed whole)")
+
+    IO.puts(
+      String.pad_trailing("readers", 9) <>
+        String.pad_leading("entries/s", 13) <>
+        String.pad_leading("MB/s", 10) <>
+        String.pad_leading("full scans/s", 14)
+    )
+
+    for readers <- reader_counts do
+      DurableBuffer.truncate_all(name)
+      fill(name, payload_size, entries)
+      result = measure_stream(name, readers, duration_ms, entries)
+
+      IO.puts(
+        String.pad_trailing(Integer.to_string(readers), 9) <>
+          String.pad_leading(format_number(result.entries_per_sec), 13) <>
+          String.pad_leading(:erlang.float_to_binary(result.mb_per_sec, decimals: 1), 10) <>
+          String.pad_leading(:erlang.float_to_binary(result.scans_per_sec, decimals: 1), 14)
+      )
+    end
+
+    DurableBuffer.truncate_all(name)
+    :ok
+  end
+
+  defp measure_stream(name, readers, duration_ms, _entries) do
+    deadline = System.monotonic_time(:millisecond) + duration_ms
+
+    results =
+      for reader <- 1..readers do
+        Task.async(fn -> read_loop(name, reader, deadline, 0, 0) end)
+      end
+      |> Task.await_many(duration_ms + 60_000)
+
+    entries = results |> Enum.map(&elem(&1, 0)) |> Enum.sum()
+    bytes = results |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+    seconds = duration_ms / 1000
+
+    %{
+      entries_per_sec: round(entries / seconds),
+      mb_per_sec: bytes / seconds / 1_048_576,
+      scans_per_sec: entries / max(bytes, 1) * bytes / seconds / 20_000
+    }
+  end
+
+  @doc """
+  What `from:` costs at increasing depth into a partition.
+
+  The sparse seek index exists so a resume does not rescan the log. This
+  measures the time to the first entry of a `from:` read, which is where a
+  scan would show up.
+  """
+  def seek_grid(name, opts \\ []) do
+    payload_size = Keyword.get(opts, :payload_size, 256)
+    entries = Keyword.get(opts, :entries, 200_000)
+    samples = Keyword.get(opts, :samples, 200)
+
+    IO.puts("\n== Seek: #{name}, #{format_bytes(payload_size)} payload ==")
+    IO.puts("(time to the first entry of a from: read, #{format_number(entries)} entries)")
+
+    IO.puts(
+      String.pad_trailing("from", 12) <>
+        String.pad_leading("us/seek", 12) <>
+        String.pad_leading("entries/s", 13)
+    )
+
+    DurableBuffer.truncate_all(name)
+    fill(name, payload_size, entries)
+
+    for fraction <- [0.0, 0.25, 0.5, 0.9, 0.99] do
+      from = round(entries * fraction)
+
+      {microseconds, _} =
+        :timer.tc(fn ->
+          for _ <- 1..samples do
+            [_first] = name |> DurableBuffer.stream(1, from: from) |> Enum.take(1)
+          end
+        end)
+
+      per_seek = microseconds / samples
+
+      IO.puts(
+        String.pad_trailing(format_number(from), 12) <>
+          String.pad_leading(:erlang.float_to_binary(per_seek, decimals: 1), 12) <>
+          String.pad_leading(format_number(round(1_000_000 / per_seek)), 13)
+      )
+    end
+
+    DurableBuffer.truncate_all(name)
+    :ok
+  end
+
+  defp fill(name, payload_size, entries) do
+    payload = :binary.copy("x", payload_size)
+    chunk = 1000
+
+    for _ <- 1..div(entries, chunk) do
+      {:ok, _range} = DurableBuffer.append_batch(name, 1, List.duplicate(payload, chunk))
+    end
+
+    :ok
+  end
+
   def latency(name, opts \\ []) do
     payload_size = Keyword.get(opts, :payload_size, 4 * 1024)
     parallel_levels = Keyword.get(opts, :parallel_levels, [1, 16, 128])
@@ -285,7 +411,7 @@ defmodule DurableBuffer.Bench do
 
       Benchee.run(
         %{
-          "append" => fn -> :ok = DurableBuffer.append(name, self(), payload) end
+          "append" => fn -> {:ok, _offset} = DurableBuffer.append(name, self(), payload) end
         },
         warmup: 1,
         time: time,
