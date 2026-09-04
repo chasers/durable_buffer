@@ -25,7 +25,9 @@ CONSTANTS
     Fsync,          \* the primary datasyncs before it counts its own ack
     AllowCrash,     \* the primary may lose its unsynced WAL tail
     AllowLoss,      \* the channel to a writer may drop a batch
-    AllowTruncate
+    AllowTruncate,
+    HealOnOpen      \* open/2 pulls back bytes a replica holds and the
+                    \* primary lost, before the partition serves
 
 VARIABLES
     pEpoch,     \* primary epoch, from DurableBuffer.Epoch
@@ -59,7 +61,22 @@ Perms == Permutations(Replicas)
 WmLeq(a, b) == a[1] < b[1] \/ (a[1] = b[1] /\ a[2] <= b[2])
 WmMax(a, b) == IF WmLeq(a, b) THEN b ELSE a
 
-Msg(e, o, i) == [epoch |-> e, off |-> o, id |-> i]
+(***************************************************************************)
+(* Each attach mints a reference that stamps the batches it sends, and the  *)
+(* writer echoes it on every ack. Rather than count generations, a message  *)
+(* or an ack carries `stale`, set when an attach happens after it was sent. *)
+(* The sender drops a stale ack. The writer still appends a stale batch: it *)
+(* cannot tell, and only the ack matters.                                   *)
+(***************************************************************************)
+Msg(e, o, i) == [epoch |-> e, off |-> o, id |-> i, stale |-> FALSE]
+
+Ack(w, stale) == [wm |-> w, stale |-> stale]
+
+RECURSIVE MarkStale(_)
+MarkStale(q) ==
+    IF q = <<>>
+      THEN <<>>
+      ELSE <<[q[1] EXCEPT !.stale = TRUE]>> \o MarkStale(Tail(q))
 
 (***************************************************************************)
 (* Sender.next_needed/1: the first unacked offset, or the primary tail when *)
@@ -136,11 +153,12 @@ DeliverBatch(r) ==
            epochOk == (~EpochStamp) \/ m.epoch = rEpoch[r]
            dup == m.epoch = rEpoch[r] /\ m.off + 1 <= tail
        IN IF dup
-            THEN /\ ackq' = [ackq EXCEPT ![r] = Append(@, <<rEpoch[r], tail>>)]
+            THEN /\ ackq' = [ackq EXCEPT ![r] = Append(@, Ack(<<rEpoch[r], tail>>, m.stale))]
                  /\ UNCHANGED <<rWal, mode>>
             ELSE IF epochOk /\ (m.off = tail \/ ~TailCheck)
               THEN /\ rWal' = [rWal EXCEPT ![r] = Append(@, m.id)]
-                   /\ ackq' = [ackq EXCEPT ![r] = Append(@, <<rEpoch[r], tail + 1>>)]
+                   /\ ackq' =
+                        [ackq EXCEPT ![r] = Append(@, Ack(<<rEpoch[r], tail + 1>>, m.stale))]
                    /\ UNCHANGED mode
               ELSE /\ mode' = [mode EXCEPT ![r] = "detached"]
                    /\ UNCHANGED <<rWal, ackq>>
@@ -161,8 +179,10 @@ LoseBatch(r) ==
 (***************************************************************************)
 DeliverAck(r) ==
     /\ ackq[r] # <<>>
-    /\ wm' = [wm EXCEPT ![r] = WmMax(@, ackq[r][1])]
-    /\ queue' = [queue EXCEPT ![r] = DropAcked(@, ackq[r][1])]
+    /\ IF ackq[r][1].stale
+         THEN UNCHANGED <<wm, queue>>
+         ELSE /\ wm' = [wm EXCEPT ![r] = WmMax(@, ackq[r][1].wm)]
+              /\ queue' = [queue EXCEPT ![r] = DropAcked(@, ackq[r][1].wm)]
     /\ ackq' = [ackq EXCEPT ![r] = Tail(@)]
     /\ UNCHANGED <<pEpoch, pWal, pSynced, nextId, acked, pending, rEpoch,
                    rWal, chan, mode, cursor, crashed, truncated>>
@@ -188,31 +208,39 @@ Overflow(r) ==
                    rWal, chan, ackq, wm, cursor, crashed, truncated>>
 
 (***************************************************************************)
-(* Sender.reconcile/2 on attach. EpochStamp gates the comparison as well as *)
-(* the writer's accept rule: without it the sender compares raw offsets.    *)
+(* Sender.reconcile/2 on attach. The remote tail is compared against the    *)
+(* primary's own WAL, not against the sender's unacked queue: a replica     *)
+(* whose ack is merely still in flight holds a valid prefix and must not be *)
+(* wiped. What it already has is dropped from the queue and adopted as its  *)
+(* watermark. EpochStamp gates the comparison as well as the writer's       *)
+(* accept rule: without it the sender ignores the epoch entirely.           *)
 (***************************************************************************)
 Attach(r) ==
     /\ mode[r] = "detached"
-    /\ LET atExpected == IF EpochStamp
-                           THEN rEpoch[r] = pEpoch /\ Len(rWal[r]) = NextNeeded(r)
-                           ELSE Len(rWal[r]) = NextNeeded(r)
-           behind == (IF EpochStamp THEN rEpoch[r] = pEpoch ELSE TRUE)
-                     /\ Len(rWal[r]) < NextNeeded(r)
-       IN IF atExpected
-            THEN /\ mode' = [mode EXCEPT ![r] = "live"]
-                 /\ chan' = [chan EXCEPT ![r] = @ \o queue[r]]
-                 /\ UNCHANGED <<rWal, rEpoch, cursor>>
-            ELSE IF behind
+    /\ LET epochOk == IF EpochStamp THEN rEpoch[r] = pEpoch ELSE TRUE
+           remote == Len(rWal[r])
+           tail == <<pEpoch, remote>>
+       IN IF ~epochOk \/ remote > Len(pWal)
+            THEN /\ rWal' = [rWal EXCEPT ![r] = <<>>]
+                 /\ rEpoch' = [rEpoch EXCEPT ![r] = pEpoch]
+                 /\ mode' = [mode EXCEPT ![r] = "resync"]
+                 /\ cursor' = [cursor EXCEPT ![r] = 0]
+                 /\ chan' = [chan EXCEPT ![r] = MarkStale(@)]
+                 /\ UNCHANGED <<queue, wm>>
+            ELSE IF remote < NextNeeded(r)
               THEN /\ mode' = [mode EXCEPT ![r] = "resync"]
-                   /\ cursor' = [cursor EXCEPT ![r] = Len(rWal[r])]
-                   /\ UNCHANGED <<chan, rWal, rEpoch>>
-              ELSE /\ rWal' = [rWal EXCEPT ![r] = <<>>]
-                   /\ rEpoch' = [rEpoch EXCEPT ![r] = pEpoch]
-                   /\ mode' = [mode EXCEPT ![r] = "resync"]
-                   /\ cursor' = [cursor EXCEPT ![r] = 0]
-                   /\ UNCHANGED chan
-    /\ UNCHANGED <<pEpoch, pWal, pSynced, nextId, acked, pending, ackq,
-                   queue, wm, crashed, truncated>>
+                   /\ cursor' = [cursor EXCEPT ![r] = remote]
+                   /\ chan' = [chan EXCEPT ![r] = MarkStale(@)]
+                   /\ UNCHANGED <<rWal, rEpoch, queue, wm>>
+              ELSE /\ mode' = [mode EXCEPT ![r] = "live"]
+                   /\ queue' = [queue EXCEPT ![r] = DropAcked(@, tail)]
+                   /\ wm' = [wm EXCEPT ![r] = WmMax(@, tail)]
+                   /\ chan' =
+                        [chan EXCEPT ![r] = MarkStale(@) \o DropAcked(queue[r], tail)]
+                   /\ UNCHANGED <<rWal, rEpoch, cursor>>
+    /\ ackq' = [ackq EXCEPT ![r] = MarkStale(@)]
+    /\ UNCHANGED <<pEpoch, pWal, pSynced, nextId, acked, pending,
+                   crashed, truncated>>
 
 (***************************************************************************)
 (* Sender.handle_info(:resync_step, _): stream the WAL suffix, then resume  *)
@@ -237,11 +265,26 @@ ResyncStep(r) ==
 (***************************************************************************)
 (* The primary loses the WAL tail it never datasynced, then restarts. Every *)
 (* sender restarts with an empty queue and a zero watermark.                *)
+(*                                                                          *)
+(* With HealOnOpen, Backend.Replica.open/2 asks every replica for its tail   *)
+(* and pulls back what it is missing from the furthest one that is on its    *)
+(* own epoch. A replica WAL is always a prefix-extension of the primary's,   *)
+(* so the healed WAL is that replica's WAL. The pull is datasynced, hence    *)
+(* pSynced follows it.                                                       *)
 (***************************************************************************)
 Crash ==
     /\ AllowCrash
     /\ ~crashed
-    /\ pWal' = SubSeq(pWal, 1, pSynced)
+    /\ LET lost == SubSeq(pWal, 1, pSynced)
+           best == CHOOSE r \in Replicas :
+                     \A other \in Replicas : Len(rWal[other]) <= Len(rWal[r])
+           healed == IF /\ HealOnOpen
+                        /\ rEpoch[best] = pEpoch
+                        /\ Len(rWal[best]) > Len(lost)
+                       THEN rWal[best]
+                       ELSE lost
+       IN /\ pWal' = healed
+          /\ pSynced' = Len(healed)
     /\ crashed' = TRUE
     /\ pending' = <<>>
     /\ queue' = [r \in Replicas |-> <<>>]
@@ -250,7 +293,7 @@ Crash ==
     /\ mode' = [r \in Replicas |-> "detached"]
     /\ wm' = [r \in Replicas |-> <<0, 0>>]
     /\ cursor' = [r \in Replicas |-> 0]
-    /\ UNCHANGED <<pEpoch, pSynced, nextId, acked, rEpoch, rWal, truncated>>
+    /\ UNCHANGED <<pEpoch, nextId, acked, rEpoch, rWal, truncated>>
 
 (***************************************************************************)
 (* Backend.Replica.truncate/1: bump and persist the epoch, wipe the local   *)

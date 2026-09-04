@@ -55,6 +55,40 @@ defmodule DurableBuffer.Backend.Local do
   def offset(state), do: state.offset
 
   @doc """
+  Reads `length` bytes of the WAL starting at `offset`.
+
+  Returns fewer bytes near the end of the file, and an empty binary at or
+  past it.
+  """
+  @spec read_range(map(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, term()}
+  def read_range(state, offset, length) do
+    case :file.open(state.path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        result = :file.pread(fd, offset, length)
+        :ok = :file.close(fd)
+
+        case result do
+          {:ok, data} -> {:ok, data}
+          :eof -> {:ok, <<>>}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, :enoent} ->
+        {:ok, <<>>}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Forces a `datasync` whatever the backend's `fsync:` setting is.
+  """
+  @spec datasync(map()) :: :ok | {:error, term()}
+  def datasync(state), do: :file.datasync(state.fd)
+
+  @doc """
   Path of the WAL file for `partition_index` under `dir`.
   """
   @spec wal_path(Path.t(), non_neg_integer()) :: Path.t()

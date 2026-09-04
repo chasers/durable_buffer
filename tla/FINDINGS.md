@@ -69,10 +69,83 @@ The sequel to F-1, and this one is not documented. Trace:
 
 Step 4 destroys the last surviving copy of an acked write. The protocol
 treats "replica ahead of primary" as corruption to be discarded, when it is
-in fact the only good copy. Healing the primary from the replica instead
-would need a promotion or catch-up path that does not exist. Until one does,
-`fsync: true` is the only configuration where an ack means what it says under
-a primary crash.
+in fact the only good copy.
+
+**Fixed.** `Backend.Replica.open/2` now heals in the other direction. It asks
+every replica for its tail, and pulls back what it is missing from the
+furthest replica on its own epoch, before the partition serves an append.
+Config `Replication_heal` turns the same scenario green: with `HealOnOpen`,
+`fsync: false` and a primary crash, all three invariants hold.
+
+The heal is sound because a replica WAL is always a prefix-extension of the
+primary's. The writer appends only at its own tail, and only bytes the
+primary sent from its own WAL, so the surplus is exactly what the primary
+lost. Healing at *open* rather than at attach is the load-bearing part: the
+sender runs after the partition is already accepting appends, and a new
+commit would claim the offsets the surplus belongs at.
+
+`Replication_ahead` keeps `HealOnOpen = FALSE` and stays VIOLATED, so the
+gate still proves the heal is what fixes it.
+
+The heal alone was not enough. `Replication_heal` stayed VIOLATED until two
+further bugs were fixed — F-5 and F-6 below. TLC found both while checking
+the heal; neither was visible from reading the code.
+
+### F-5 — an ack from a previous attach is applied after a re-attach
+
+Found while fixing F-2. Config `Replication_heal`.
+
+`Replica.Sender` matched `{:replica_ack, watermark}` without any notion of
+which attach produced it. An ack already in flight when the sender detaches
+is still in its mailbox after it re-attaches, and was applied there. Trace:
+
+1. The replica appends a batch and acks it. The ack is in flight.
+2. The sender detaches before it processes the ack.
+3. It re-attaches, decides the replica must be wiped, and truncates it.
+4. It then processes the stale ack, advances that member's watermark, and
+   forwards it to the primary.
+
+The primary now counts a replica as durable through an offset the replica no
+longer holds, and a commit can complete on the strength of it. This is a
+false ack — the one thing the epoch was supposed to make impossible.
+
+**Fixed.** Every attach mints a reference that stamps the batches it sends.
+The writer echoes it on each ack, and the sender drops any ack carrying a
+different reference. The spec models this with a `stale` flag on messages and
+acks, set by `Attach`.
+
+### F-6 — reconcile wipes a replica that is only ahead of the unacked queue
+
+Found while fixing F-5, which exposed it. Config `Replication_heal`.
+
+`reconcile/2` compared the replica's tail against `next_needed/1` — the first
+offset in the sender's *unacked queue*. Any replica past that point fell
+through to the truncate branch:
+
+```elixir
+remote_tail == expected -> resume
+remote_epoch == state.epoch and remote_offset < next_needed(state) -> resync
+true -> truncate_remote(state)
+```
+
+A replica is routinely past `next_needed` for a perfectly ordinary reason:
+its ack is still in flight. So a detach with an unprocessed ack truncated a
+replica that held a valid prefix of the primary WAL. Usually harmless — the
+resync and the queue re-send refill it — but if the primary crashes inside
+that window the replica is empty and acked data is gone.
+
+**Fixed.** The tail is now compared against the primary's own WAL, which is
+the only thing that defines what a replica may hold:
+
+- a different epoch — truncate;
+- past the primary's tail — truncate, and log it, since `open/2` should have
+  healed from it (F-2);
+- behind `next_needed` — resync the gap;
+- otherwise — adopt the tail as that member's watermark, drop what the
+  replica already has from the queue, and resume live.
+
+Adopting the tail is strictly more accurate than waiting for acks: at attach
+the sender has just been told the replica's real durable offset.
 
 ### F-3 — a failed truncate `:erpc` opens a divergence window
 
@@ -123,6 +196,8 @@ Planned fix: `.plans/2026-09-03_02_ack-durable-reads.md`.
 ## Not modeled yet
 
 - Replica-side crashes. Only the primary loses an unsynced tail today.
+- A heal from two replicas at different tails. The model picks the furthest,
+  but every config runs one replica through the crash path.
 - More than one truncate, and more than one primary crash, per behavior.
 - The WAL frame layer: CRC torn-tail recovery in `DurableBuffer.WAL`.
 - Group-commit batching and the adaptive flush dwell in

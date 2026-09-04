@@ -445,4 +445,123 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     assert local_entries == expected
     assert replica_entries == expected
   end
+
+  describe "healing a primary that lost WAL bytes a replica still holds" do
+    test "recovers the whole tail", %{tmp_dir: tmp_dir} do
+      {primary_dir, replica_dir} = dirs(tmp_dir)
+
+      config =
+        Replica.init_config(
+          dir: primary_dir,
+          replica_dir: replica_dir,
+          replicas: [node()],
+          fsync: false
+        )
+
+      {:ok, state} = Replica.open(config, 0)
+      {batch, bytes} = encode_batch(["acked-then-lost"])
+      assert {:ok, state} = Replica.commit(state, batch, bytes)
+      assert :ok = Replica.close(state)
+
+      crash_primary(primary_dir, 0)
+      assert Enum.to_list(Replica.stream(config, 0)) == []
+
+      {:ok, state} = Replica.open(config, 0)
+      assert Enum.to_list(Replica.stream(config, 0)) == ["acked-then-lost"]
+      assert :ok = Replica.close(state)
+    end
+
+    test "recovers only the missing suffix", %{tmp_dir: tmp_dir} do
+      {primary_dir, replica_dir} = dirs(tmp_dir)
+
+      config =
+        Replica.init_config(
+          dir: primary_dir,
+          replica_dir: replica_dir,
+          replicas: [node()],
+          fsync: false
+        )
+
+      {:ok, state} = Replica.open(config, 0)
+
+      state =
+        Enum.reduce(["one", "two", "three"], state, fn payload, state ->
+          {batch, bytes} = encode_batch([payload])
+          {:ok, state} = Replica.commit(state, batch, bytes)
+          state
+        end)
+
+      assert :ok = Replica.close(state)
+
+      {kept, _bytes} = encode_batch(["one"])
+      crash_primary(primary_dir, IO.iodata_length(kept))
+      assert Enum.to_list(Replica.stream(config, 0)) == ["one"]
+
+      {:ok, state} = Replica.open(config, 0)
+      assert Enum.to_list(Replica.stream(config, 0)) == ["one", "two", "three"]
+      assert :ok = Replica.close(state)
+    end
+
+    test "appends nothing when the primary is level with the replica", %{tmp_dir: tmp_dir} do
+      {primary_dir, replica_dir} = dirs(tmp_dir)
+
+      config =
+        Replica.init_config(dir: primary_dir, replica_dir: replica_dir, replicas: [node()])
+
+      {:ok, state} = Replica.open(config, 0)
+      {batch, bytes} = encode_batch(["level"])
+      assert {:ok, state} = Replica.commit(state, batch, bytes)
+      assert :ok = Replica.close(state)
+
+      {:ok, state} = Replica.open(config, 0)
+      assert Enum.to_list(Replica.stream(config, 0)) == ["level"]
+      assert :ok = Replica.close(state)
+    end
+
+    test "opens without healing when every replica is unreachable", %{tmp_dir: tmp_dir} do
+      {primary_dir, replica_dir} = dirs(tmp_dir)
+
+      config =
+        Replica.init_config(
+          dir: primary_dir,
+          replica_dir: replica_dir,
+          replicas: [:unreachable@nohost],
+          heal_timeout: 500
+        )
+
+      assert {:ok, state} = Replica.open(config, 0)
+      assert Enum.to_list(Replica.stream(config, 0)) == []
+      assert :ok = Replica.close(state)
+    end
+
+    test "ignores a replica on an older epoch", %{tmp_dir: tmp_dir} do
+      {primary_dir, replica_dir} = dirs(tmp_dir)
+
+      config =
+        Replica.init_config(
+          dir: primary_dir,
+          replica_dir: replica_dir,
+          replicas: [node()],
+          fsync: false
+        )
+
+      {:ok, state} = Replica.open(config, 0)
+      {batch, bytes} = encode_batch(["old-epoch"])
+      assert {:ok, state} = Replica.commit(state, batch, bytes)
+      assert :ok = Replica.close(state)
+
+      crash_primary(primary_dir, 0)
+      DurableBuffer.Epoch.store!(primary_dir, 0, 7)
+
+      {:ok, state} = Replica.open(config, 0)
+      assert Enum.to_list(Replica.stream(config, 0)) == []
+      assert :ok = Replica.close(state)
+    end
+  end
+
+  defp crash_primary(primary_dir, keep_bytes) do
+    path = Local.wal_path(primary_dir, 0)
+    contents = File.read!(path)
+    File.write!(path, binary_part(contents, 0, keep_bytes))
+  end
 end

@@ -47,8 +47,9 @@ property is load-bearing.
 | `Replication_quorum` | same with two replicas and a majority ack policy | PASS |
 | `Replication_loss` | dropped batches alone; the tail check heals them | PASS |
 | `Replication_nocrash` | truncate + loss, `fsync: false`, no crash | PASS |
+| `Replication_heal` | `fsync: false` + crash, with the open-time heal, the attach reference and the reconcile fix | PASS |
 | `Replication` | `fsync: false` + primary crash, `AckedInPrimary` | VIOLATED — F-1 |
-| `Replication_ahead` | same, `AckedSomewhere` | VIOLATED — F-2 |
+| `Replication_ahead` | same, `AckedSomewhere`, heal off | VIOLATED — F-2 |
 | `Replication_staletruncate` | truncate whose `:erpc` to the replica fails | VIOLATED — F-3 |
 | `Replication_dirtyread` | reads gated on the ack policy | VIOLATED — F-4 |
 | `Replication_notailcheck` | the writer's tail rule turned off | VIOLATED (control) |
