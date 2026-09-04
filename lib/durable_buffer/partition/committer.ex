@@ -67,24 +67,21 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   @doc """
+  Drops every entry below `upto`. Ordered against commits and truncates
+  like every other unit of work here.
+  """
+  @spec request_trim(GenServer.server(), GenServer.from(), non_neg_integer()) :: :ok
+  def request_trim(server, from, upto) do
+    GenServer.cast(server, {:trim, from, upto})
+  end
+
+  @doc """
   Reports the backend's per-replica replication state, for backends that
   track one. Returns `{:error, :unsupported}` for the others.
   """
-  @spec replica_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
-  def replica_status(server, timeout \\ 5_000) do
-    GenServer.call(server, :replica_status, timeout)
-  end
-
-  @impl GenServer
-  def handle_call(:replica_status, _from, state) do
-    reply =
-      if function_exported?(state.backend, :status, 1) do
-        {:ok, state.backend.status(state.backend_state)}
-      else
-        {:error, :unsupported}
-      end
-
-    {:reply, reply, state}
+  @spec request_replica_status(GenServer.server(), GenServer.from()) :: :ok
+  def request_replica_status(server, from) do
+    GenServer.cast(server, {:replica_status, from})
   end
 
   @impl GenServer
@@ -203,6 +200,49 @@ defmodule DurableBuffer.Partition.Committer do
   def handle_cast({:sync, from}, state) do
     GenServer.reply(from, sync_reply(:ok, state))
     {:noreply, %{state | async_error: nil}}
+  end
+
+  def handle_cast({:replica_status, from}, state) do
+    reply =
+      if function_exported?(state.backend, :status, 1) do
+        {:ok, state.backend.status(state.backend_state)}
+      else
+        {:error, :unsupported}
+      end
+
+    GenServer.reply(from, reply)
+    {:noreply, state}
+  end
+
+  def handle_cast({:trim, from, upto}, state) do
+    state = if function_exported?(state.backend, :trim, 2), do: drain(state), else: state
+
+    cond do
+      not function_exported?(state.backend, :trim, 2) ->
+        GenServer.reply(from, {:error, :unsupported})
+        {:noreply, state}
+
+      upto > state.durable_logical ->
+        GenServer.reply(from, {:error, :not_durable})
+        {:noreply, state}
+
+      true ->
+        {reply, backend_state} =
+          case state.backend.trim(state.backend_state, upto) do
+            {:ok, backend_state} -> {:ok, backend_state}
+            {:error, reason, backend_state} -> {{:error, reason}, backend_state}
+          end
+
+        GenServer.reply(from, reply)
+
+        state = %{
+          state
+          | backend_state: backend_state,
+            base_offset: seed_base_offset(state.backend, backend_state)
+        }
+
+        {:noreply, publish_offset(state)}
+    end
   end
 
   def handle_cast({:truncate, from}, state) do

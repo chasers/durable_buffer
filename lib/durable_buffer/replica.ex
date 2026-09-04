@@ -28,11 +28,20 @@ defmodule DurableBuffer.Replica do
 
   @doc """
   Discards all replicated data for `{dir, partition_index}` and adopts the
-  primary's post-truncate epoch.
+  primary's post-truncate epoch and logical byte base.
   """
-  @spec truncate(Path.t(), non_neg_integer(), non_neg_integer()) :: :ok
-  def truncate(dir, partition_index, epoch) do
-    Writer.truncate(ensure_writer(dir, partition_index), epoch)
+  @spec truncate(Path.t(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: :ok
+  def truncate(dir, partition_index, epoch, base_byte) do
+    Writer.truncate(ensure_writer(dir, partition_index), epoch, base_byte)
+  end
+
+  @doc """
+  Drops every byte below `base_byte` from the replica WAL for
+  `{dir, partition_index}`, passing on a trim the primary already applied.
+  """
+  @spec trim(Path.t(), non_neg_integer(), non_neg_integer()) :: :ok
+  def trim(dir, partition_index, base_byte) do
+    Writer.trim(ensure_writer(dir, partition_index), base_byte)
   end
 
   @doc """

@@ -45,7 +45,8 @@ DurableBuffer.stream(:events, user_id, with_offsets: true)        # {offset, pay
 
 DurableBuffer.offsets(:events, user_id)                           # %{first:, durable:, next:}
 
-:ok = DurableBuffer.truncate(:events, user_id)                    # drop consumed data
+:ok = DurableBuffer.trim(:events, user_id, upto: 5_000)           # drop the head
+:ok = DurableBuffer.truncate(:events, user_id)                    # drop everything
 :ok = DurableBuffer.truncate_all(:events)
 ```
 
@@ -72,13 +73,74 @@ recovers its count from the WAL on open.
 Use `:first` to detect that a resume point predates retention and fall back
 to a full resync, instead of silently replaying from the trim point.
 
+### Consumer positions
+
+The buffer does not track consumers. It records no positions for them, and
+their positions do not gate retention. A consumer keeps its own cursor, the
+way an SSE client carries `Last-Event-ID` and a Kafka consumer stores its
+offset outside the log:
+
+```elixir
+from = MyApp.Cursor.load("worker-1") || 0
+
+for {offset, payload} <-
+      DurableBuffer.stream(:events, user_id, from: from, with_offsets: true) do
+  handle(payload)
+  MyApp.Cursor.save("worker-1", offset + 1)
+end
+```
+
+Compare `from` against `offsets/2`'s `:first` before you resume. A resume
+point below `:first` predates retention, so the consumer resyncs in full
+rather than replaying silently from the trim point.
+
+### Retention
+
+Trim the head of a partition at an explicit offset:
+
+```elixir
+:ok = DurableBuffer.trim(:events, user_id, upto: 5_000)
+```
+
+The buffer tracks no consumers, so it cannot pick the point for you. Pick
+one from a cursor your application owns, or from a policy of your own.
+
+`upto:` is exclusive: every entry below it is dropped and becomes the new
+`:first`. A trim past the durable offset is refused with
+`{:error, :not_durable}`.
+
+The local backend cuts exactly at the point. It copies the retained suffix
+to a sibling file, `datasync`s it and renames over the WAL, so a crash
+mid-trim leaves the original intact; the cost is proportional to the bytes
+*kept*, which is cheap exactly when trimming is routine. S3 stores immutable
+segments, so it drops only segments lying entirely below the point and
+`:first` lands on a segment boundary at or below it.
+
+**A trim does not reach the replication wire.** Batches are stamped with
+*logical* byte offsets, which count from the first byte ever written rather
+than from the start of the file, so trimming the head moves
+`base_byte_offset` and leaves every stamped number alone. No epoch bump, no
+resync, and the seek index needs no rebuild. The primary passes its new base
+on to each replica as an advisory, best-effort `:erpc` — a replica that
+misses it simply keeps more data than it needs.
+
+The one case that needs care is a replica whose tail falls *below* the
+primary's base, because it was down while the primary appended and then
+trimmed. Nobody has the bytes in between, so the sender discards that
+replica's copy, rebases it on the primary's base, and streams forward from
+there.
+
 `from:` seeks rather than scans. The local backend keeps a sparse index
 (`p<index>.idx`, one 20-byte record per group commit) and binary-searches it
 for the last batch at or before the wanted offset. The index is a pure
 cache: it is written on the commit path but never `datasync`ed, and any
-record the WAL does not back is dropped when the partition opens. A missing,
-stale, torn or corrupt index costs a scan from the start of the log — never
-a wrong answer. S3 needs no index at all: its segment keys *are* offsets, so
+record the WAL does not back is dropped when the partition opens — past its
+tail, below its retained base, or torn. A seek result pointing below the
+base is ignored as well, since the index is written without a `datasync`
+while the metadata beside it is synced, and a crash between the two can
+leave the base advanced and stale records behind. A missing, stale, torn or
+corrupt index costs a scan from the start of the log — never a wrong
+answer. S3 needs no index at all: its segment keys *are* offsets, so
 a seek picks the floor key from the listing it already does.
 
 The `partition_key` (any term) is hashed to one of a fixed number of

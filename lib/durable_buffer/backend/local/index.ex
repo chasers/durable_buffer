@@ -19,14 +19,22 @@ defmodule DurableBuffer.Backend.Local.Index do
   @type handle :: %{fd: :file.fd() | nil, path: Path.t()}
 
   @doc """
-  Opens the index for appending, first dropping any record the WAL does not
-  back — records past `wal_size`, and a torn partial record at the end.
+  Opens the index for appending, first dropping every record the WAL does
+  not back: records past its tail, records below its retained base, and a
+  torn partial record at the end.
+
+  Dropping below the base matters because `trim/2` writes without a
+  `datasync` while the metadata beside it is synced. A crash between the two
+  can leave the base advanced and stale records on disk, and a record
+  pointing into trimmed bytes would otherwise label a read with offsets
+  lower than the entries actually carry.
   """
-  @spec open(Path.t(), non_neg_integer(), non_neg_integer()) :: handle()
-  def open(dir, partition_index, wal_size) do
+  @spec open(Path.t(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: handle()
+  def open(dir, partition_index, wal_tail, base_offset \\ 0) do
     path = path(dir, partition_index)
     File.mkdir_p!(Path.dirname(path))
-    trim(path, wal_size)
+    drop_unbacked(path, wal_tail)
+    trim_path(path, base_offset)
 
     case :file.open(path, [:append, :raw, :binary]) do
       {:ok, fd} -> %{fd: fd, path: path}
@@ -44,8 +52,7 @@ defmodule DurableBuffer.Backend.Local.Index do
   def append(%{fd: nil}, _first_offset, _byte_pos), do: :ok
 
   def append(%{fd: fd}, first_offset, byte_pos) do
-    body = <<first_offset::64-big, byte_pos::64-big>>
-    _ignored = :file.write(fd, [body, <<:erlang.crc32(body)::32-big>>])
+    _ignored = :file.write(fd, encode(first_offset, byte_pos))
     :ok
   end
 
@@ -70,6 +77,30 @@ defmodule DurableBuffer.Backend.Local.Index do
   end
 
   @doc """
+  Drops every record for data below `upto`, keeping the rest untouched.
+
+  Record positions are logical byte offsets, and a trim does not move
+  those, so the surviving records stay correct without being rewritten.
+  """
+  @spec trim(handle(), non_neg_integer()) :: handle()
+  def trim(%{path: nil} = handle, _upto), do: handle
+
+  def trim(handle, upto) do
+    close(handle)
+    trim_path(handle.path, upto)
+    reopen(handle)
+  end
+
+  defp trim_path(path, upto) do
+    kept =
+      for {first_offset, byte_pos} <- read_all(path),
+          first_offset >= upto,
+          do: encode(first_offset, byte_pos)
+
+    File.write!(path, kept)
+  end
+
+  @doc """
   Discards the index, then reopens it empty.
   """
   @spec reset(handle()) :: handle()
@@ -78,10 +109,34 @@ defmodule DurableBuffer.Backend.Local.Index do
   def reset(handle) do
     close(handle)
     _ignored = File.rm(handle.path)
+    reopen(handle)
+  end
 
+  defp reopen(handle) do
     case :file.open(handle.path, [:append, :raw, :binary]) do
       {:ok, fd} -> %{handle | fd: fd}
       {:error, _reason} -> %{handle | fd: nil}
+    end
+  end
+
+  defp encode(first_offset, byte_pos) do
+    body = <<first_offset::64-big, byte_pos::64-big>>
+    [body, <<:erlang.crc32(body)::32-big>>]
+  end
+
+  defp read_all(path) do
+    with {:ok, %{size: size}} <- File.stat(path),
+         records when records > 0 <- div(size, @record_size),
+         {:ok, fd} <- :file.open(path, [:read, :raw, :binary]) do
+      found =
+        for position <- 0..(records - 1),
+            {:ok, record} <- [read_record(fd, position)],
+            do: record
+
+      :ok = :file.close(fd)
+      found
+    else
+      _unusable -> []
     end
   end
 
@@ -122,16 +177,16 @@ defmodule DurableBuffer.Backend.Local.Index do
     end
   end
 
-  defp trim(path, wal_size) do
+  defp drop_unbacked(path, wal_size) do
     case File.stat(path) do
-      {:ok, %{size: size}} -> trim_to(path, div(size, @record_size), wal_size)
+      {:ok, %{size: size}} -> drop_unbacked_to(path, div(size, @record_size), wal_size)
       {:error, _reason} -> :ok
     end
   end
 
-  defp trim_to(_path, 0, _wal_size), do: :ok
+  defp drop_unbacked_to(_path, 0, _wal_size), do: :ok
 
-  defp trim_to(path, records, wal_size) do
+  defp drop_unbacked_to(path, records, wal_size) do
     {:ok, fd} = :file.open(path, [:read, :write, :raw, :binary])
     keep = backed_records(fd, 0, records - 1, wal_size, 0)
     {:ok, _position} = :file.position(fd, keep * @record_size)

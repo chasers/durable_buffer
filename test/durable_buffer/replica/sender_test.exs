@@ -173,7 +173,7 @@ defmodule DurableBuffer.Replica.SenderTest do
 
     {:ok, local} = Local.truncate(local, 0)
     :ok = Sender.reset(sender, 1)
-    :ok = DurableBuffer.Replica.truncate(replica_dir, 0, 1)
+    :ok = DurableBuffer.Replica.truncate(replica_dir, 0, 1, 0)
 
     fresh = entry("fresh")
     {:ok, local} = Local.commit(local, fresh, byte_size(fresh), {Local.offsets(local).next, 1})

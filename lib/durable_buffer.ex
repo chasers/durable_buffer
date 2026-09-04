@@ -14,7 +14,7 @@ defmodule DurableBuffer do
 
   Then append from any process:
 
-      :ok = DurableBuffer.append(:events, user_id, payload)
+      {:ok, offset} = DurableBuffer.append(:events, user_id, payload)
 
   `append/3` returns once the payload is durable per the backend's guarantee.
   All appends that arrive at a partition while a commit is in flight are
@@ -155,8 +155,8 @@ defmodule DurableBuffer do
 
   Options:
 
-    * `:from` — start at this logical offset, inclusive. Resume a consumer
-      with `from: last_acked + 1`.
+    * `:from` — start at this logical offset, inclusive. A consumer keeps
+      its own cursor and resumes with `from: last_processed + 1`.
     * `:with_offsets` — yield `{offset, payload}` instead of `payload`.
     * `:dirty` — read the whole local WAL, including batches that have not
       met the policy and may still fail. Recovery tooling wants this;
@@ -225,6 +225,31 @@ defmodule DurableBuffer do
     end
 
     :ok
+  end
+
+  @doc """
+  Drops entries from the head of `partition_key`'s partition, up to but not
+  including the logical offset `upto`.
+
+      :ok = DurableBuffer.trim(:events, user_id, upto: 5_000)
+
+  `upto:` is exclusive: every entry *below* it is dropped, and `offsets/2`
+  reports it as the new `:first`. A trim past the durable offset is refused
+  with `{:error, :not_durable}`.
+
+  The buffer does not track consumers, so it cannot pick the point for you.
+  A consumer keeps its own cursor and detects a resume point below `:first`
+  from `offsets/2`.
+
+  The local and replicated backends cut exactly at `upto`. S3 stores
+  immutable segments, so it drops only segments that lie entirely below the
+  trim point and `:first` lands on a segment boundary at or below it.
+  """
+  @spec trim(atom(), term(), keyword()) :: :ok | {:error, term()}
+  def trim(name, partition_key, opts) do
+    name
+    |> partition_server(partition_key)
+    |> Partition.trim(Keyword.fetch!(opts, :upto))
   end
 
   @doc """

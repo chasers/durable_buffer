@@ -172,4 +172,35 @@ defmodule DurableBuffer.Backend.S3Test do
     {payloads, _valid, _rest} = batch |> IO.iodata_to_binary() |> DurableBuffer.WAL.decode_all()
     {module.offsets(state).next, length(payloads)}
   end
+
+  test "trim drops only segments that lie entirely below the point" do
+    {config, store} = start_backend()
+    {:ok, state} = S3.open(config, 0)
+
+    state =
+      Enum.reduce([["a", "b"], ["c", "d"], ["e", "f"]], state, fn payloads, state ->
+        {batch, bytes} = encode_batch(payloads)
+        {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+        state
+      end)
+
+    assert S3.offsets(state) == %{first: 0, next: 6}
+
+    {:ok, state} = S3.trim(state, 3)
+
+    assert S3.offsets(state) == %{first: 2, next: 6}
+    assert Enum.to_list(S3.stream(config, 0)) == ~w(c d e f)
+
+    assert Map.keys(FakeS3.objects(store)) |> Enum.sort() == [
+             "buffers/test/p0/000000000002.wal",
+             "buffers/test/p0/000000000004.wal",
+             "buffers/test/p0/base"
+           ]
+
+    {:ok, reopened} = S3.open(config, 0)
+    assert S3.offsets(reopened) == %{first: 2, next: 6}
+
+    assert Enum.to_list(S3.stream(config, 0, from: 4, with_offsets: true)) ==
+             [{4, "e"}, {5, "f"}]
+  end
 end

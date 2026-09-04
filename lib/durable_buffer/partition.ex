@@ -91,10 +91,18 @@ defmodule DurableBuffer.Partition do
   end
 
   @doc """
+  Drops every entry below `upto`.
+  """
+  @spec trim(GenServer.server(), non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def trim(server, upto, timeout \\ :infinity) do
+    GenServer.call(server, {:trim, upto}, timeout)
+  end
+
+  @doc """
   Reports the backend's per-replica replication state.
   """
   @spec replica_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
-  def replica_status(server, timeout \\ 5_000) do
+  def replica_status(server, timeout \\ :infinity) do
     GenServer.call(server, :replica_status, timeout)
   end
 
@@ -149,8 +157,15 @@ defmodule DurableBuffer.Partition do
     {:noreply, state}
   end
 
-  def handle_call(:replica_status, _from, state) do
-    {:reply, Committer.replica_status(state.committer), state}
+  def handle_call({:trim, upto}, from, state) do
+    state = if state.pending == [], do: state, else: handoff(state)
+    Committer.request_trim(state.committer, from, upto)
+    {:noreply, state}
+  end
+
+  def handle_call(:replica_status, from, state) do
+    Committer.request_replica_status(state.committer, from)
+    {:noreply, state}
   end
 
   def handle_call(:truncate, from, state) do

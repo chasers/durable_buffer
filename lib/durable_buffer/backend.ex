@@ -71,6 +71,8 @@ defmodule DurableBuffer.Backend do
               Enumerable.t()
   @callback durable_offset(state()) :: non_neg_integer()
   @callback offsets(state()) :: %{first: non_neg_integer(), next: non_neg_integer()}
+  @callback trim(state(), upto :: non_neg_integer()) ::
+              {:ok, state()} | {:error, term(), state()}
   @callback truncate(state(), next_offset :: non_neg_integer()) :: {:ok, state()}
   @callback close(state()) :: :ok
 
@@ -78,7 +80,8 @@ defmodule DurableBuffer.Backend do
                       handle_message: 2,
                       stream: 3,
                       durable_offset: 1,
-                      offsets: 1
+                      offsets: 1,
+                      trim: 2
 
   @doc """
   Normalizes a `{module, opts}` backend spec into `{module, config}`.

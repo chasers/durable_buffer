@@ -238,6 +238,30 @@ defmodule DurableBuffer.Backend.Replica do
   def offsets(state), do: Local.offsets(state.local)
 
   @doc """
+  Drops every entry below `upto` locally, then passes the resulting logical
+  byte base on to every replica.
+
+  A trim never reaches the replication wire as a data change: logical byte
+  offsets do not move, so a replica that has not yet trimmed still accepts
+  the same batches at the same offsets. Propagation is advisory and
+  best-effort, exactly like the truncate `:erpc`, and only reclaims space. A
+  replica that misses it keeps more data than it needs, which is safe.
+  """
+  @impl DurableBuffer.Backend
+  @spec trim(map(), non_neg_integer()) :: {:ok, map()} | {:error, term(), map()}
+  def trim(state, upto) do
+    case Local.trim(state.local, upto) do
+      {:ok, local} ->
+        base_byte = Local.base_byte(local)
+        Enum.each(state.config.replicas, &trim_replica(state, &1, base_byte))
+        {:ok, %{state | local: local}}
+
+      {:error, reason, local} ->
+        {:error, reason, %{state | local: local}}
+    end
+  end
+
+  @doc """
   Byte offset through which the ack policy is met.
 
   Take every member watermark on the current epoch, sort them descending,
@@ -324,7 +348,19 @@ defmodule DurableBuffer.Backend.Replica do
       node,
       DurableBuffer.Replica,
       :truncate,
-      [state.config.replica_dir, state.partition_index, epoch],
+      [state.config.replica_dir, state.partition_index, epoch, 0],
+      state.config.rpc_timeout
+    )
+  catch
+    _kind, _reason -> :error
+  end
+
+  defp trim_replica(state, node, base_byte) do
+    :erpc.call(
+      node,
+      DurableBuffer.Replica,
+      :trim,
+      [state.config.replica_dir, state.partition_index, base_byte],
       state.config.rpc_timeout
     )
   catch

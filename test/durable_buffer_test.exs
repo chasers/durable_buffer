@@ -396,4 +396,173 @@ defmodule DurableBufferTest do
 
     assert Enum.to_list(DurableBuffer.stream(name, "k", from: 1)) == ["b", "c"]
   end
+
+  describe "retention" do
+    setup %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..9} = DurableBuffer.append_batch(name, "k", Enum.map(0..9, &"e#{&1}"))
+      %{name: name, dir: tmp_dir}
+    end
+
+    test "trims to an explicit point", %{name: name} do
+      assert :ok = DurableBuffer.trim(name, "k", upto: 6)
+
+      assert %{first: 6, next: 10} = DurableBuffer.offsets(name, "k")
+      assert Enum.to_list(DurableBuffer.stream(name, "k")) == Enum.map(6..9, &"e#{&1}")
+    end
+
+    test "keeps offsets stable across a trim", %{name: name} do
+      :ok = DurableBuffer.trim(name, "k", upto: 6)
+
+      assert Enum.take(DurableBuffer.stream(name, "k", with_offsets: true), 2) ==
+               [{6, "e6"}, {7, "e7"}]
+
+      assert {:ok, 10} = DurableBuffer.append(name, "k", "e10")
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 9)) == ["e9", "e10"]
+    end
+
+    test "seeks correctly after a trim", %{name: name} do
+      :ok = DurableBuffer.trim(name, "k", upto: 4)
+
+      for from <- 4..10 do
+        assert Enum.to_list(DurableBuffer.stream(name, "k", from: from)) ==
+                 Enum.map(from..9//1, &"e#{&1}")
+      end
+    end
+
+    test "survives a restart", %{name: name, dir: dir} do
+      :ok = DurableBuffer.trim(name, "k", upto: 6)
+      stop_supervised!({DurableBuffer, name})
+
+      name = start_buffer(dir, name: name, partitions: 1)
+
+      assert %{first: 6, next: 10} = DurableBuffer.offsets(name, "k")
+      assert Enum.to_list(DurableBuffer.stream(name, "k")) == Enum.map(6..9, &"e#{&1}")
+      assert {:ok, 10} = DurableBuffer.append(name, "k", "e10")
+    end
+
+    test "a trim past every entry keeps offsets monotonic", %{name: name} do
+      assert :ok = DurableBuffer.trim(name, "k", upto: 10)
+
+      assert %{first: 10, next: 10} = DurableBuffer.offsets(name, "k")
+      assert Enum.to_list(DurableBuffer.stream(name, "k")) == []
+      assert {:ok, 10} = DurableBuffer.append(name, "k", "after")
+    end
+
+    test "refuses a trim past the durable offset", %{name: name} do
+      assert {:error, :not_durable} = DurableBuffer.trim(name, "k", upto: 11)
+      assert %{first: 0} = DurableBuffer.offsets(name, "k")
+    end
+
+    test "a trim below the base is a no-op", %{name: name} do
+      :ok = DurableBuffer.trim(name, "k", upto: 6)
+      assert :ok = DurableBuffer.trim(name, "k", upto: 2)
+      assert %{first: 6} = DurableBuffer.offsets(name, "k")
+    end
+  end
+
+  test "a replica keeps replicating across a primary trim", %{tmp_dir: tmp_dir} do
+    name =
+      start_buffer(tmp_dir,
+        backend:
+          {DurableBuffer.Backend.Replica,
+           dir: Path.join(tmp_dir, "primary"),
+           replica_dir: Path.join(tmp_dir, "replica"),
+           replicas: [node()],
+           ack: :all},
+        partitions: 1
+      )
+
+    {:ok, 0..4} = DurableBuffer.append_batch(name, "k", ~w(a b c d e))
+    assert :ok = DurableBuffer.trim(name, "k", upto: 3)
+
+    assert {:ok, 5} = DurableBuffer.append(name, "k", "f")
+    assert %{first: 3, next: 6} = DurableBuffer.offsets(name, "k")
+    assert Enum.to_list(DurableBuffer.stream(name, "k")) == ~w(d e f)
+
+    assert %{epoch: 0} = DurableBuffer.replica_status(name, "k") |> elem(1) |> Map.fetch!(node())
+  end
+
+  describe "review regressions" do
+    test "a pre-trim index never mislabels offsets", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+
+      for chunk <- Enum.chunk_every(0..19, 2) do
+        {:ok, _range} = DurableBuffer.append_batch(name, "k", Enum.map(chunk, &"e#{&1}"))
+      end
+
+      index = Path.join(tmp_dir, "p0.idx")
+      stale = File.read!(index)
+
+      :ok = DurableBuffer.trim(name, "k", upto: 10)
+      File.write!(index, stale)
+
+      assert Enum.take(DurableBuffer.stream(name, "k", from: 5, with_offsets: true), 2) ==
+               [{10, "e10"}, {11, "e11"}]
+
+      assert Enum.take(DurableBuffer.stream(name, "k", from: 15, with_offsets: true), 2) ==
+               [{15, "e15"}, {16, "e16"}]
+    end
+
+    test "a stale index is dropped when the partition reopens", %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+
+      for chunk <- Enum.chunk_every(0..19, 2) do
+        {:ok, _range} = DurableBuffer.append_batch(name, "k", Enum.map(chunk, &"e#{&1}"))
+      end
+
+      index = Path.join(tmp_dir, "p0.idx")
+      stale = File.read!(index)
+      :ok = DurableBuffer.trim(name, "k", upto: 10)
+      stop_supervised!({DurableBuffer, name})
+      File.write!(index, stale)
+
+      name = start_buffer(tmp_dir, name: name, partitions: 1)
+
+      assert Enum.take(DurableBuffer.stream(name, "k", from: 12, with_offsets: true), 2) ==
+               [{12, "e12"}, {13, "e13"}]
+    end
+
+    test "trim settles the pipeline before judging the trim point", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          backend:
+            {DurableBuffer.Backend.Replica,
+             dir: Path.join(tmp_dir, "primary"),
+             replica_dir: Path.join(tmp_dir, "replica"),
+             replicas: [node()],
+             ack: :all},
+          partitions: 1
+        )
+
+      for i <- 0..4, do: :ok = DurableBuffer.append_async(name, "k", "e#{i}")
+
+      assert :ok = DurableBuffer.trim(name, "k", upto: 5)
+      assert %{first: 5, next: 5} = DurableBuffer.offsets(name, "k")
+    end
+
+    test "reading replica status does not block behind a busy committer", %{tmp_dir: tmp_dir} do
+      name =
+        start_buffer(tmp_dir,
+          backend:
+            {DurableBuffer.Backend.Replica,
+             dir: Path.join(tmp_dir, "primary"),
+             replica_dir: Path.join(tmp_dir, "replica"),
+             replicas: [node()],
+             ack: :all},
+          partitions: 1
+        )
+
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+
+      writers =
+        for i <- 1..20 do
+          Task.async(fn -> DurableBuffer.append(name, "k", "concurrent-#{i}") end)
+        end
+
+      assert {:ok, status} = DurableBuffer.replica_status(name, "k")
+      assert %{epoch: 0} = Map.fetch!(status, node())
+      assert Enum.all?(Task.await_many(writers, 5000), &match?({:ok, _}, &1))
+    end
+  end
 end
