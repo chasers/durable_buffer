@@ -58,8 +58,15 @@ defmodule DurableBuffer.Replica.Sender do
   end
 
   @doc """
-  Clears the queue and adopts `epoch` with an empty primary WAL. Called
-  after a truncate, once the pipeline is drained.
+  Clears the queue, adopts `epoch` with an empty primary WAL, and re-attaches
+  at once. Called after a truncate, once the pipeline is drained.
+
+  The re-attach is what makes a truncate converge. `Backend.Replica.truncate/1`
+  sends each replica an `:erpc` truncate that may fail, and a replica that
+  misses it keeps the old epoch and its pre-truncate data. Re-attaching makes
+  the sender compare epochs immediately, truncate the replica itself, and
+  keep retrying on its reconnect timer until the replica confirms — rather
+  than waiting for the next commit to be rejected.
   """
   @spec reset(GenServer.server(), non_neg_integer()) :: :ok
   def reset(sender, epoch) do
@@ -131,17 +138,16 @@ defmodule DurableBuffer.Replica.Sender do
 
   @impl GenServer
   def handle_call({:reset, epoch}, _from, state) do
-    state = close_resync(state)
+    state = %{
+      state
+      | epoch: epoch,
+        primary_tail: 0,
+        queue: :queue.new(),
+        queued_bytes: 0,
+        watermark: {0, 0}
+    }
 
-    {:reply, :ok,
-     %{
-       state
-       | epoch: epoch,
-         primary_tail: 0,
-         queue: :queue.new(),
-         queued_bytes: 0,
-         mode: :live
-     }}
+    {:reply, :ok, reattach(state, 0)}
   end
 
   @impl GenServer
@@ -283,10 +289,10 @@ defmodule DurableBuffer.Replica.Sender do
         wipe_and_resync(state)
 
       remote_offset < next_needed(state) ->
-        start_resync(state, remote_offset)
+        state |> note_adopted() |> start_resync(remote_offset)
 
       true ->
-        state = adopt_remote_tail(state, remote_tail)
+        state = state |> note_adopted() |> adopt_remote_tail(remote_tail)
         state = resend_queue(%{state | mode: :live})
         ensure_progress_check(state)
     end
@@ -306,9 +312,14 @@ defmodule DurableBuffer.Replica.Sender do
 
   defp wipe_and_resync(state) do
     case truncate_remote(state) do
-      :ok -> start_resync(state, 0)
+      :ok -> state |> note_adopted() |> start_resync(0)
       :error -> force_reattach(state)
     end
+  end
+
+  defp note_adopted(state) do
+    send(state.owner, {:backend, {:adopted, state.node, state.epoch}})
+    state
   end
 
   defp next_needed(state) do
@@ -352,10 +363,12 @@ defmodule DurableBuffer.Replica.Sender do
     _kind, _reason -> :error
   end
 
-  defp force_reattach(state) do
+  defp force_reattach(state), do: reattach(state, @connect_retry_ms)
+
+  defp reattach(state, delay) do
     if state.monitor, do: Process.demonitor(state.monitor, [:flush])
     state = close_resync(state)
-    Process.send_after(self(), :connect, @connect_retry_ms)
+    Process.send_after(self(), :connect, delay)
     %{state | writer: nil, monitor: nil, attach_ref: nil, mode: :live}
   end
 

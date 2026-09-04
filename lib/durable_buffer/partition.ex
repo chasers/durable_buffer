@@ -88,6 +88,14 @@ defmodule DurableBuffer.Partition do
     GenServer.call(server, :truncate, timeout)
   end
 
+  @doc """
+  Reports the backend's per-replica replication state.
+  """
+  @spec replica_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
+  def replica_status(server, timeout \\ 5_000) do
+    GenServer.call(server, :replica_status, timeout)
+  end
+
   @impl GenServer
   def init(opts) do
     {backend, config} = Keyword.fetch!(opts, :backend)
@@ -137,6 +145,10 @@ defmodule DurableBuffer.Partition do
       |> handoff()
 
     {:noreply, state}
+  end
+
+  def handle_call(:replica_status, _from, state) do
+    {:reply, Committer.replica_status(state.committer), state}
   end
 
   def handle_call(:truncate, from, state) do

@@ -564,4 +564,52 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     contents = File.read!(path)
     File.write!(path, binary_part(contents, 0, keep_bytes))
   end
+
+  describe "replica adoption after a truncate" do
+    test "records every replica the truncate reached", %{tmp_dir: tmp_dir} do
+      {primary_dir, replica_dir} = dirs(tmp_dir)
+
+      config =
+        Replica.init_config(dir: primary_dir, replica_dir: replica_dir, replicas: [node()])
+
+      {:ok, state} = Replica.open(config, 0)
+      {batch, bytes} = encode_batch(["before-truncate"])
+      assert {:ok, state} = Replica.commit(state, batch, bytes)
+
+      before = state |> Replica.status() |> Map.fetch!(node())
+      assert before.adopted_epoch == 0
+      assert before.promotable?
+
+      assert {:ok, state} = Replica.truncate(state)
+
+      after_truncate = state |> Replica.status() |> Map.fetch!(node())
+      assert after_truncate.epoch == 1
+      assert after_truncate.adopted_epoch == 1
+      assert after_truncate.promotable?
+
+      assert :ok = Replica.close(state)
+    end
+
+    test "reports a replica it could not reach as not promotable", %{tmp_dir: tmp_dir} do
+      {primary_dir, replica_dir} = dirs(tmp_dir)
+
+      config =
+        Replica.init_config(
+          dir: primary_dir,
+          replica_dir: replica_dir,
+          replicas: [:unreachable@nohost],
+          rpc_timeout: 500,
+          heal_timeout: 500
+        )
+
+      {:ok, state} = Replica.open(config, 0)
+
+      status = state |> Replica.status() |> Map.fetch!(:unreachable@nohost)
+      assert status.adopted_epoch == nil
+      refute status.promotable?
+      refute status.caught_up?
+
+      assert :ok = Replica.close(state)
+    end
+  end
 end

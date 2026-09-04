@@ -47,6 +47,7 @@ property is load-bearing.
 | `Replication_quorum` | same with two replicas and a majority ack policy | PASS |
 | `Replication_loss` | dropped batches alone; the tail check heals them | PASS |
 | `Replication_nocrash` | truncate + loss, `fsync: false`, no crash | PASS |
+| `Replication_adopt` | the adopted-epoch report across a failed truncate `:erpc` | PASS |
 | `Replication_heal` | `fsync: false` + crash, with the open-time heal, the attach reference and the reconcile fix | PASS |
 | `Replication` | `fsync: false` + primary crash, `AckedInPrimary` | VIOLATED — F-1 |
 | `Replication_ahead` | same, `AckedSomewhere`, heal off | VIOLATED — F-2 |
@@ -63,6 +64,10 @@ Invariants:
   are local-only, so this is what a caller actually gets.
 - `AckedSomewhere` — an acked batch still exists on some member.
 - `ReadsAreAckDurable` — every readable byte met the ack policy.
+- `AdoptedIsHonest` — the primary never claims an epoch a replica has not
+  persisted.
+- `PromotableIsClean` — a replica reported as promotable holds no
+  pre-truncate data.
 
 ## Conventions
 

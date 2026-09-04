@@ -217,4 +217,24 @@ defmodule DurableBuffer.Replica.SenderTest do
       50 -> :ok
     end
   end
+
+  test "reset re-attaches at once and truncates a replica on the old epoch",
+       %{tmp_dir: tmp_dir} do
+    {primary_dir, _replica_dir} = dirs(tmp_dir)
+    local = open_primary(primary_dir)
+    sender = start_sender(tmp_dir, [])
+
+    binary = entry("pre-truncate")
+    local = commit_both(local, sender, binary)
+    await_watermark({0, byte_size(binary)})
+    assert replica_entries(tmp_dir) == ["pre-truncate"]
+
+    :ok = Sender.reset(sender, 1)
+
+    assert_receive {:backend, {:adopted, _node, 1}}, 2000
+    assert replica_entries(tmp_dir) == []
+
+    Sender.stop(sender)
+    Local.close(local)
+  end
 end

@@ -55,6 +55,27 @@ defmodule DurableBuffer.Partition.Committer do
     GenServer.cast(server, {:truncate, from})
   end
 
+  @doc """
+  Reports the backend's per-replica replication state, for backends that
+  track one. Returns `{:error, :unsupported}` for the others.
+  """
+  @spec replica_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
+  def replica_status(server, timeout \\ 5_000) do
+    GenServer.call(server, :replica_status, timeout)
+  end
+
+  @impl GenServer
+  def handle_call(:replica_status, _from, state) do
+    reply =
+      if function_exported?(state.backend, :status, 1) do
+        {:ok, state.backend.status(state.backend_state)}
+      else
+        {:error, :unsupported}
+      end
+
+    {:reply, reply, state}
+  end
+
   @impl GenServer
   def init({backend, config, partition_index, opts, writer}) do
     Process.flag(:trap_exit, true)
