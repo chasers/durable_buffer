@@ -2,6 +2,7 @@ Replication	VIOLATED
 Replication_ahead	VIOLATED
 Replication_core	PASS
 Replication_dirtyread	VIOLATED
+Replication_heal	PASS
 Replication_loss	PASS
 Replication_nocrash	PASS
 Replication_noepoch	VIOLATED

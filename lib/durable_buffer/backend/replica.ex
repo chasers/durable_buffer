@@ -39,9 +39,18 @@ defmodule DurableBuffer.Backend.Replica do
   truncate rejects everything after the gap instead of diverging silently.
   Rejections, disconnects, and ack stalls all heal the same way: the sender
   re-attaches, learns the replica's tail, and streams the missing WAL
-  suffix (truncating the replica first when it missed an epoch bump or
-  holds bytes the primary lost) before resuming live traffic — a replica
-  that was down for an hour catches up automatically. Until it does, its
+  suffix (truncating the replica first when it missed an epoch bump) before
+  resuming live traffic — a replica that was down for an hour catches up
+  automatically.
+
+  Healing runs in the other direction too. A primary opened with
+  `fsync: false` can come back from a crash having lost WAL bytes a replica
+  still holds and already acked. `open/2` therefore asks every replica for
+  its tail, and pulls back anything it is missing from the furthest one
+  before the partition serves a single append. Pulled bytes are CRC-checked
+  frame by frame and `datasync`ed whatever the `fsync:` setting is. A
+  replica unreachable at open is not consulted, so `heal_timeout:` (5s)
+  bounds how long a dead node delays startup. Until it does, its
   acks are missing, which surfaces as `:insufficient_acks` errors when the
   ack policy needs it. Primary and replica nodes must run the same
   `:durable_buffer` version, since batches cross nodes with this framing.
@@ -56,9 +65,14 @@ defmodule DurableBuffer.Backend.Replica do
 
   @behaviour DurableBuffer.Backend
 
+  require Logger
+
   alias DurableBuffer.Backend.Local
   alias DurableBuffer.Epoch
   alias DurableBuffer.Replica.Sender
+  alias DurableBuffer.WAL
+
+  @heal_chunk_bytes 1024 * 1024
 
   @typedoc """
   A member's durability watermark: everything up to `offset` in `epoch` is
@@ -79,6 +93,7 @@ defmodule DurableBuffer.Backend.Replica do
       needed_acks: needed_acks(Keyword.get(opts, :ack, :all), replicas),
       rpc_timeout: Keyword.get(opts, :rpc_timeout, 15_000),
       max_sender_bytes: Keyword.get(opts, :max_sender_bytes, 64 * 1024 * 1024),
+      heal_timeout: Keyword.get(opts, :heal_timeout, 5_000),
       fsync: Keyword.get(opts, :fsync, false)
     }
   end
@@ -87,6 +102,7 @@ defmodule DurableBuffer.Backend.Replica do
   def open(config, partition_index) do
     {:ok, local} = Local.open(local_config(config), partition_index)
     epoch = Epoch.load(config.dir, partition_index)
+    local = heal(config, partition_index, epoch, local)
 
     senders =
       Map.new(config.replicas, fn node ->
@@ -237,6 +253,95 @@ defmodule DurableBuffer.Backend.Replica do
           nil -> await_commit(state, tag)
         end
     end
+  end
+
+  defp heal(%{replicas: []}, _partition_index, _epoch, local), do: local
+
+  defp heal(config, partition_index, epoch, local) do
+    case ahead_replica(config, partition_index, epoch, Local.offset(local)) do
+      nil -> local
+      {node, remote_offset} -> pull(config, partition_index, node, local, remote_offset)
+    end
+  end
+
+  defp ahead_replica(config, partition_index, epoch, local_offset) do
+    candidates =
+      for node <- config.replicas,
+          {^epoch, offset} <- [remote_tail(config, partition_index, node)],
+          offset > local_offset,
+          do: {node, offset}
+
+    case candidates do
+      [] -> nil
+      list -> Enum.max_by(list, fn {_node, offset} -> offset end)
+    end
+  end
+
+  defp remote_tail(config, partition_index, node) do
+    {_pid, tail} =
+      :erpc.call(
+        node,
+        DurableBuffer.Replica,
+        :attach,
+        [config.replica_dir, partition_index, config.fsync],
+        config.heal_timeout
+      )
+
+    tail
+  catch
+    _kind, _reason -> nil
+  end
+
+  defp pull(config, partition_index, node, local, remote_offset) do
+    Logger.warning(
+      "DurableBuffer primary #{config.dir} p#{partition_index} is " <>
+        "#{remote_offset - Local.offset(local)} bytes behind #{inspect(node)}; " <>
+        "healing from it before the partition serves"
+    )
+
+    local = pull_chunks(config, partition_index, node, local, remote_offset, <<>>)
+    :ok = Local.datasync(local)
+    local
+  end
+
+  defp pull_chunks(config, partition_index, node, local, remote_offset, leftover) do
+    cursor = Local.offset(local) + byte_size(leftover)
+
+    if cursor >= remote_offset do
+      local
+    else
+      length = min(@heal_chunk_bytes, remote_offset - cursor)
+
+      case read_remote(config, partition_index, node, cursor, length) do
+        {:ok, data} when byte_size(data) > 0 ->
+          buffer = leftover <> data
+          {_payloads, valid, rest} = WAL.decode_all(buffer)
+          local = append_healed(local, buffer, valid)
+          pull_chunks(config, partition_index, node, local, remote_offset, rest)
+
+        _empty_or_error ->
+          local
+      end
+    end
+  end
+
+  defp append_healed(local, _buffer, 0), do: local
+
+  defp append_healed(local, buffer, valid) do
+    {:ok, local} = Local.commit(local, binary_part(buffer, 0, valid), valid)
+    local
+  end
+
+  defp read_remote(config, partition_index, node, offset, length) do
+    :erpc.call(
+      node,
+      DurableBuffer.Replica,
+      :read_range,
+      [config.replica_dir, partition_index, offset, length],
+      config.heal_timeout
+    )
+  catch
+    _kind, _reason -> :error
   end
 
   defp local_config(config) do

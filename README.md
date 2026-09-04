@@ -60,6 +60,7 @@ use more partitions to saturate your disk.
 | `:max_batch_entries` | 5000 | Force a flush at this many pending entries |
 | `:flush_delay_ms` | 0 (adaptive) | Dwell before committing a batch started while idle. Default is adaptive: 0 normally, growing to 2 ms automatically when commit completions are slow (fsync/PUT-bound) and batches are concurrent. An explicit value fixes the dwell |
 | `:max_inflight_commits` | 32 | For backends with pipelined commits (currently `Backend.Replica`): batches committing concurrently per partition; replies stay in order |
+| `:heal_timeout` | 5 s | `Backend.Replica` only: how long `open/2` waits for a replica to report its tail before it opens without healing from that node |
 
 ### Tuning for small payloads
 
@@ -129,14 +130,27 @@ application; writers start on demand, keyed by `{replica_dir, partition}`.
 integer. Commits return as soon as the ack target is met; reads are served
 from the local WAL.
 
+A primary that comes back from a crash heals itself first. With
+`fsync: false` it can lose WAL bytes a replica already has and already
+acked, so `open/2` asks every replica for its tail and pulls back anything
+it is missing from the furthest one, before the partition serves a single
+append. Pulled bytes are CRC-checked frame by frame and `datasync`ed
+whatever the `fsync:` setting is. `heal_timeout:` (5 s) bounds how long an
+unreachable replica delays startup; a replica that does not answer is not
+consulted.
+
 Every batch is stamped with `{epoch, offset}` — a per-partition epoch that
 increments on truncate (persisted in a `p<index>.meta` sidecar file) and the
 WAL byte offset where the batch starts. A replica appends a batch only when
 it lands exactly at its own WAL tail, so it can never diverge silently, and
-every failure heals the same way: the sender re-attaches, compares tails,
-and streams the replica the missing suffix of the primary's WAL before
-resuming live traffic (truncating the replica first if it missed a truncate
-or holds bytes the primary lost). A replica that was down for an hour — or
+every failure heals the same way: the sender re-attaches, compares the
+replica's tail against the primary's WAL, and streams the replica the
+missing suffix before resuming live traffic (truncating the replica first if
+it missed a truncate). A replica merely ahead of the sender's unacked
+queue — normal whenever an ack is in flight — keeps its data; the sender
+adopts its tail as that member's watermark. Each attach mints a reference
+that stamps the batches it sends, so an ack from an earlier attach is
+dropped rather than counted. A replica that was down for an hour — or
 that lost its disk entirely — catches up automatically; until it has, its
 missing acks surface as `:insufficient_acks` errors whenever the ack policy
 needs it. Primary and replica nodes must run the same `:durable_buffer`
@@ -164,7 +178,8 @@ token. If you need automatic failover, put it above this library.
 2. **Pick the most current follower.** With `ack: :all` every follower is
    complete. With `:quorum` or an integer they can differ — compare the
    `p<index>.wal` file sizes under `replica_dir` on each node and take the
-   largest, per partition.
+   largest, per partition. Note that a primary which merely *restarts* does
+   not need this: it heals itself from the followers at open.
 3. **Wait out a recent truncate.** A truncate whose `:erpc` to a follower
    failed leaves that follower holding pre-truncate data until its sender
    re-attaches. Do not promote inside that window. See F-3 in

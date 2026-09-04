@@ -17,7 +17,9 @@ defmodule DurableBuffer.Replica.Writer do
   Batches arrive either as synchronous calls (`commit/4`, used by `:erpc`)
   or as pipelined `{:replicate, epoch, offset, batch, from}` messages from a
   `DurableBuffer.Replica.Sender`, answered asynchronously with
-  `{:replica_ack, watermark}` / `{:replica_nack, reason}` sent to `from`. A
+  `{:replica_ack, ref, watermark}` / `{:replica_nack, ref, reason}` sent to
+  `from`. The `ref` is the sender's attach reference, echoed back untouched
+  so the sender can drop an ack that belongs to an earlier attach. A
   successful append acknowledges with the writer's new durability watermark
   `{epoch, offset}` — everything up to `offset` in `epoch` is on disk here.
 
@@ -59,6 +61,18 @@ defmodule DurableBuffer.Replica.Writer do
   end
 
   @doc """
+  Reads `length` bytes of this writer's WAL starting at `offset`.
+
+  Serves the primary's heal path, so it is answered in order against the
+  writer's own appends.
+  """
+  @spec read_range(GenServer.server(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, term()}
+  def read_range(server, offset, length) do
+    GenServer.call(server, {:read_range, offset, length}, :infinity)
+  end
+
+  @doc """
   Returns this writer's tail `{epoch, offset}` — where the next batch must
   land.
   """
@@ -95,13 +109,17 @@ defmodule DurableBuffer.Replica.Writer do
     {:reply, :ok, %{state | local: local, epoch: epoch}}
   end
 
+  def handle_call({:read_range, offset, length}, _from, state) do
+    {:reply, Local.read_range(state.local, offset, length), state}
+  end
+
   def handle_call(:tail, _from, state) do
     {:reply, {state.epoch, Local.offset(state.local)}, state}
   end
 
   @impl GenServer
-  def handle_info({:replicate, epoch, offset, batch, from}, state) do
-    messages = drain_replicates([{epoch, offset, batch, from}])
+  def handle_info({:replicate, ref, epoch, offset, batch, from}, state) do
+    messages = drain_replicates([{ref, epoch, offset, batch, from}])
     {:noreply, replicate_group(state, messages)}
   end
 
@@ -134,8 +152,8 @@ defmodule DurableBuffer.Replica.Writer do
 
   defp drain_replicates(acc) do
     receive do
-      {:replicate, epoch, offset, batch, from} ->
-        drain_replicates([{epoch, offset, batch, from} | acc])
+      {:replicate, ref, epoch, offset, batch, from} ->
+        drain_replicates([{ref, epoch, offset, batch, from} | acc])
     after
       0 -> Enum.reverse(acc)
     end
@@ -145,22 +163,22 @@ defmodule DurableBuffer.Replica.Writer do
     tail = Local.offset(state.local)
 
     {batches, bytes, appended, others} =
-      Enum.reduce(messages, {[], 0, [], []}, fn {epoch, offset, batch, from},
+      Enum.reduce(messages, {[], 0, [], []}, fn {ref, epoch, offset, batch, from},
                                                 {batches, bytes, appended, others} ->
         running_tail = tail + bytes
 
         cond do
           epoch == state.epoch and offset == running_tail ->
-            {[batches, batch], bytes + byte_size(batch), [from | appended], others}
+            {[batches, batch], bytes + byte_size(batch), [{from, ref} | appended], others}
 
           epoch == state.epoch and offset + byte_size(batch) <= running_tail ->
-            {batches, bytes, appended, [{from, :duplicate} | others]}
+            {batches, bytes, appended, [{{from, ref}, :duplicate} | others]}
 
           true ->
             nack =
               {:sequence_mismatch, %{expected: {state.epoch, running_tail}, got: {epoch, offset}}}
 
-            {batches, bytes, appended, [{from, {:nack, nack}} | others]}
+            {batches, bytes, appended, [{{from, ref}, {:nack, nack}} | others]}
         end
       end)
 
@@ -171,28 +189,28 @@ defmodule DurableBuffer.Replica.Writer do
         case Local.commit(state.local, batches, bytes) do
           {:ok, local} ->
             watermark = {state.epoch, Local.offset(local)}
-            reply_each(appended, {:replica_ack, watermark})
+            reply_each(appended, &{:replica_ack, &1, watermark})
             {%{state | local: local}, watermark}
 
           {:error, reason, local} ->
-            reply_each(appended, {:replica_nack, {:commit_failed, reason}})
+            reply_each(appended, &{:replica_nack, &1, {:commit_failed, reason}})
             {%{state | local: local}, {state.epoch, tail}}
         end
       end
 
-    duplicates = for {from, :duplicate} <- others, do: from
-    reply_each(duplicates, {:replica_ack, watermark})
+    duplicates = for {recipient, :duplicate} <- others, do: recipient
+    reply_each(duplicates, &{:replica_ack, &1, watermark})
 
-    for {from, {:nack, nack}} <- others do
-      send(from, {:replica_nack, nack})
+    for {{from, ref}, {:nack, nack}} <- others do
+      send(from, {:replica_nack, ref, nack})
     end
 
     state
   end
 
-  defp reply_each(froms, message) do
-    froms
+  defp reply_each(recipients, build_message) do
+    recipients
     |> Enum.uniq()
-    |> Enum.each(&send(&1, message))
+    |> Enum.each(fn {from, ref} -> send(from, build_message.(ref)) end)
   end
 end

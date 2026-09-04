@@ -168,4 +168,53 @@ defmodule DurableBuffer.Replica.SenderTest do
     assert replica_entries(tmp_dir) == ["fresh"]
     Local.close(local)
   end
+
+  test "drops an ack that belongs to an earlier attach", %{tmp_dir: tmp_dir} do
+    {primary_dir, _replica_dir} = dirs(tmp_dir)
+    local = open_primary(primary_dir)
+    sender = start_sender(tmp_dir, [])
+
+    commit_both(local, sender, entry("replicated"))
+    assert_receive {:backend, {:watermark, _node, {0, _offset}}}, 1000
+
+    send(sender, {:replica_ack, make_ref(), {0, 999_999}})
+
+    refute_receive {:backend, {:watermark, _node, {0, 999_999}}}, 200
+
+    Sender.stop(sender)
+    Local.close(local)
+  end
+
+  test "adopts the replica tail on attach instead of truncating it", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+    local = open_primary(primary_dir)
+    sender = start_sender(tmp_dir, [])
+
+    kept = entry("on-both")
+    ahead = entry("already-durable-on-the-replica")
+
+    local = commit_both(local, sender, kept)
+    await_watermark({0, byte_size(kept)})
+    flush_watermarks()
+
+    GenServer.stop(DurableBuffer.Replica.writer_pid(replica_dir, 0, true))
+
+    :ok = Sender.commit(sender, 0, byte_size(kept), ahead)
+    {:ok, _watermark} = DurableBuffer.Replica.commit(replica_dir, 0, 0, byte_size(kept), ahead)
+
+    assert_receive {:backend, {:watermark, _node, watermark}}, 5000
+    assert watermark == {0, byte_size(kept) + byte_size(ahead)}
+    assert replica_entries(tmp_dir) == ["on-both", "already-durable-on-the-replica"]
+
+    Sender.stop(sender)
+    Local.close(local)
+  end
+
+  defp flush_watermarks do
+    receive do
+      {:backend, {:watermark, _node, _watermark}} -> flush_watermarks()
+    after
+      50 -> :ok
+    end
+  end
 end

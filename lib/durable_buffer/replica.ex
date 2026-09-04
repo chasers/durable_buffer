@@ -36,6 +36,19 @@ defmodule DurableBuffer.Replica do
   end
 
   @doc """
+  Reads `length` bytes of the replica WAL for `{dir, partition_index}`
+  starting at `offset`.
+
+  Called over `:erpc` by `DurableBuffer.Backend.Replica` when a restarted
+  primary heals the WAL tail it lost from a replica that still holds it.
+  """
+  @spec read_range(Path.t(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, term()}
+  def read_range(dir, partition_index, offset, length) do
+    Writer.read_range(ensure_writer(dir, partition_index), offset, length)
+  end
+
+  @doc """
   Returns the pid of the writer for `{dir, partition_index}`, starting it if
   needed. `fsync` applies only when this call starts the writer (an
   already-running writer keeps its setting).
