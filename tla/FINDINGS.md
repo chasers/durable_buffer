@@ -18,11 +18,19 @@ Models one partition of the replicated-disk backend across three processes:
 | `ResyncStep` | `Replica.Sender.handle_info(:resync_step, _)` |
 | `Detach` | `Replica.Sender.force_reattach/1` |
 | `Overflow` | `Replica.Sender.handle_cast/2`, the `:max_sender_bytes` branch |
+| `Trim` | `Backend.Replica.trim/2`, with best-effort `:erpc` propagation |
 | `Crash` | the primary loses the WAL tail it never `datasync`ed |
 
 One batch is one byte, so a WAL byte offset is a sequence index and a batch id
 also identifies its content. Channels are ordered, matching Erlang's per-pair
 message ordering.
+
+Byte offsets are **logical**: they count from the first byte ever written
+rather than from the start of the file, so `pBase` and `rBase[r]` say where
+each member's retained bytes begin. Adding retention to the code without
+adding it here would have left the spec quietly checking a protocol the code
+no longer runs — `NoConflict` compared `pWal[i]` to `rWal[r][i]`, which is
+only right while both start at zero.
 
 ### What passes
 
@@ -249,6 +257,42 @@ written before the restart. `Replication_gatedread` therefore models the
 crash and the heal, and the invariant holds — but the property it proves is
 about the in-flight window.
 
+## Retention
+
+`Replication_trim` runs the whole protocol with a trim in it: crashes, the
+open-time heal, gated reads, message loss and a best-effort trim `:erpc`
+that reaches an arbitrary subset of replicas. All six invariants hold,
+including two added for it:
+
+- `ReplicaBaseNotAhead` — a replica never trims past the primary. It only
+  ever adopts the primary's base, by propagation or by a rebase at attach.
+- `CursorInRange` — a resync never reads outside the file it opened.
+
+The one modelling subtlety worth writing down: a resync opens the WAL once
+and keeps that fd, so a trim that unlinks the file does not stop it
+mid-stream — it reads on through the old inode. The spec keeps `pDropped`
+alongside `pWal` for exactly that, and `resyncBase[r]` records the base each
+running resync opened at, so a resync that *starts* after a trim cannot
+reach the dropped bytes while one already under way can.
+
+`Replication_trimskew` is the negative control: a trim that cuts a replica's
+bytes without advancing its base. `ReadsAreDurable` fails, because the
+primary then counts a replica as holding logical offsets it no longer has.
+That is the accounting the whole logical-offset design rests on.
+
+### What this could not prove
+
+Two defences in the code have **no safety control**, and removing either one
+leaves every invariant green:
+
+- The `remote < pBase` rebase branch in `reconcile/2`. Without it a replica
+  below the base is nacked forever and never recovers. That is a liveness
+  failure, and `Spec` still has no fairness — the same wall as F-3. An
+  Elixir test covers it, because a test can simply wait for convergence.
+- The `max(cursor, base)` clamp in `start_resync/2`, which turns out to be
+  redundant: the rebase branch already guarantees `remote >= pBase` by the
+  time the clamp runs. It is harmless belt-and-braces, now known to be so.
+
 ## Not modeled yet
 
 - Replica-side crashes. Only the primary loses an unsynced tail today.
@@ -256,9 +300,14 @@ about the in-flight window.
   but every config runs one replica through the crash path.
 - More than one truncate, and more than one primary crash, per behavior.
 - Liveness. Every config checks a state invariant. `Spec` has no fairness, so
-  "every replica *eventually* adopts the epoch" is not checked — only that
-  the primary never claims one that has not. Adding `WF_vars` to the healing
-  actions is the follow-up.
+  neither "every replica *eventually* adopts the epoch" nor "a replica below
+  the trimmed base *eventually* rebases" is checked. Adding `WF_vars` to the
+  healing actions is the follow-up, and it now has two customers.
+- Logical entry offsets, seek and acks. `Replication.tla` models bytes. The
+  offset-stability property — a given offset never names two different
+  entries, across failed commits, truncate, trim and restart — wants its own
+  spec, with "a synchronously failed commit does not rewind" as its negative
+  control.
 - The WAL frame layer: CRC torn-tail recovery in `DurableBuffer.WAL`.
 - Group-commit batching and the adaptive flush dwell in
   `DurableBuffer.Partition.Committer`.

@@ -28,7 +28,8 @@ negative control, or a documented finding on code as it stands today. A new
 config must be added to `expected.tsv`, and a fix that changes a result must
 update it in the same change.
 
-The whole gate takes about a minute. `Replication_quorum` is most of it.
+The whole gate takes about a minute and a half. `Replication_quorum` is most
+of it.
 
 ## Layout
 
@@ -49,6 +50,8 @@ property is load-bearing.
 | `Replication_nocrash` | truncate + loss, `fsync: false`, no crash | PASS |
 | `Replication_adopt` | the adopted-epoch report across a failed truncate `:erpc` | PASS |
 | `Replication_gatedread` | the same read check with `GateReads = TRUE` | PASS |
+| `Replication_trim` | the whole protocol with retention: trim, crash, heal, loss | PASS |
+| `Replication_trimskew` | a trim that cuts a replica without advancing its base | VIOLATED (control) |
 | `Replication_heal` | `fsync: false` + crash, with the open-time heal, the attach reference and the reconcile fix | PASS |
 | `Replication` | `fsync: false` + primary crash, `AckedInPrimary` | VIOLATED — F-1 |
 | `Replication_ahead` | same, `AckedSomewhere`, heal off | VIOLATED — F-2 |
@@ -71,6 +74,8 @@ Invariants:
   persisted.
 - `PromotableIsClean` — a replica reported as promotable holds no
   pre-truncate data.
+- `ReplicaBaseNotAhead` — a replica never trims past the primary.
+- `CursorInRange` — a resync never reads outside the file it opened.
 
 ## Conventions
 
