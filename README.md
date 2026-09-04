@@ -72,8 +72,9 @@ than resetting to zero, so a resumed consumer can never silently read
 different data at the same offset. They survive a restart: a partition
 recovers its count from the WAL on open.
 
-Use `:first` to detect that a resume point predates retention and fall back
-to a full resync, instead of silently replaying from the trim point.
+Compare a resume point against `:first` to detect that it predates
+retention. `stream/3` checks it too, and raises
+`DurableBuffer.OutOfRangeError` rather than replaying from the trim point.
 
 ### Consumer positions
 
@@ -85,16 +86,24 @@ offset outside the log:
 ```elixir
 from = MyApp.Cursor.load("worker-1") || 0
 
-for {offset, payload} <-
-      DurableBuffer.stream(:events, user_id, from: from, with_offsets: true) do
-  handle(payload)
-  MyApp.Cursor.save("worker-1", offset + 1)
+try do
+  for {offset, payload} <-
+        DurableBuffer.stream(:events, user_id, from: from, with_offsets: true) do
+    handle(payload)
+    MyApp.Cursor.save("worker-1", offset + 1)
+  end
+rescue
+  error in DurableBuffer.OutOfRangeError -> resync_from(error.first)
 end
 ```
 
-Compare `from` against `offsets/2`'s `:first` before you resume. A resume
-point below `:first` predates retention, so the consumer resyncs in full
-rather than replaying silently from the trim point.
+**A read below `:first` raises.** Starting at the retained base instead
+would hand the consumer a contiguous-looking stream with a hole in it, and
+nothing else protects a consumer that falls behind the retention window.
+`DurableBuffer.OutOfRangeError` names the offset asked for and the oldest
+one retained, so the caller resyncs deliberately. `stream/3` reads the
+bounds before it builds the stream, so the raise lands at the call rather
+than part-way through iterating.
 
 ### Retention
 

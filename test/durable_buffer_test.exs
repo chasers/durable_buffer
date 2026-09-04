@@ -659,6 +659,61 @@ defmodule DurableBufferTest do
     end
   end
 
+  describe "reads below the retained base" do
+    setup %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..9} = DurableBuffer.append_batch(name, "k", Enum.map(0..9, &"e#{&1}"))
+      :ok = DurableBuffer.trim(name, "k", upto: 6)
+      %{name: name}
+    end
+
+    test "raise when the stream is built, rather than starting at the base", %{name: name} do
+      assert_raise DurableBuffer.OutOfRangeError, fn ->
+        DurableBuffer.stream(name, "k", from: 2)
+      end
+    end
+
+    test "name the requested offset and the oldest retained one", %{name: name} do
+      error =
+        assert_raise DurableBuffer.OutOfRangeError, fn ->
+          DurableBuffer.stream(name, "k", from: 2)
+        end
+
+      assert error.requested == 2
+      assert error.first == 6
+      assert error.partition_index == 0
+      assert error.name == name
+      assert Exception.message(error) =~ "no longer retains offset 2"
+      assert Exception.message(error) =~ "oldest retained offset is 6"
+    end
+
+    test "read from :first itself", %{name: name} do
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 6)) == ~w(e6 e7 e8 e9)
+    end
+
+    test "read without :from", %{name: name} do
+      assert Enum.to_list(DurableBuffer.stream(name, "k")) == ~w(e6 e7 e8 e9)
+    end
+
+    test "a dirty read below the base still raises", %{name: name} do
+      assert_raise DurableBuffer.OutOfRangeError, fn ->
+        DurableBuffer.stream(name, "k", from: 2, dirty: true)
+      end
+    end
+
+    test "a truncate puts every earlier offset out of range", %{tmp_dir: tmp_dir} do
+      name = start_buffer(Path.join(tmp_dir, "truncated"), partitions: 1)
+      {:ok, 0..2} = DurableBuffer.append_batch(name, "k", ~w(a b c))
+      :ok = DurableBuffer.truncate(name, "k")
+
+      assert_raise DurableBuffer.OutOfRangeError, fn ->
+        DurableBuffer.stream(name, "k", from: 1)
+      end
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: 3)) == []
+    end
+  end
+
   describe "review regressions" do
     test "a pre-trim index never mislabels offsets", %{tmp_dir: tmp_dir} do
       name = start_buffer(tmp_dir, partitions: 1)
@@ -670,11 +725,11 @@ defmodule DurableBufferTest do
       index = Path.join(tmp_dir, "p0.idx")
       stale = File.read!(index)
 
-      :ok = DurableBuffer.trim(name, "k", upto: 10)
+      :ok = DurableBuffer.trim(name, "k", upto: 11)
       File.write!(index, stale)
 
-      assert Enum.take(DurableBuffer.stream(name, "k", from: 5, with_offsets: true), 2) ==
-               [{10, "e10"}, {11, "e11"}]
+      assert Enum.take(DurableBuffer.stream(name, "k", from: 11, with_offsets: true), 2) ==
+               [{11, "e11"}, {12, "e12"}]
 
       assert Enum.take(DurableBuffer.stream(name, "k", from: 15, with_offsets: true), 2) ==
                [{15, "e15"}, {16, "e16"}]

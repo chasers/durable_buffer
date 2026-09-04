@@ -167,7 +167,10 @@ defmodule DurableBuffer do
   Options:
 
     * `:from` — start at this logical offset, inclusive. A consumer keeps
-      its own cursor and resumes with `from: last_processed + 1`.
+      its own cursor and resumes with `from: last_processed + 1`. An offset
+      below `offsets/2`'s `:first` raises `DurableBuffer.OutOfRangeError`
+      rather than silently starting at the base, so a consumer that fell
+      outside the retention window resyncs deliberately.
     * `:with_offsets` — yield `{offset, payload}` instead of `payload`.
     * `:dirty` — read the whole local WAL, including batches that have not
       met the policy and may still fail. Recovery tooling wants this;
@@ -177,6 +180,7 @@ defmodule DurableBuffer do
   def stream(name, partition_key, opts \\ []) do
     %{backend: {backend, backend_config}} = buffer = config(name)
     index = partition_index(name, partition_key)
+    :ok = check_in_range(buffer, name, index, Keyword.get(opts, :from))
 
     if Backend.gates_reads?(backend) or Backend.tracks_offsets?(backend) do
       backend.stream(backend_config, index, stream_opts(buffer, index, backend, opts))
@@ -193,9 +197,10 @@ defmodule DurableBuffer do
       durability guarantee. This is where a reader's view ends.
     * `:next` — where the next append lands.
 
-  On a quiet buffer `:durable` and `:next` are equal. Use `:first` to detect
-  that a resume point predates retention and fall back to a full resync,
-  rather than silently replaying from the trim point.
+  On a quiet buffer `:durable` and `:next` are equal. Compare a resume point
+  against `:first` to detect that it predates retention. `stream/3` checks
+  it too, and raises `DurableBuffer.OutOfRangeError` rather than replaying
+  from the trim point.
   """
   @spec offsets(atom(), term()) :: %{
           first: non_neg_integer(),
@@ -364,6 +369,22 @@ defmodule DurableBuffer do
         }
   def config(name) do
     :persistent_term.get({DurableBuffer, name})
+  end
+
+  defp check_in_range(_buffer, _name, _index, nil), do: :ok
+
+  defp check_in_range(buffer, name, index, from) do
+    first = :atomics.get(Map.fetch!(buffer, :durable_offsets), index * 4 + 4)
+
+    if from < first do
+      raise DurableBuffer.OutOfRangeError,
+        name: name,
+        partition_index: index,
+        requested: from,
+        first: first
+    end
+
+    :ok
   end
 
   defp stream_opts(buffer, index, backend, opts) do
