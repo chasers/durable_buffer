@@ -5,10 +5,17 @@ defmodule DurableBuffer.Replica.Sender do
   Owns a long-lived, ordered channel to the remote
   `DurableBuffer.Replica.Writer` and pipelines batches over it without
   waiting for acks, so a slow or dead replica never blocks the commit path —
-  it only stalls its own channel (sends block this process when the
-  distribution buffer to the replica is full, which is the intended
-  backpressure). Acks come back as durability watermarks and are forwarded
-  to the owner as `{:backend, {:watermark, node, watermark}}` messages.
+  it only stalls its own channel. Acks come back as durability watermarks
+  and are forwarded to the owner as `{:backend, {:watermark, node,
+  watermark}}` messages.
+
+  Batches go out over a `DurableBuffer.Transport`, resolved to a channel
+  once per attach. The default, `DurableBuffer.Transport.Distribution`,
+  sends to the remote writer pid, and those sends block this process when
+  the distribution buffer to the replica is full — the intended
+  backpressure. Everything else here stays on distribution whatever the
+  transport is: the `:erpc` attach and truncate, the acks, and the
+  `Process.monitor/1` that forces a re-attach when the writer dies.
 
   On every (re)connect the sender attaches with the remote writer's tail
   `{epoch, offset}` and reconciles against the primary's own WAL, not
@@ -97,7 +104,9 @@ defmodule DurableBuffer.Replica.Sender do
        rpc_timeout: Keyword.fetch!(opts, :rpc_timeout),
        max_bytes: Keyword.fetch!(opts, :max_bytes),
        fsync: Keyword.get(opts, :fsync, false),
+       transport: Keyword.get(opts, :transport, DurableBuffer.Transport.Distribution),
        writer: nil,
+       channel: nil,
        monitor: nil,
        attach_ref: nil,
        mode: :live,
@@ -163,6 +172,8 @@ defmodule DurableBuffer.Replica.Sender do
         state = %{
           state
           | writer: writer,
+            channel:
+              state.transport.channel(state.node, state.dir, state.partition_index, writer),
             monitor: monitor,
             attach_ref: make_ref(),
             primary_base: primary_base(state)
@@ -180,7 +191,7 @@ defmodule DurableBuffer.Replica.Sender do
     {:noreply, state}
   end
 
-  def handle_info(:resync_step, %{mode: :resync, writer: writer} = state) when writer != nil do
+  def handle_info(:resync_step, %{mode: :resync, channel: channel} = state) when channel != nil do
     target = next_needed(state)
     cursor = state.resync_cursor
 
@@ -197,7 +208,7 @@ defmodule DurableBuffer.Replica.Sender do
                min(@resync_chunk_bytes, target - cursor)
              ) do
           {:ok, data} when byte_size(data) > 0 ->
-            send(state.writer, {:replicate, state.attach_ref, state.epoch, cursor, data, self()})
+            :ok = send_batch(state, state.epoch, cursor, data)
             send(self(), :resync_step)
             {:noreply, %{state | resync_cursor: cursor + byte_size(data)}}
 
@@ -262,7 +273,7 @@ defmodule DurableBuffer.Replica.Sender do
     state = %{state | progress_check: nil}
 
     if not :queue.is_empty(state.queue) and state.watermark == watermark_at_send and
-         state.mode == :live and state.writer != nil do
+         state.mode == :live and state.channel != nil do
       {:noreply, force_reattach(state)}
     else
       {:noreply, ensure_progress_check(state)}
@@ -401,7 +412,7 @@ defmodule DurableBuffer.Replica.Sender do
     if state.monitor, do: Process.demonitor(state.monitor, [:flush])
     state = close_resync(state)
     Process.send_after(self(), :connect, delay)
-    %{state | writer: nil, monitor: nil, attach_ref: nil, mode: :live}
+    %{state | writer: nil, channel: nil, monitor: nil, attach_ref: nil, mode: :live}
   end
 
   defp close_resync(%{resync_fd: nil} = state), do: state
@@ -411,11 +422,22 @@ defmodule DurableBuffer.Replica.Sender do
     %{state | resync_fd: nil, resync_cursor: nil}
   end
 
-  defp send_entry(%{writer: nil} = state, _entry), do: state
+  defp send_entry(%{channel: nil} = state, _entry), do: state
 
   defp send_entry(state, {epoch, offset, binary}) do
-    send(state.writer, {:replicate, state.attach_ref, epoch, offset, binary, self()})
+    :ok = send_batch(state, epoch, offset, binary)
     state
+  end
+
+  defp send_batch(state, epoch, offset, binary) do
+    state.transport.send_batch(
+      state.channel,
+      state.attach_ref,
+      epoch,
+      offset,
+      binary,
+      self()
+    )
   end
 
   defp resend_queue(state) do

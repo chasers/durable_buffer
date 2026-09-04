@@ -232,6 +232,7 @@ use more partitions to saturate your disk.
 | `:flush_delay_ms` | 0 (adaptive) | Dwell before committing a batch started while idle. Default is adaptive: 0 normally, growing to 2 ms automatically when commit completions are slow (fsync/PUT-bound) and batches are concurrent. An explicit value fixes the dwell |
 | `:max_inflight_commits` | 32 | For backends with pipelined commits (currently `Backend.Replica`): batches committing concurrently per partition; replies stay in order |
 | `:heal_timeout` | 5 s | `Backend.Replica` only: how long `open/2` waits for a replica to report its tail before it opens without healing from that node |
+| `:transport` | `Transport.Distribution` | `Backend.Replica` only: the wire replicated batches travel on. See [Transports](#transports) |
 | `:retention_ms` | none | Keep at most this much history per partition. `trim/2` with no options drops batches that committed longer ago |
 | `:retention_bytes` | none | Keep at most this many bytes per partition. Whichever bound binds first decides |
 | `:retention_interval_ms` | 60 s | How often each partition applies its policy on its own. Declaring a bound turns the timer on; `:infinity` turns it off and leaves `trim/2` manual. Must be a positive integer or `:infinity` |
@@ -319,6 +320,29 @@ whatever has queued on its channel into a single write + fsync — so a slow
 or dead replica stalls only its own channel, never the commit path. Replica
 nodes need no configuration beyond running the `:durable_buffer`
 application; writers start on demand, keyed by `{replica_dir, partition}`.
+
+#### Transports
+
+`transport:` decides what carries replicated batches. It defaults to
+`DurableBuffer.Transport.Distribution`, which sends them to the remote
+writer over the Erlang distribution channel — the behaviour every earlier
+version had.
+
+Only the batches use it. The control path (attach, truncate, trim, remote
+tail, remote read) and the acks stay on distribution whatever `transport:`
+says. They are small request/reply round trips, so they block nothing, and
+keeping them on distribution is what lets the sender detect a dead replica
+with an ordinary `Process.monitor/1` on the remote writer.
+
+The reason to change it is head-of-line blocking. Distribution is **one TCP
+connection per node pair**, shared by every process on those nodes. An
+8-partition buffer under load is 8 senders pushing batches through the same
+socket that carries the cluster heartbeat. A starved heartbeat reads as a
+node going down, which is the event replication exists to survive.
+
+A transport must deliver batches to one replica in the order they were sent.
+A replica appends a batch only when it lands exactly at its WAL tail, so a
+reordered pair costs a full resync.
 
 `ack:` controls when a commit counts as durable (the local write is one ack):
 `:all` (default), `:quorum` (majority of `1 + length(replicas)`), or an

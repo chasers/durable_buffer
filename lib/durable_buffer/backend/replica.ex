@@ -33,6 +33,14 @@ defmodule DurableBuffer.Backend.Replica do
   primary and every replica before it is acked, at a significant throughput
   cost when many partitions share a disk.
 
+  Batches reach replicas over `transport:`, which defaults to
+  `DurableBuffer.Transport.Distribution` — plain Erlang distribution, the
+  behaviour every earlier version had. Only the batches use it. The control
+  path (attach, truncate, trim, remote tail, remote read) and the acks stay
+  on distribution whatever `transport:` says, because they are small and
+  because the sender's liveness check is a `Process.monitor/1` on the remote
+  writer. See `DurableBuffer.Transport`.
+
   Every batch is stamped with `{epoch, offset}` — the partition's epoch
   (bumped on truncate, persisted via `DurableBuffer.Meta`) and the WAL byte
   offset at which the batch starts. Replica writers append a batch only when
@@ -95,8 +103,25 @@ defmodule DurableBuffer.Backend.Replica do
       rpc_timeout: Keyword.get(opts, :rpc_timeout, 15_000),
       max_sender_bytes: Keyword.get(opts, :max_sender_bytes, 64 * 1024 * 1024),
       heal_timeout: Keyword.get(opts, :heal_timeout, 5_000),
-      fsync: Keyword.get(opts, :fsync, false)
+      fsync: Keyword.get(opts, :fsync, false),
+      transport: transport!(Keyword.get(opts, :transport, DurableBuffer.Transport.Distribution))
     }
+  end
+
+  defp transport!(module) when is_atom(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :send_batch, 6) and
+         function_exported?(module, :channel, 4) do
+      module
+    else
+      raise ArgumentError,
+            "transport: #{inspect(module)} does not implement DurableBuffer.Transport. " <>
+              "Pass a module exporting channel/4 and send_batch/6, or omit the option " <>
+              "to use DurableBuffer.Transport.Distribution."
+    end
+  end
+
+  defp transport!(other) do
+    raise ArgumentError, "transport: expects a module, got #{inspect(other)}"
   end
 
   @impl DurableBuffer.Backend
@@ -125,7 +150,8 @@ defmodule DurableBuffer.Backend.Replica do
             epoch: epoch,
             rpc_timeout: config.rpc_timeout,
             max_bytes: config.max_sender_bytes,
-            fsync: config.fsync
+            fsync: config.fsync,
+            transport: config.transport
           )
 
         {node, sender}
