@@ -72,6 +72,15 @@ recovers its count from the WAL on open.
 Use `:first` to detect that a resume point predates retention and fall back
 to a full resync, instead of silently replaying from the trim point.
 
+`from:` seeks rather than scans. The local backend keeps a sparse index
+(`p<index>.idx`, one 20-byte record per group commit) and binary-searches it
+for the last batch at or before the wanted offset. The index is a pure
+cache: it is written on the commit path but never `datasync`ed, and any
+record the WAL does not back is dropped when the partition opens. A missing,
+stale, torn or corrupt index costs a scan from the start of the log — never
+a wrong answer. S3 needs no index at all: its segment keys *are* offsets, so
+a seek picks the floor key from the listing it already does.
+
 The `partition_key` (any term) is hashed to one of a fixed number of
 partitions (default `System.schedulers_online()`). Each partition has its own
 writer, WAL, and backend state, so partitions commit fully in parallel —
@@ -126,7 +135,8 @@ without waiting for commit boundaries.
 Append-only WAL file per partition (`p<index>.wal`), one write + one
 `:file.datasync/1` per group commit. Entries are framed as
 `<<len::32, crc32::32, payload>>`; torn tails from crashes are detected by
-CRC and truncated on open.
+CRC and truncated on open. Two sidecars sit next to it: `p<index>.meta`
+(epoch and retention bounds) and `p<index>.idx` (the sparse seek index).
 
 `fsync: false` skips the `datasync` — commits then survive a BEAM crash but
 not an OS crash or power loss. Defaults to `true` for this backend: with a
@@ -292,12 +302,6 @@ once its PUT succeeded.
 Credentials come from `req_options` or the standard `AWS_*` environment
 variables; point `aws_endpoint_url_s3:` at MinIO or another S3-compatible
 store. In tests, pass `req_options: [plug: {Req.Test, YourStub}]`.
-
-**Upgrading an S3 buffer to 0.4.0:** segment keys changed meaning. Before
-0.4.0 they were a commit counter; now they are the segment's first logical
-entry offset. An existing bucket would be misread, since a counter of 1 does
-not mean one entry. Drain the partition (`truncate/3`) before upgrading —
-there is no migration.
 
 S3's high PUT latency is where group commit matters most: while one PUT is
 in flight, every arriving append queues into the next segment, so throughput

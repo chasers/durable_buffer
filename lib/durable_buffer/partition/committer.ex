@@ -124,7 +124,13 @@ defmodule DurableBuffer.Partition.Committer do
     tag = make_ref()
 
     state =
-      case state.backend.commit_async(state.backend_state, batch, byte_size, tag) do
+      case state.backend.commit_async(
+             state.backend_state,
+             batch,
+             byte_size,
+             {assigned_from, next_offset - assigned_from},
+             tag
+           ) do
         {:done, result, backend_state} ->
           %{
             state
@@ -162,7 +168,12 @@ defmodule DurableBuffer.Partition.Committer do
     batch = for {:entries, _from, entries, _count, _shape, _first} <- units, do: entries
 
     {reply, backend_state} =
-      case state.backend.commit(state.backend_state, batch, byte_size) do
+      case state.backend.commit(
+             state.backend_state,
+             batch,
+             byte_size,
+             {assigned_from, next_offset - assigned_from}
+           ) do
         {:ok, backend_state} -> {:ok, backend_state}
         {:error, reason, backend_state} -> {{:error, reason}, backend_state}
       end

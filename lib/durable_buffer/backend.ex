@@ -3,18 +3,19 @@ defmodule DurableBuffer.Backend do
   Behaviour for durability backends.
 
   A backend instance is owned by a single `DurableBuffer.Partition` writer.
-  `commit/3` receives an already-framed batch of WAL entries and must not
-  return `{:ok, state}` until the batch is durable per the backend's
-  guarantee (fsync, replica acks, S3 PUT).
+  `commit/4` receives an already-framed batch of WAL entries, the span of
+  logical offsets it occupies, and must not return `{:ok, state}` until the
+  batch is durable per the backend's guarantee (fsync, replica acks, S3
+  PUT).
 
   A backend may additionally implement the asynchronous commit contract —
-  `commit_async/4` and `handle_message/2` — to let commits overlap:
-  `commit_async/4` submits a batch and returns either `{:done, result,
+  `commit_async/5` and `handle_message/2` — to let commits overlap:
+  `commit_async/5` submits a batch and returns either `{:done, result,
   state}` (settled immediately) or `{:pending, state}` (settled later). A
   pending commit settles when a `{:backend, message}` message arrives at the
   owning process and `handle_message/2` returns its tag in the completions
   list. Any timers or acknowledgement traffic the backend needs must be
-  addressed to `self()` at `commit_async/4` time, wrapped as `{:backend,
+  addressed to `self()` at `commit_async/5` time, wrapped as `{:backend,
   message}`. `DurableBuffer.Partition.Committer` uses this contract when
   available to pipeline commits, replying to callers strictly in submission
   order.
@@ -24,6 +25,13 @@ defmodule DurableBuffer.Backend do
   @type state :: term()
   @type tag :: term()
   @type result :: :ok | {:error, term()}
+
+  @typedoc """
+  Where a batch lands in the logical log: the offset of its first entry and
+  how many entries it carries. Backends that name or index data by offset
+  need it; the rest ignore it.
+  """
+  @type span :: {first_offset :: non_neg_integer(), count :: non_neg_integer()}
 
   @typedoc """
   Returns the byte offset through which the partition's data currently meets
@@ -48,10 +56,15 @@ defmodule DurableBuffer.Backend do
 
   @callback init_config(keyword()) :: config()
   @callback open(config(), partition_index :: non_neg_integer()) :: {:ok, state()}
-  @callback commit(state(), batch :: iodata(), byte_size :: non_neg_integer()) ::
+  @callback commit(state(), batch :: iodata(), byte_size :: non_neg_integer(), span()) ::
               {:ok, state()} | {:error, term(), state()}
-  @callback commit_async(state(), batch :: iodata(), byte_size :: non_neg_integer(), tag()) ::
-              {:done, result(), state()} | {:pending, state()}
+  @callback commit_async(
+              state(),
+              batch :: iodata(),
+              byte_size :: non_neg_integer(),
+              span(),
+              tag()
+            ) :: {:done, result(), state()} | {:pending, state()}
   @callback handle_message(message :: term(), state()) :: {[{tag(), result()}], state()}
   @callback stream(config(), partition_index :: non_neg_integer()) :: Enumerable.t()
   @callback stream(config(), partition_index :: non_neg_integer(), opts :: keyword()) ::
@@ -61,7 +74,7 @@ defmodule DurableBuffer.Backend do
   @callback truncate(state(), next_offset :: non_neg_integer()) :: {:ok, state()}
   @callback close(state()) :: :ok
 
-  @optional_callbacks commit_async: 4,
+  @optional_callbacks commit_async: 5,
                       handle_message: 2,
                       stream: 3,
                       durable_offset: 1,
@@ -105,7 +118,7 @@ defmodule DurableBuffer.Backend do
   """
   @spec async?(module()) :: boolean()
   def async?(module) do
-    function_exported?(module, :commit_async, 4) and
+    function_exported?(module, :commit_async, 5) and
       function_exported?(module, :handle_message, 2)
   end
 end

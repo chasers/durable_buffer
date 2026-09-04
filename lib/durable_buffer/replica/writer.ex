@@ -37,6 +37,8 @@ defmodule DurableBuffer.Replica.Writer do
   alias DurableBuffer.Backend.Local
   alias DurableBuffer.Meta
 
+  @mirrored {0, 0}
+
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
   end
@@ -85,7 +87,7 @@ defmodule DurableBuffer.Replica.Writer do
   def init(opts) do
     dir = Keyword.fetch!(opts, :dir)
     partition_index = Keyword.fetch!(opts, :partition_index)
-    config = Local.init_config(dir: dir, fsync: Keyword.get(opts, :fsync, true))
+    config = Local.init_config(dir: dir, fsync: Keyword.get(opts, :fsync, true), index: false)
     {:ok, local} = Local.open(config, partition_index)
 
     {:ok,
@@ -133,7 +135,7 @@ defmodule DurableBuffer.Replica.Writer do
 
     cond do
       {epoch, offset} == {state.epoch, tail} ->
-        case Local.commit(state.local, batch, byte_size(batch)) do
+        case Local.commit(state.local, batch, byte_size(batch), @mirrored) do
           {:ok, local} ->
             {{:ok, {state.epoch, Local.offset(local)}}, %{state | local: local}}
 
@@ -186,7 +188,7 @@ defmodule DurableBuffer.Replica.Writer do
       if bytes == 0 do
         {state, {state.epoch, tail}}
       else
-        case Local.commit(state.local, batches, bytes) do
+        case Local.commit(state.local, batches, bytes, @mirrored) do
           {:ok, local} ->
             watermark = {state.epoch, Local.offset(local)}
             reply_each(appended, &{:replica_ack, &1, watermark})

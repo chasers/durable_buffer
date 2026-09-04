@@ -47,7 +47,7 @@ defmodule DurableBuffer.Replica.SenderTest do
 
   defp commit_both(local, sender, binary) do
     offset = Local.offset(local)
-    {:ok, local} = Local.commit(local, binary, byte_size(binary))
+    {:ok, local} = Local.commit(local, binary, byte_size(binary), {offset, 1})
     :ok = Sender.commit(sender, 0, offset, binary)
     local
   end
@@ -101,8 +101,23 @@ defmodule DurableBuffer.Replica.SenderTest do
   test "resyncs a fresh replica from the primary WAL on attach", %{tmp_dir: tmp_dir} do
     {primary_dir, _replica_dir} = dirs(tmp_dir)
     local = open_primary(primary_dir)
-    {:ok, local} = Local.commit(local, entry("old-one"), byte_size(entry("old-one")))
-    {:ok, local} = Local.commit(local, entry("old-two"), byte_size(entry("old-two")))
+
+    {:ok, local} =
+      Local.commit(
+        local,
+        entry("old-one"),
+        byte_size(entry("old-one")),
+        {Local.offsets(local).next, 1}
+      )
+
+    {:ok, local} =
+      Local.commit(
+        local,
+        entry("old-two"),
+        byte_size(entry("old-two")),
+        {Local.offsets(local).next, 1}
+      )
+
     tail = Local.offset(local)
 
     _sender = start_sender(tmp_dir, primary_tail: tail)
@@ -161,7 +176,7 @@ defmodule DurableBuffer.Replica.SenderTest do
     :ok = DurableBuffer.Replica.truncate(replica_dir, 0, 1)
 
     fresh = entry("fresh")
-    {:ok, local} = Local.commit(local, fresh, byte_size(fresh))
+    {:ok, local} = Local.commit(local, fresh, byte_size(fresh), {Local.offsets(local).next, 1})
     :ok = Sender.commit(sender, 1, 0, fresh)
 
     await_watermark({1, byte_size(fresh)})

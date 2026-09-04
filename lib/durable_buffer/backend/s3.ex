@@ -10,9 +10,12 @@ defmodule DurableBuffer.Backend.S3 do
   an object exists only once its PUT succeeded.
 
   The key is the segment's first logical entry offset, zero-padded so keys
-  sort in offset order. Offsets therefore resume from a LIST plus one GET of
-  the newest segment on open, and a truncate records the new base in a
-  sibling `base` object so offsets stay monotonic across it.
+  sort in offset order. That makes the key list its own seek index: a
+  `from:` read picks the last segment starting at or before the wanted
+  offset and skips the few entries inside it, with no extra state to keep.
+  Offsets resume from a LIST plus one GET of the newest segment on open, and
+  a truncate records the new base in a sibling `base` object so offsets stay
+  monotonic across it.
 
   S3 PUT latency is high relative to disk, which makes group commit the whole
   ballgame: while one PUT is in flight every new append queues into the next
@@ -85,14 +88,13 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   @impl DurableBuffer.Backend
-  def commit(state, batch, _byte_size) do
-    key = object_key(state.config, state.partition_index, state.next_offset)
+  def commit(state, batch, _byte_size, {first_offset, count}) do
+    key = object_key(state.config, state.partition_index, first_offset)
     binary = IO.iodata_to_binary(batch)
-    {payloads, _valid, _rest} = WAL.decode_all(binary)
 
     case Req.put(state.req, url: "s3://#{state.config.bucket}/#{key}", body: binary) do
       {:ok, %Req.Response{status: status}} when status in 200..299 ->
-        {:ok, %{state | next_offset: state.next_offset + length(payloads)}}
+        {:ok, %{state | next_offset: first_offset + count}}
 
       {:ok, %Req.Response{status: status}} ->
         {:error, {:unexpected_status, status}, state}
@@ -104,11 +106,13 @@ defmodule DurableBuffer.Backend.S3 do
 
   @impl DurableBuffer.Backend
   def stream(config, partition_index) do
+    req = build_req(config)
+    stream_keys(req, config, list_keys(req, config, partition_index))
+  end
+
+  defp stream_keys(req, config, keys) do
     Stream.resource(
-      fn ->
-        req = build_req(config)
-        {req, list_keys(req, config, partition_index)}
-      end,
+      fn -> {req, keys} end,
       fn
         {_req, []} ->
           {:halt, :done}
@@ -127,16 +131,36 @@ defmodule DurableBuffer.Backend.S3 do
   @impl DurableBuffer.Backend
   def stream(config, partition_index, opts) do
     req = build_req(config)
+    keys = list_keys(req, config, partition_index)
+    from = Keyword.get(opts, :from)
+    {keys, base} = seek(keys, from, req, config, partition_index)
 
-    base =
-      case list_keys(req, config, partition_index) do
-        [] -> load_base(req, config, partition_index)
-        [first | _rest] -> offset_from_key(first)
-      end
+    req
+    |> stream_keys(config, keys)
+    |> project(base, from, Keyword.get(opts, :with_offsets, false))
+  end
 
-    config
-    |> stream(partition_index)
-    |> project(base, Keyword.get(opts, :from), Keyword.get(opts, :with_offsets, false))
+  defp seek(keys, nil, req, config, partition_index) do
+    {keys, base_offset(keys, req, config, partition_index)}
+  end
+
+  defp seek(keys, from, req, config, partition_index) do
+    case Enum.split_while(keys, &(offset_from_key(&1) <= from)) do
+      {[], after_from} ->
+        {after_from, base_offset(keys, req, config, partition_index)}
+
+      {at_or_before, after_from} ->
+        floor_key = List.last(at_or_before)
+        {[floor_key | after_from], offset_from_key(floor_key)}
+    end
+  end
+
+  defp base_offset([], req, config, partition_index) do
+    load_base(req, config, partition_index)
+  end
+
+  defp base_offset([first | _rest], _req, _config, _partition_index) do
+    offset_from_key(first)
   end
 
   defp project(stream, _base, nil, false), do: stream
