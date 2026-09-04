@@ -59,7 +59,7 @@ defmodule DurableBuffer.Test.SlowBackend do
   end
 
   @impl DurableBuffer.Backend
-  def truncate(state) do
+  def truncate(state, _next) do
     Agent.update(state.recorder, fn _batches -> [] end)
     {:ok, state}
   end

@@ -38,7 +38,8 @@ defmodule DurableBuffer.Partition do
   @doc """
   Appends a payload and blocks until it is durable.
   """
-  @spec append(GenServer.server(), iodata(), timeout()) :: :ok | {:error, term()}
+  @spec append(GenServer.server(), iodata(), timeout()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
   def append(server, payload, timeout \\ :infinity) do
     GenServer.call(server, {:append, payload}, timeout)
   end
@@ -51,10 +52,11 @@ defmodule DurableBuffer.Partition do
   group commit together, so the per-call messaging cost is paid once for the
   entire list — the main lever for small-payload throughput.
   """
-  @spec append_batch(GenServer.server(), [iodata()], timeout()) :: :ok | {:error, term()}
+  @spec append_batch(GenServer.server(), [iodata()], timeout()) ::
+          {:ok, Range.t() | []} | {:error, term()}
   def append_batch(server, payloads, timeout \\ :infinity)
 
-  def append_batch(_server, [], _timeout), do: :ok
+  def append_batch(_server, [], _timeout), do: {:ok, []}
 
   def append_batch(server, payloads, timeout) do
     GenServer.call(server, {:append_batch, payloads}, timeout)
@@ -127,11 +129,11 @@ defmodule DurableBuffer.Partition do
 
   @impl GenServer
   def handle_call({:append, payload}, from, state) do
-    {:noreply, enqueue(state, from, encode_one(payload))}
+    {:noreply, enqueue(state, from, encode_one(payload), :offset)}
   end
 
   def handle_call({:append_batch, payloads}, from, state) do
-    {:noreply, enqueue(state, from, encode_many(payloads))}
+    {:noreply, enqueue(state, from, encode_many(payloads), :range)}
   end
 
   def handle_call(:sync, from, %{pending: []} = state) do
@@ -159,7 +161,7 @@ defmodule DurableBuffer.Partition do
 
   @impl GenServer
   def handle_cast({:append, payload}, state) do
-    {:noreply, enqueue(state, nil, encode_one(payload))}
+    {:noreply, enqueue(state, nil, encode_one(payload), :offset)}
   end
 
   @impl GenServer
@@ -206,10 +208,10 @@ defmodule DurableBuffer.Partition do
     {Enum.reverse(entries), count, bytes}
   end
 
-  defp enqueue(state, from, {entries, count, bytes}) do
+  defp enqueue(state, from, {entries, count, bytes}, shape) do
     state = %{
       state
-      | pending: [{:entries, from, entries} | state.pending],
+      | pending: [{:entries, from, entries, count, shape} | state.pending],
         pending_bytes: state.pending_bytes + bytes,
         pending_count: state.pending_count + count
     }

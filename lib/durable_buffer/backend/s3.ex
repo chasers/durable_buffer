@@ -3,11 +3,16 @@ defmodule DurableBuffer.Backend.S3 do
   S3 backend using `Req` + `ReqS3`.
 
   Each group commit uploads one immutable segment object
-  `<prefix>/p<partition>/<sequence>.wal` containing the framed batch, so a
+  `<prefix>/p<partition>/<offset>.wal` containing the framed batch, so a
   commit is durable exactly when the PUT succeeds — there is no fsync
-  equivalent to manage and no torn-write recovery. The sequence resumes from
-  a LIST on open. Reads LIST the partition's segments in key order and GET
-  them lazily.
+  equivalent to manage and no torn-write recovery. Reads LIST the partition's
+  segments in key order and GET them lazily. Reads need no durability gate:
+  an object exists only once its PUT succeeded.
+
+  The key is the segment's first logical entry offset, zero-padded so keys
+  sort in offset order. Offsets therefore resume from a LIST plus one GET of
+  the newest segment on open, and a truncate records the new base in a
+  sibling `base` object so offsets stay monotonic across it.
 
   S3 PUT latency is high relative to disk, which makes group commit the whole
   ballgame: while one PUT is in flight every new append queues into the next
@@ -29,7 +34,7 @@ defmodule DurableBuffer.Backend.S3 do
 
   alias DurableBuffer.WAL
 
-  @seq_width 12
+  @offset_width 12
 
   @impl DurableBuffer.Backend
   def init_config(opts) do
@@ -43,26 +48,51 @@ defmodule DurableBuffer.Backend.S3 do
   @impl DurableBuffer.Backend
   def open(config, partition_index) do
     req = build_req(config)
+    base = load_base(req, config, partition_index)
 
-    seq =
+    {first, next} =
       case list_keys(req, config, partition_index) do
-        [] -> 0
-        keys -> keys |> List.last() |> seq_from_key() |> Kernel.+(1)
+        [] ->
+          {base, base}
+
+        keys ->
+          last = List.last(keys)
+
+          {offset_from_key(List.first(keys)),
+           offset_from_key(last) + count_entries(req, config, last)}
       end
 
-    {:ok, %{req: req, config: config, partition_index: partition_index, seq: seq}}
+    {:ok,
+     %{
+       req: req,
+       config: config,
+       partition_index: partition_index,
+       first_offset: first,
+       next_offset: next
+     }}
+  end
+
+  @doc """
+  Logical entry offsets as of `open/2` or the last `truncate/1`.
+
+  Segment keys are the segment's first entry offset, so the bounds come from
+  a LIST plus one GET of the newest segment to count its entries.
+  """
+  @impl DurableBuffer.Backend
+  @spec offsets(map()) :: %{first: non_neg_integer(), next: non_neg_integer()}
+  def offsets(state) do
+    %{first: state.first_offset, next: state.next_offset}
   end
 
   @impl DurableBuffer.Backend
   def commit(state, batch, _byte_size) do
-    key = object_key(state.config, state.partition_index, state.seq)
+    key = object_key(state.config, state.partition_index, state.next_offset)
+    binary = IO.iodata_to_binary(batch)
+    {payloads, _valid, _rest} = WAL.decode_all(binary)
 
-    case Req.put(state.req,
-           url: "s3://#{state.config.bucket}/#{key}",
-           body: IO.iodata_to_binary(batch)
-         ) do
+    case Req.put(state.req, url: "s3://#{state.config.bucket}/#{key}", body: binary) do
       {:ok, %Req.Response{status: status}} when status in 200..299 ->
-        {:ok, %{state | seq: state.seq + 1}}
+        {:ok, %{state | next_offset: state.next_offset + length(payloads)}}
 
       {:ok, %Req.Response{status: status}} ->
         {:error, {:unexpected_status, status}, state}
@@ -95,7 +125,39 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   @impl DurableBuffer.Backend
-  def truncate(state) do
+  def stream(config, partition_index, opts) do
+    req = build_req(config)
+
+    base =
+      case list_keys(req, config, partition_index) do
+        [] -> load_base(req, config, partition_index)
+        [first | _rest] -> offset_from_key(first)
+      end
+
+    config
+    |> stream(partition_index)
+    |> project(base, Keyword.get(opts, :from), Keyword.get(opts, :with_offsets, false))
+  end
+
+  defp project(stream, _base, nil, false), do: stream
+
+  defp project(stream, base, from, with_offsets?) do
+    stream
+    |> Stream.with_index(base)
+    |> drop_below(from)
+    |> Stream.map(fn {payload, offset} ->
+      if with_offsets?, do: {offset, payload}, else: payload
+    end)
+  end
+
+  defp drop_below(stream, nil), do: stream
+
+  defp drop_below(stream, from) do
+    Stream.drop_while(stream, fn {_payload, offset} -> offset < from end)
+  end
+
+  @impl DurableBuffer.Backend
+  def truncate(state, next) do
     for key <- list_keys(state.req, state.config, state.partition_index) do
       %Req.Response{status: status} =
         Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
@@ -103,7 +165,9 @@ defmodule DurableBuffer.Backend.S3 do
       true = status in 200..299
     end
 
-    {:ok, state}
+    :ok = store_base(state.req, state.config, state.partition_index, next)
+
+    {:ok, %{state | first_offset: next, next_offset: next}}
   end
 
   @impl DurableBuffer.Backend
@@ -121,15 +185,55 @@ defmodule DurableBuffer.Backend.S3 do
     "#{config.prefix}/p#{partition_index}/"
   end
 
-  defp object_key(config, partition_index, seq) do
-    padded = seq |> Integer.to_string() |> String.pad_leading(@seq_width, "0")
+  defp object_key(config, partition_index, offset) do
+    padded = offset |> Integer.to_string() |> String.pad_leading(@offset_width, "0")
     "#{partition_prefix(config, partition_index)}#{padded}.wal"
   end
 
-  defp seq_from_key(key) do
+  defp offset_from_key(key) do
     key
     |> Path.basename(".wal")
     |> String.to_integer()
+  end
+
+  defp base_key(config, partition_index) do
+    "#{partition_prefix(config, partition_index)}base"
+  end
+
+  defp load_base(req, config, partition_index) do
+    case Req.get(req,
+           url: "s3://#{config.bucket}/#{base_key(config, partition_index)}",
+           decode_body: false
+         ) do
+      {:ok, %Req.Response{status: 200, body: body}} when is_binary(body) -> parse_base(body)
+      _missing_or_error -> 0
+    end
+  end
+
+  defp parse_base(body) do
+    case body |> String.trim() |> Integer.parse() do
+      {base, ""} -> base
+      _not_a_base -> 0
+    end
+  end
+
+  defp store_base(req, config, partition_index, base) do
+    %Req.Response{status: status} =
+      Req.put!(req,
+        url: "s3://#{config.bucket}/#{base_key(config, partition_index)}",
+        body: Integer.to_string(base)
+      )
+
+    true = status in 200..299
+    :ok
+  end
+
+  defp count_entries(req, config, key) do
+    %Req.Response{status: 200, body: body} =
+      Req.get!(req, url: "s3://#{config.bucket}/#{key}", decode_body: false)
+
+    {payloads, _valid, _rest} = WAL.decode_all(body)
+    length(payloads)
   end
 
   defp list_keys(req, config, partition_index) do
@@ -158,6 +262,7 @@ defmodule DurableBuffer.Backend.S3 do
       |> Map.get("Contents", [])
       |> List.wrap()
       |> Enum.map(&Map.fetch!(&1, "Key"))
+      |> Enum.filter(&String.ends_with?(&1, ".wal"))
 
     acc = acc ++ keys
 

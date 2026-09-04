@@ -54,8 +54,8 @@ defmodule DurableBuffer.WALTest do
   describe "recover!/1" do
     @describetag :tmp_dir
 
-    test "returns 0 for a missing file", %{tmp_dir: tmp_dir} do
-      assert WAL.recover!(Path.join(tmp_dir, "missing.wal")) == 0
+    test "returns zeroes for a missing file", %{tmp_dir: tmp_dir} do
+      assert WAL.recover!(Path.join(tmp_dir, "missing.wal")) == {0, 0}
     end
 
     test "truncates a torn tail in place", %{tmp_dir: tmp_dir} do
@@ -63,7 +63,7 @@ defmodule DurableBuffer.WALTest do
       {entry, size} = WAL.encode("keep-me")
       File.write!(path, [entry, <<9::32, 0::32, "to">>])
 
-      assert WAL.recover!(path) == size
+      assert WAL.recover!(path) == {size, 1}
       assert {["keep-me"], ^size, ""} = path |> File.read!() |> WAL.decode_all()
     end
 
@@ -72,7 +72,7 @@ defmodule DurableBuffer.WALTest do
       {entry, size} = WAL.encode("data")
       File.write!(path, entry)
 
-      assert WAL.recover!(path) == size
+      assert WAL.recover!(path) == {size, 1}
       assert File.stat!(path).size == size
     end
   end

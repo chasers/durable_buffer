@@ -106,7 +106,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {batch, bytes} = encode_batch(["to-be-dropped"])
     {:ok, state} = Replica.commit(state, batch, bytes)
 
-    assert {:ok, state} = Replica.truncate(state)
+    assert {:ok, state} = Replica.truncate(state, 0)
 
     assert Enum.to_list(Replica.stream(config, 0)) == []
     assert Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0)) == []
@@ -264,10 +264,10 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {batch, bytes} = encode_batch(["pre-truncate"])
     {:ok, state} = Replica.commit(state, batch, bytes)
 
-    {:ok, state} = Replica.truncate(state)
+    {:ok, state} = Replica.truncate(state, 0)
     assert state.epoch == 1
-    assert DurableBuffer.Epoch.load(primary_dir, 0) == 1
-    assert DurableBuffer.Epoch.load(replica_dir, 0) == 1
+    assert DurableBuffer.Meta.epoch(primary_dir, 0) == 1
+    assert DurableBuffer.Meta.epoch(replica_dir, 0) == 1
 
     {batch, bytes} = encode_batch(["post-truncate"])
     assert {:ok, state} = Replica.commit(state, batch, bytes)
@@ -289,7 +289,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
     solo_config = Replica.init_config(dir: primary_dir, replica_dir: replica_dir, replicas: [])
     {:ok, solo_state} = Replica.open(solo_config, 0)
-    {:ok, solo_state} = Replica.truncate(solo_state)
+    {:ok, solo_state} = Replica.truncate(solo_state, 0)
     assert solo_state.epoch == 1
     {new_batch, new_bytes} = encode_batch(["new-epoch-data"])
     {:ok, solo_state} = Replica.commit(solo_state, new_batch, new_bytes)
@@ -311,7 +311,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     assert Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0)) ==
              ["new-epoch-data", "after-heal"]
 
-    assert DurableBuffer.Epoch.load(replica_dir, 0) == 1
+    assert DurableBuffer.Meta.epoch(replica_dir, 0) == 1
     assert :ok = Replica.close(state)
   end
 
@@ -320,8 +320,8 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
     config = Replica.init_config(dir: primary_dir, replica_dir: replica_dir, replicas: [])
     {:ok, state} = Replica.open(config, 0)
-    {:ok, state} = Replica.truncate(state)
-    {:ok, state} = Replica.truncate(state)
+    {:ok, state} = Replica.truncate(state, 0)
+    {:ok, state} = Replica.truncate(state, 0)
     assert state.epoch == 2
     :ok = Replica.close(state)
 
@@ -423,7 +423,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
         Task.async(fn -> DurableBuffer.append(name, index, "entry-#{index}") end)
       end
 
-    assert Enum.all?(Task.await_many(tasks, 10_000), &(&1 == :ok))
+    assert Enum.all?(Task.await_many(tasks, 10_000), &match?({:ok, _}, &1))
 
     primary_config = Local.init_config(dir: primary_dir)
 
@@ -551,7 +551,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
       assert :ok = Replica.close(state)
 
       crash_primary(primary_dir, 0)
-      DurableBuffer.Epoch.store!(primary_dir, 0, 7)
+      DurableBuffer.Meta.update!(primary_dir, 0, &%{&1 | epoch: 7})
 
       {:ok, state} = Replica.open(config, 0)
       assert Enum.to_list(Replica.stream(config, 0)) == []
@@ -580,7 +580,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
       assert before.adopted_epoch == 0
       assert before.promotable?
 
-      assert {:ok, state} = Replica.truncate(state)
+      assert {:ok, state} = Replica.truncate(state, 0)
 
       after_truncate = state |> Replica.status() |> Map.fetch!(node())
       assert after_truncate.epoch == 1

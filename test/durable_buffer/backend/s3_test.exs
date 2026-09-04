@@ -38,7 +38,7 @@ defmodule DurableBuffer.Backend.S3Test do
 
     assert Map.keys(FakeS3.objects(store)) |> Enum.sort() == [
              "buffers/test/p0/000000000000.wal",
-             "buffers/test/p0/000000000001.wal"
+             "buffers/test/p0/000000000002.wal"
            ]
 
     assert Enum.to_list(S3.stream(config, 0)) == ["a", "b", "c"]
@@ -64,14 +64,14 @@ defmodule DurableBuffer.Backend.S3Test do
     assert Enum.to_list(S3.stream(config, 1)) == ["p1"]
   end
 
-  test "open resumes the sequence after existing segments" do
+  test "open resumes offsets after existing segments" do
     {config, store} = start_backend()
     {:ok, state} = S3.open(config, 0)
     {batch, bytes} = encode_batch(["first"])
     {:ok, _state} = S3.commit(state, batch, bytes)
 
     {:ok, reopened} = S3.open(config, 0)
-    assert reopened.seq == 1
+    assert S3.offsets(reopened) == %{first: 0, next: 1}
 
     {batch, bytes} = encode_batch(["second"])
     {:ok, _state} = S3.commit(reopened, batch, bytes)
@@ -94,7 +94,8 @@ defmodule DurableBuffer.Backend.S3Test do
     assert Enum.to_list(S3.stream(config, 0)) == Enum.map(1..5, &"entry-#{&1}")
 
     {:ok, reopened} = S3.open(config, 0)
-    assert reopened.seq == state.seq
+    assert S3.offsets(reopened) == S3.offsets(state)
+    assert S3.offsets(reopened) == %{first: 0, next: 5}
   end
 
   test "truncate deletes only the partition's segments" do
@@ -107,9 +108,33 @@ defmodule DurableBuffer.Backend.S3Test do
     {batch, bytes} = encode_batch(["keep"])
     {:ok, _state1} = S3.commit(state1, batch, bytes)
 
-    {:ok, _state0} = S3.truncate(state0)
+    {:ok, _state0} = S3.truncate(state0, 1)
 
-    assert Map.keys(FakeS3.objects(store)) == ["buffers/test/p1/000000000000.wal"]
+    assert Map.keys(FakeS3.objects(store)) |> Enum.sort() == [
+             "buffers/test/p0/base",
+             "buffers/test/p1/000000000000.wal"
+           ]
+  end
+
+  test "offsets stay monotonic across a truncate" do
+    {config, _store} = start_backend()
+    {:ok, state} = S3.open(config, 0)
+
+    {batch, bytes} = encode_batch(["one", "two"])
+    {:ok, state} = S3.commit(state, batch, bytes)
+    assert S3.offsets(state) == %{first: 0, next: 2}
+
+    {:ok, state} = S3.truncate(state, 2)
+    assert S3.offsets(state) == %{first: 2, next: 2}
+
+    {:ok, reopened} = S3.open(config, 0)
+    assert S3.offsets(reopened) == %{first: 2, next: 2}
+
+    {batch, bytes} = encode_batch(["three"])
+    {:ok, state} = S3.commit(reopened, batch, bytes)
+    assert S3.offsets(state) == %{first: 2, next: 3}
+
+    assert Enum.to_list(S3.stream(config, 0, with_offsets: true)) == [{2, "three"}]
   end
 
   test "a failed PUT surfaces as a commit error" do

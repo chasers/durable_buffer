@@ -26,8 +26,8 @@ defmodule DurableBuffer.PartitionTest do
   test "append blocks until committed and preserves order" do
     {pid, recorder} = start_partition()
 
-    assert :ok = Partition.append(pid, "a")
-    assert :ok = Partition.append(pid, "b")
+    assert {:ok, _} = Partition.append(pid, "a")
+    assert {:ok, _} = Partition.append(pid, "b")
 
     assert List.flatten(SlowBackend.committed_batches(recorder)) == ["a", "b"]
   end
@@ -40,7 +40,7 @@ defmodule DurableBuffer.PartitionTest do
         Task.async(fn -> Partition.append(pid, "entry-#{index}") end)
       end
 
-    assert Enum.all?(Task.await_many(tasks, 5000), &(&1 == :ok))
+    assert Enum.all?(Task.await_many(tasks, 5000), &match?({:ok, _}, &1))
 
     batches = SlowBackend.committed_batches(recorder)
     assert length(List.flatten(batches)) == 50
@@ -50,8 +50,8 @@ defmodule DurableBuffer.PartitionTest do
   test "append_batch commits all payloads in order with one reply" do
     {pid, recorder} = start_partition()
 
-    assert :ok = Partition.append_batch(pid, ["b1", "b2", "b3"])
-    assert :ok = Partition.append(pid, "single")
+    assert {:ok, _} = Partition.append_batch(pid, ["b1", "b2", "b3"])
+    assert {:ok, _} = Partition.append(pid, "single")
 
     assert List.flatten(SlowBackend.committed_batches(recorder)) == ["b1", "b2", "b3", "single"]
   end
@@ -59,7 +59,7 @@ defmodule DurableBuffer.PartitionTest do
   test "append_batch with an empty list is a no-op" do
     {pid, recorder} = start_partition()
 
-    assert :ok = Partition.append_batch(pid, [])
+    assert {:ok, _} = Partition.append_batch(pid, [])
     assert SlowBackend.committed_batches(recorder) == []
   end
 
@@ -72,7 +72,8 @@ defmodule DurableBuffer.PartitionTest do
         Task.async(fn -> Partition.append(pid, "lone") end)
       ]
 
-    assert Task.await_many(tasks, 5000) == [:ok, :ok]
+    assert [{:ok, batch_range}, {:ok, lone}] = Task.await_many(tasks, 5000)
+    assert Enum.sort(Enum.to_list(batch_range) ++ [lone]) == Enum.to_list(0..50)
 
     committed = List.flatten(SlowBackend.committed_batches(recorder))
     assert length(committed) == 51
@@ -91,7 +92,7 @@ defmodule DurableBuffer.PartitionTest do
   test "max_batch_entries counts individual batch payloads" do
     {pid, recorder} = start_partition(max_batch_entries: 10)
 
-    assert :ok = Partition.append_batch(pid, Enum.map(1..25, &"forced-#{&1}"))
+    assert {:ok, _} = Partition.append_batch(pid, Enum.map(1..25, &"forced-#{&1}"))
     :ok = Partition.sync(pid)
 
     batches = SlowBackend.committed_batches(recorder)
