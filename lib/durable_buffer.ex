@@ -25,6 +25,12 @@ defmodule DurableBuffer do
   The `partition_key` is hashed to one of a fixed set of partitions; each
   partition commits independently and in parallel.
 
+  Data is kept for a window rather than forever. Declare `retention_ms`,
+  `retention_bytes`, or both, and each partition applies the policy on a
+  timer; whichever bound binds first decides. The buffer tracks no
+  consumers, so a consumer keeps its own cursor and `stream/3` raises
+  `DurableBuffer.OutOfRangeError` if that cursor falls outside the window.
+
   Backends:
 
     * `DurableBuffer.Backend.Local` — append-only WAL + `datasync` per commit

@@ -458,6 +458,12 @@ defmodule DurableBuffer.Backend.Local do
   replicas, which mirror bytes and have no view of entry offsets. A logical
   byte offset is a frame boundary on every member, since every member holds
   the same bytes at the same logical positions.
+
+  A replica's `offsets/1` therefore counts bytes, not log positions.
+  `DurableBuffer.Replica.Writer` commits with a zero span, so `base_offset`
+  never moves and `entry_count` is recovered from the file rather than
+  tracked. A promoted follower starts where the operator points it, which is
+  the same answer the README already gives.
   """
   @spec trim_bytes(map(), non_neg_integer()) :: {:ok, map()} | {:error, term(), map()}
   def trim_bytes(state, base_byte) do
