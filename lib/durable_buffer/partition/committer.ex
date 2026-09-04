@@ -67,6 +67,23 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   @doc """
+  Records a consumer ack. Answered once the position is written, and ordered
+  against commits and truncates like every other unit of work here.
+  """
+  @spec request_ack(GenServer.server(), GenServer.from(), term(), non_neg_integer()) :: :ok
+  def request_ack(server, from, consumer_id, offset) do
+    GenServer.cast(server, {:ack, from, consumer_id, offset})
+  end
+
+  @doc """
+  Every consumer's acked offset for this partition.
+  """
+  @spec acks(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
+  def acks(server, timeout \\ 5_000) do
+    GenServer.call(server, :acks, timeout)
+  end
+
+  @doc """
   Reports the backend's per-replica replication state, for backends that
   track one. Returns `{:error, :unsupported}` for the others.
   """
@@ -76,6 +93,17 @@ defmodule DurableBuffer.Partition.Committer do
   end
 
   @impl GenServer
+  def handle_call(:acks, _from, state) do
+    reply =
+      if Backend.tracks_acks?(state.backend) do
+        {:ok, state.backend.acks(state.backend_state)}
+      else
+        {:error, :unsupported}
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call(:replica_status, _from, state) do
     reply =
       if function_exported?(state.backend, :status, 1) do
@@ -203,6 +231,28 @@ defmodule DurableBuffer.Partition.Committer do
   def handle_cast({:sync, from}, state) do
     GenServer.reply(from, sync_reply(:ok, state))
     {:noreply, %{state | async_error: nil}}
+  end
+
+  def handle_cast({:ack, from, consumer_id, offset}, state) do
+    cond do
+      not Backend.tracks_acks?(state.backend) ->
+        GenServer.reply(from, {:error, :unsupported})
+        {:noreply, state}
+
+      offset >= state.durable_logical ->
+        GenServer.reply(from, {:error, :not_durable})
+        {:noreply, state}
+
+      true ->
+        {reply, backend_state} =
+          case state.backend.ack(state.backend_state, consumer_id, offset) do
+            {:ok, backend_state} -> {:ok, backend_state}
+            {:error, reason, backend_state} -> {{:error, reason}, backend_state}
+          end
+
+        GenServer.reply(from, reply)
+        {:noreply, %{state | backend_state: backend_state}}
+    end
   end
 
   def handle_cast({:truncate, from}, state) do

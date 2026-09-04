@@ -238,6 +238,25 @@ defmodule DurableBuffer.Backend.Replica do
   def offsets(state), do: Local.offsets(state.local)
 
   @doc """
+  Records a consumer ack against the primary's own directory.
+
+  Ack positions are not replicated. There is no failover story to serve —
+  promoting a follower is a manual, operator-driven procedure — so shipping
+  them would buy nothing today. A promoted follower starts its consumers
+  from wherever the operator points them.
+  """
+  @impl DurableBuffer.Backend
+  @spec ack(map(), term(), non_neg_integer()) :: {:ok, map()}
+  def ack(state, consumer_id, offset) do
+    {:ok, local} = Local.ack(state.local, consumer_id, offset)
+    {:ok, %{state | local: local}}
+  end
+
+  @impl DurableBuffer.Backend
+  @spec acks(map()) :: %{term() => non_neg_integer()}
+  def acks(state), do: Local.acks(state.local)
+
+  @doc """
   Byte offset through which the ack policy is met.
 
   Take every member watermark on the current epoch, sort them descending,

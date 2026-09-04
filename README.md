@@ -72,6 +72,51 @@ recovers its count from the WAL on open.
 Use `:first` to detect that a resume point predates retention and fall back
 to a full resync, instead of silently replaying from the trim point.
 
+### Consumer acks
+
+Named consumers record how far they have processed, so each resumes from its
+own position after a restart:
+
+```elixir
+:ok            = DurableBuffer.ack(:events, user_id, "worker-1", offset)
+{:ok, offset}  = DurableBuffer.acked(:events, user_id, "worker-1")  # :error if unknown
+{:ok, all}     = DurableBuffer.acks(:events, user_id)               # every consumer
+
+from =
+  case DurableBuffer.acked(:events, user_id, "worker-1") do
+    {:ok, offset} -> offset + 1
+    :error -> 0
+  end
+
+DurableBuffer.stream(:events, user_id, from: from)
+```
+
+An ack records "processed through `offset`, inclusive". Acks are **monotonic
+per consumer**: an offset at or below what that consumer already acked is a
+no-op, so a duplicate or reordered ack cannot move a consumer backwards.
+
+An ack past the partition's durable offset is refused with
+`{:error, :not_durable}`. A consumer cannot have read that far, and
+accepting it would let ack-driven retention discard data that never met the
+durability guarantee.
+
+`truncate/3` clears every ack for the partition — the data they point at is
+gone and the offsets have moved past it.
+
+Positions live in `p<index>.acks` for the local and replicated backends, and
+in one small object per consumer under `<prefix>/p<partition>/acks/` for S3.
+A lost or corrupt ack file reads as no acks, which replays entries a
+consumer already handled; consumers must tolerate that anyway, and the
+opposite error would silently skip entries.
+
+Consumer ids are any term for the local and replicated backends. S3 puts the
+id in the object key, so it needs a `String.Chars`-able id.
+
+**Acks are not replicated.** They live on the primary's directory only.
+There is no automatic failover to serve, so shipping them buys nothing
+today; a promoted follower starts its consumers wherever the operator points
+them.
+
 `from:` seeks rather than scans. The local backend keeps a sparse index
 (`p<index>.idx`, one 20-byte record per group commit) and binary-searches it
 for the last batch at or before the wanted offset. The index is a pure

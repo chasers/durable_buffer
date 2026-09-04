@@ -19,6 +19,7 @@ defmodule DurableBuffer.Backend.Local do
 
   @behaviour DurableBuffer.Backend
 
+  alias DurableBuffer.Acks
   alias DurableBuffer.Backend.Local.Index
   alias DurableBuffer.Meta
   alias DurableBuffer.WAL
@@ -52,7 +53,8 @@ defmodule DurableBuffer.Backend.Local do
        partition_index: partition_index,
        base_offset: meta.base_offset,
        entry_count: entry_count,
-       index: open_index(config, partition_index, offset)
+       index: open_index(config, partition_index, offset),
+       acks: Acks.load(config.dir, partition_index)
      }}
   end
 
@@ -61,6 +63,34 @@ defmodule DurableBuffer.Backend.Local do
   defp open_index(config, partition_index, offset) do
     Index.open(config.dir, partition_index, offset)
   end
+
+  @doc """
+  Records that `consumer_id` has processed through `offset`, inclusive.
+
+  Acks are monotonic per consumer: an offset at or below what that consumer
+  already acked is a no-op, so a duplicate or reordered ack cannot move a
+  consumer backwards.
+  """
+  @impl DurableBuffer.Backend
+  @spec ack(map(), term(), non_neg_integer()) :: {:ok, map()}
+  def ack(state, consumer_id, offset) do
+    case Map.get(state.acks, consumer_id) do
+      current when is_integer(current) and offset <= current ->
+        {:ok, state}
+
+      _behind_or_new ->
+        acks = Map.put(state.acks, consumer_id, offset)
+        :ok = Acks.store!(state.dir, state.partition_index, acks, state.fsync)
+        {:ok, %{state | acks: acks}}
+    end
+  end
+
+  @doc """
+  Every consumer's acked offset for this partition.
+  """
+  @impl DurableBuffer.Backend
+  @spec acks(map()) :: %{term() => non_neg_integer()}
+  def acks(state), do: state.acks
 
   @doc """
   The partition's logical entry offset bounds.
@@ -199,6 +229,7 @@ defmodule DurableBuffer.Backend.Local do
       %{meta | base_offset: next, base_byte_offset: 0}
     end)
 
+    :ok = Acks.reset(state.dir, state.partition_index)
     {:ok, fd} = :file.open(state.path, [:append, :raw, :binary])
 
     {:ok,
@@ -208,7 +239,8 @@ defmodule DurableBuffer.Backend.Local do
          offset: 0,
          base_offset: next,
          entry_count: 0,
-         index: Index.reset(state.index)
+         index: Index.reset(state.index),
+         acks: %{}
      }}
   end
 

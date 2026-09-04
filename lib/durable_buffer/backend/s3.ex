@@ -71,9 +71,47 @@ defmodule DurableBuffer.Backend.S3 do
        config: config,
        partition_index: partition_index,
        first_offset: first,
-       next_offset: next
+       next_offset: next,
+       acks: load_acks(req, config, partition_index)
      }}
   end
+
+  @doc """
+  Records that `consumer_id` has processed through `offset`, inclusive, as
+  one small object per consumer under the partition's `acks/` prefix.
+
+  Consumer ids must be `String.Chars`-able here, since the id becomes part
+  of the key. Local and replicated buffers accept any term.
+  """
+  @impl DurableBuffer.Backend
+  @spec ack(map(), term(), non_neg_integer()) :: {:ok, map()} | {:error, term(), map()}
+  def ack(state, consumer_id, offset) do
+    case Map.get(state.acks, consumer_id) do
+      current when is_integer(current) and offset <= current ->
+        {:ok, state}
+
+      _behind_or_new ->
+        key = ack_key(state.config, state.partition_index, consumer_id)
+
+        case Req.put(state.req,
+               url: "s3://#{state.config.bucket}/#{key}",
+               body: Integer.to_string(offset)
+             ) do
+          {:ok, %Req.Response{status: status}} when status in 200..299 ->
+            {:ok, %{state | acks: Map.put(state.acks, consumer_id, offset)}}
+
+          {:ok, %Req.Response{status: status}} ->
+            {:error, {:unexpected_status, status}, state}
+
+          {:error, exception} ->
+            {:error, exception, state}
+        end
+    end
+  end
+
+  @impl DurableBuffer.Backend
+  @spec acks(map()) :: %{term() => non_neg_integer()}
+  def acks(state), do: state.acks
 
   @doc """
   Logical entry offsets as of `open/2` or the last `truncate/1`.
@@ -189,9 +227,16 @@ defmodule DurableBuffer.Backend.S3 do
       true = status in 200..299
     end
 
+    for key <- list_ack_keys(state.req, state.config, state.partition_index) do
+      %Req.Response{status: status} =
+        Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
+
+      true = status in 200..299
+    end
+
     :ok = store_base(state.req, state.config, state.partition_index, next)
 
-    {:ok, %{state | first_offset: next, next_offset: next}}
+    {:ok, %{state | first_offset: next, next_offset: next, acks: %{}}}
   end
 
   @impl DurableBuffer.Backend
@@ -218,6 +263,35 @@ defmodule DurableBuffer.Backend.S3 do
     key
     |> Path.basename(".wal")
     |> String.to_integer()
+  end
+
+  defp acks_prefix(config, partition_index) do
+    "#{partition_prefix(config, partition_index)}acks/"
+  end
+
+  defp ack_key(config, partition_index, consumer_id) do
+    encoded = consumer_id |> to_string() |> URI.encode_www_form()
+    "#{acks_prefix(config, partition_index)}#{encoded}"
+  end
+
+  defp list_ack_keys(req, config, partition_index) do
+    req
+    |> list_prefix(config, acks_prefix(config, partition_index), nil, [])
+    |> Enum.filter(&String.starts_with?(&1, acks_prefix(config, partition_index)))
+  end
+
+  defp load_acks(req, config, partition_index) do
+    prefix = acks_prefix(config, partition_index)
+
+    for key <- list_ack_keys(req, config, partition_index), into: %{} do
+      consumer_id =
+        key |> String.replace_prefix(prefix, "") |> URI.decode_www_form()
+
+      %Req.Response{status: 200, body: body} =
+        Req.get!(req, url: "s3://#{config.bucket}/#{key}", decode_body: false)
+
+      {consumer_id, parse_base(body)}
+    end
   end
 
   defp base_key(config, partition_index) do
@@ -261,14 +335,15 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   defp list_keys(req, config, partition_index) do
-    list_keys(req, config, partition_index, nil, [])
+    list_prefix(req, config, partition_prefix(config, partition_index), nil, [])
+    |> Enum.filter(&String.ends_with?(&1, ".wal"))
   end
 
-  defp list_keys(req, config, partition_index, continuation_token, acc) do
+  defp list_prefix(req, config, prefix, continuation_token, acc) do
     params =
       [
         {"list-type", "2"},
-        {"prefix", partition_prefix(config, partition_index)}
+        {"prefix", prefix}
       ] ++
         if continuation_token do
           [{"continuation-token", continuation_token}]
@@ -286,13 +361,12 @@ defmodule DurableBuffer.Backend.S3 do
       |> Map.get("Contents", [])
       |> List.wrap()
       |> Enum.map(&Map.fetch!(&1, "Key"))
-      |> Enum.filter(&String.ends_with?(&1, ".wal"))
 
     acc = acc ++ keys
 
     case result do
       %{"IsTruncated" => "true", "NextContinuationToken" => token} ->
-        list_keys(req, config, partition_index, token, acc)
+        list_prefix(req, config, prefix, token, acc)
 
       _result ->
         Enum.sort(acc)

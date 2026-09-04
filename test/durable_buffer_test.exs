@@ -396,4 +396,79 @@ defmodule DurableBufferTest do
 
     assert Enum.to_list(DurableBuffer.stream(name, "k", from: 1)) == ["b", "c"]
   end
+
+  describe "consumer acks" do
+    setup %{tmp_dir: tmp_dir} do
+      name = start_buffer(tmp_dir, partitions: 1)
+      {:ok, 0..4} = DurableBuffer.append_batch(name, "k", ~w(a b c d e))
+      %{name: name, dir: tmp_dir}
+    end
+
+    test "records and reads back a position", %{name: name} do
+      assert DurableBuffer.acked(name, "k", "worker-1") == :error
+
+      assert :ok = DurableBuffer.ack(name, "k", "worker-1", 2)
+      assert DurableBuffer.acked(name, "k", "worker-1") == {:ok, 2}
+    end
+
+    test "resumes a consumer from the entry after its ack", %{name: name} do
+      :ok = DurableBuffer.ack(name, "k", "worker-1", 2)
+      {:ok, acked} = DurableBuffer.acked(name, "k", "worker-1")
+
+      assert Enum.to_list(DurableBuffer.stream(name, "k", from: acked + 1)) == ~w(d e)
+    end
+
+    test "is monotonic: a stale ack is a no-op", %{name: name} do
+      :ok = DurableBuffer.ack(name, "k", "worker-1", 3)
+
+      assert :ok = DurableBuffer.ack(name, "k", "worker-1", 1)
+      assert :ok = DurableBuffer.ack(name, "k", "worker-1", 3)
+      assert DurableBuffer.acked(name, "k", "worker-1") == {:ok, 3}
+
+      assert :ok = DurableBuffer.ack(name, "k", "worker-1", 4)
+      assert DurableBuffer.acked(name, "k", "worker-1") == {:ok, 4}
+    end
+
+    test "keeps consumers independent", %{name: name} do
+      :ok = DurableBuffer.ack(name, "k", "worker-1", 1)
+      :ok = DurableBuffer.ack(name, "k", "worker-2", 4)
+
+      assert DurableBuffer.acked(name, "k", "worker-1") == {:ok, 1}
+      assert DurableBuffer.acked(name, "k", "worker-2") == {:ok, 4}
+      assert {:ok, %{"worker-1" => 1, "worker-2" => 4}} = DurableBuffer.acks(name, "k")
+    end
+
+    test "survives a restart", %{name: name, dir: dir} do
+      :ok = DurableBuffer.ack(name, "k", "worker-1", 3)
+      stop_supervised!({DurableBuffer, name})
+
+      name = start_buffer(dir, name: name, partitions: 1)
+      assert DurableBuffer.acked(name, "k", "worker-1") == {:ok, 3}
+    end
+
+    test "refuses an ack past the durable offset", %{name: name} do
+      assert :ok = DurableBuffer.ack(name, "k", "worker-1", 4)
+      assert {:error, :not_durable} = DurableBuffer.ack(name, "k", "worker-1", 5)
+      assert {:error, :not_durable} = DurableBuffer.ack(name, "k", "worker-1", 99)
+      assert DurableBuffer.acked(name, "k", "worker-1") == {:ok, 4}
+    end
+
+    test "truncate clears every ack", %{name: name} do
+      :ok = DurableBuffer.ack(name, "k", "worker-1", 3)
+      :ok = DurableBuffer.truncate(name, "k")
+
+      assert {:ok, acks} = DurableBuffer.acks(name, "k")
+      assert acks == %{}
+      assert DurableBuffer.acked(name, "k", "worker-1") == :error
+    end
+
+    test "a corrupt ack file reads as no acks", %{name: name, dir: dir} do
+      :ok = DurableBuffer.ack(name, "k", "worker-1", 3)
+      stop_supervised!({DurableBuffer, name})
+      File.write!(Path.join(dir, "p0.acks"), "not-a-term")
+
+      name = start_buffer(dir, name: name, partitions: 1)
+      assert DurableBuffer.acked(name, "k", "worker-1") == :error
+    end
+  end
 end

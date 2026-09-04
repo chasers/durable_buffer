@@ -228,6 +228,52 @@ defmodule DurableBuffer do
   end
 
   @doc """
+  Records that `consumer_id` has processed `partition_key`'s partition
+  through `offset`, inclusive.
+
+  Acks are monotonic per consumer: an offset at or below what that consumer
+  already acked is a no-op, so a duplicate or reordered ack cannot move a
+  consumer backwards. Resume a consumer with
+  `stream(name, key, from: acked + 1)`.
+
+  An ack past the partition's durable offset is refused with
+  `{:error, :not_durable}`. A consumer cannot have read that far, and
+  accepting it would let ack-driven retention discard data that never met
+  the durability guarantee.
+
+  `truncate/3` clears every ack for the partition: the data they point at is
+  gone and the offsets have moved past them.
+  """
+  @spec ack(atom(), term(), term(), non_neg_integer()) :: :ok | {:error, term()}
+  def ack(name, partition_key, consumer_id, offset) do
+    name
+    |> partition_server(partition_key)
+    |> Partition.ack(consumer_id, offset)
+  end
+
+  @doc """
+  Returns the offset `consumer_id` has processed `partition_key`'s partition
+  through, or `:error` when that consumer has never acked.
+  """
+  @spec acked(atom(), term(), term()) :: {:ok, non_neg_integer()} | :error | {:error, term()}
+  def acked(name, partition_key, consumer_id) do
+    case acks(name, partition_key) do
+      {:ok, acks} -> Map.fetch(acks, consumer_id)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Every consumer's acked offset for `partition_key`'s partition.
+  """
+  @spec acks(atom(), term()) :: {:ok, %{term() => non_neg_integer()}} | {:error, term()}
+  def acks(name, partition_key) do
+    name
+    |> partition_server(partition_key)
+    |> Partition.acks()
+  end
+
+  @doc """
   Reports each replica's replication state for `partition_key`'s partition.
 
   Only `DurableBuffer.Backend.Replica` tracks one; the other backends return

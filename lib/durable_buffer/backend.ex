@@ -71,6 +71,9 @@ defmodule DurableBuffer.Backend do
               Enumerable.t()
   @callback durable_offset(state()) :: non_neg_integer()
   @callback offsets(state()) :: %{first: non_neg_integer(), next: non_neg_integer()}
+  @callback ack(state(), consumer_id :: term(), offset :: non_neg_integer()) ::
+              {:ok, state()} | {:error, term(), state()}
+  @callback acks(state()) :: %{term() => non_neg_integer()}
   @callback truncate(state(), next_offset :: non_neg_integer()) :: {:ok, state()}
   @callback close(state()) :: :ok
 
@@ -78,7 +81,9 @@ defmodule DurableBuffer.Backend do
                       handle_message: 2,
                       stream: 3,
                       durable_offset: 1,
-                      offsets: 1
+                      offsets: 1,
+                      ack: 3,
+                      acks: 1
 
   @doc """
   Normalizes a `{module, opts}` backend spec into `{module, config}`.
@@ -90,6 +95,14 @@ defmodule DurableBuffer.Backend do
 
   def normalize(module) when is_atom(module) do
     normalize({module, []})
+  end
+
+  @doc """
+  Whether `module` records consumer ack positions.
+  """
+  @spec tracks_acks?(module()) :: boolean()
+  def tracks_acks?(module) do
+    function_exported?(module, :ack, 3) and function_exported?(module, :acks, 1)
   end
 
   @doc """

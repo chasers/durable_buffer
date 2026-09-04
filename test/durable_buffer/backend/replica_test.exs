@@ -624,4 +624,27 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {payloads, _valid, _rest} = batch |> IO.iodata_to_binary() |> DurableBuffer.WAL.decode_all()
     {module.offsets(state).next, length(payloads)}
   end
+
+  test "acks are kept on the primary and not replicated", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+
+    config =
+      Replica.init_config(dir: primary_dir, replica_dir: replica_dir, replicas: [node()])
+
+    {:ok, state} = Replica.open(config, 0)
+    {batch, bytes} = encode_batch(["one", "two"])
+    {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
+
+    {:ok, state} = Replica.ack(state, "worker-1", 1)
+    assert Replica.acks(state) == %{"worker-1" => 1}
+
+    assert File.exists?(Path.join(primary_dir, "p0.acks"))
+    refute File.exists?(Path.join(replica_dir, "p0.acks"))
+
+    assert :ok = Replica.close(state)
+
+    {:ok, reopened} = Replica.open(config, 0)
+    assert Replica.acks(reopened) == %{"worker-1" => 1}
+    assert :ok = Replica.close(reopened)
+  end
 end

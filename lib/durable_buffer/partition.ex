@@ -91,6 +91,22 @@ defmodule DurableBuffer.Partition do
   end
 
   @doc """
+  Records that `consumer_id` has processed through `offset`, inclusive.
+  """
+  @spec ack(GenServer.server(), term(), non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def ack(server, consumer_id, offset, timeout \\ 5_000) do
+    GenServer.call(server, {:ack, consumer_id, offset}, timeout)
+  end
+
+  @doc """
+  Every consumer's acked offset for this partition.
+  """
+  @spec acks(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
+  def acks(server, timeout \\ 5_000) do
+    GenServer.call(server, :acks, timeout)
+  end
+
+  @doc """
   Reports the backend's per-replica replication state.
   """
   @spec replica_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
@@ -147,6 +163,15 @@ defmodule DurableBuffer.Partition do
       |> handoff()
 
     {:noreply, state}
+  end
+
+  def handle_call({:ack, consumer_id, offset}, from, state) do
+    Committer.request_ack(state.committer, from, consumer_id, offset)
+    {:noreply, state}
+  end
+
+  def handle_call(:acks, _from, state) do
+    {:reply, Committer.acks(state.committer), state}
   end
 
   def handle_call(:replica_status, _from, state) do

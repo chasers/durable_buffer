@@ -172,4 +172,53 @@ defmodule DurableBuffer.Backend.S3Test do
     {payloads, _valid, _rest} = batch |> IO.iodata_to_binary() |> DurableBuffer.WAL.decode_all()
     {module.offsets(state).next, length(payloads)}
   end
+
+  describe "consumer acks" do
+    test "round-trip, monotonicity and recovery on reopen" do
+      {config, _store} = start_backend()
+      {:ok, state} = S3.open(config, 0)
+      {batch, bytes} = encode_batch(["a", "b", "c"])
+      {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+
+      assert S3.acks(state) == %{}
+
+      {:ok, state} = S3.ack(state, "worker-1", 1)
+      {:ok, state} = S3.ack(state, "worker-2", 2)
+      assert S3.acks(state) == %{"worker-1" => 1, "worker-2" => 2}
+
+      {:ok, state} = S3.ack(state, "worker-1", 0)
+      assert S3.acks(state) == %{"worker-1" => 1, "worker-2" => 2}
+
+      {:ok, reopened} = S3.open(config, 0)
+      assert S3.acks(reopened) == %{"worker-1" => 1, "worker-2" => 2}
+    end
+
+    test "ack objects are not mistaken for segments" do
+      {config, _store} = start_backend()
+      {:ok, state} = S3.open(config, 0)
+      {batch, bytes} = encode_batch(["a", "b"])
+      {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+      {:ok, state} = S3.ack(state, "worker-1", 1)
+
+      assert Enum.to_list(S3.stream(config, 0)) == ["a", "b"]
+      assert S3.offsets(state) == %{first: 0, next: 2}
+
+      {:ok, reopened} = S3.open(config, 0)
+      assert S3.offsets(reopened) == %{first: 0, next: 2}
+    end
+
+    test "truncate clears every ack" do
+      {config, _store} = start_backend()
+      {:ok, state} = S3.open(config, 0)
+      {batch, bytes} = encode_batch(["a"])
+      {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+      {:ok, state} = S3.ack(state, "worker-1", 0)
+
+      {:ok, state} = S3.truncate(state, 1)
+      assert S3.acks(state) == %{}
+
+      {:ok, reopened} = S3.open(config, 0)
+      assert S3.acks(reopened) == %{}
+    end
+  end
 end

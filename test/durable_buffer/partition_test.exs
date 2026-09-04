@@ -181,4 +181,11 @@ defmodule DurableBuffer.PartitionTest do
 
     assert SlowBackend.committed_batches(recorder) == []
   end
+
+  test "acks are unsupported on a backend that does not track them" do
+    {pid, _recorder} = start_partition()
+
+    assert {:error, :unsupported} = Partition.acks(pid)
+    assert {:error, :unsupported} = Partition.ack(pid, "worker-1", 0)
+  end
 end
