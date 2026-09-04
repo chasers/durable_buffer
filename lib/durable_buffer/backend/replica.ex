@@ -146,10 +146,10 @@ defmodule DurableBuffer.Backend.Replica do
   end
 
   @impl DurableBuffer.Backend
-  def commit(state, batch, byte_size) do
+  def commit(state, batch, byte_size, span) do
     tag = make_ref()
 
-    case commit_async(state, batch, byte_size, tag) do
+    case commit_async(state, batch, byte_size, span, tag) do
       {:done, :ok, state} -> {:ok, state}
       {:done, {:error, reason}, state} -> {:error, reason, state}
       {:pending, state} -> await_commit(state, tag)
@@ -157,14 +157,14 @@ defmodule DurableBuffer.Backend.Replica do
   end
 
   @impl DurableBuffer.Backend
-  def commit_async(state, batch, byte_size, tag) do
+  def commit_async(state, batch, byte_size, span, tag) do
     config = state.config
     binary = IO.iodata_to_binary(batch)
     epoch = state.epoch
     offset = Local.offset(state.local)
     target = {epoch, offset + byte_size}
 
-    case Local.commit(state.local, binary, byte_size) do
+    case Local.commit(state.local, binary, byte_size, span) do
       {:ok, local} ->
         Enum.each(state.senders, fn {_node, sender} ->
           Sender.commit(sender, epoch, offset, binary)
@@ -413,8 +413,8 @@ defmodule DurableBuffer.Backend.Replica do
       case read_remote(config, partition_index, node, cursor, length) do
         {:ok, data} when byte_size(data) > 0 ->
           buffer = leftover <> data
-          {_payloads, valid, rest} = WAL.decode_all(buffer)
-          local = append_healed(local, buffer, valid)
+          {payloads, valid, rest} = WAL.decode_all(buffer)
+          local = append_healed(local, buffer, length(payloads), valid)
           pull_chunks(config, partition_index, node, local, remote_offset, rest)
 
         _empty_or_error ->
@@ -423,10 +423,11 @@ defmodule DurableBuffer.Backend.Replica do
     end
   end
 
-  defp append_healed(local, _buffer, 0), do: local
+  defp append_healed(local, _buffer, _count, 0), do: local
 
-  defp append_healed(local, buffer, valid) do
-    {:ok, local} = Local.commit(local, binary_part(buffer, 0, valid), valid)
+  defp append_healed(local, buffer, count, valid) do
+    span = {Local.offsets(local).next, count}
+    {:ok, local} = Local.commit(local, binary_part(buffer, 0, valid), valid, span)
     local
   end
 

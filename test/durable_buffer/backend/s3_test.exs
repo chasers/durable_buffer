@@ -32,9 +32,9 @@ defmodule DurableBuffer.Backend.S3Test do
     {:ok, state} = S3.open(config, 0)
 
     {batch, bytes} = encode_batch(["a", "b"])
-    {:ok, state} = S3.commit(state, batch, bytes)
+    {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
     {batch, bytes} = encode_batch(["c"])
-    {:ok, state} = S3.commit(state, batch, bytes)
+    {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
 
     assert Map.keys(FakeS3.objects(store)) |> Enum.sort() == [
              "buffers/test/p0/000000000000.wal",
@@ -56,9 +56,9 @@ defmodule DurableBuffer.Backend.S3Test do
     {:ok, state1} = S3.open(config, 1)
 
     {batch, bytes} = encode_batch(["p0"])
-    {:ok, _state0} = S3.commit(state0, batch, bytes)
+    {:ok, _state0} = S3.commit(state0, batch, bytes, span(S3, state0, batch))
     {batch, bytes} = encode_batch(["p1"])
-    {:ok, _state1} = S3.commit(state1, batch, bytes)
+    {:ok, _state1} = S3.commit(state1, batch, bytes, span(S3, state1, batch))
 
     assert Enum.to_list(S3.stream(config, 0)) == ["p0"]
     assert Enum.to_list(S3.stream(config, 1)) == ["p1"]
@@ -68,13 +68,13 @@ defmodule DurableBuffer.Backend.S3Test do
     {config, store} = start_backend()
     {:ok, state} = S3.open(config, 0)
     {batch, bytes} = encode_batch(["first"])
-    {:ok, _state} = S3.commit(state, batch, bytes)
+    {:ok, _state} = S3.commit(state, batch, bytes, span(S3, state, batch))
 
     {:ok, reopened} = S3.open(config, 0)
     assert S3.offsets(reopened) == %{first: 0, next: 1}
 
     {batch, bytes} = encode_batch(["second"])
-    {:ok, _state} = S3.commit(reopened, batch, bytes)
+    {:ok, _state} = S3.commit(reopened, batch, bytes, span(S3, reopened, batch))
 
     assert map_size(FakeS3.objects(store)) == 2
     assert Enum.to_list(S3.stream(config, 0)) == ["first", "second"]
@@ -87,7 +87,7 @@ defmodule DurableBuffer.Backend.S3Test do
     state =
       Enum.reduce(1..5, state, fn index, state ->
         {batch, bytes} = encode_batch(["entry-#{index}"])
-        {:ok, state} = S3.commit(state, batch, bytes)
+        {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
         state
       end)
 
@@ -104,9 +104,9 @@ defmodule DurableBuffer.Backend.S3Test do
     {:ok, state1} = S3.open(config, 1)
 
     {batch, bytes} = encode_batch(["drop"])
-    {:ok, state0} = S3.commit(state0, batch, bytes)
+    {:ok, state0} = S3.commit(state0, batch, bytes, span(S3, state0, batch))
     {batch, bytes} = encode_batch(["keep"])
-    {:ok, _state1} = S3.commit(state1, batch, bytes)
+    {:ok, _state1} = S3.commit(state1, batch, bytes, span(S3, state1, batch))
 
     {:ok, _state0} = S3.truncate(state0, 1)
 
@@ -121,7 +121,7 @@ defmodule DurableBuffer.Backend.S3Test do
     {:ok, state} = S3.open(config, 0)
 
     {batch, bytes} = encode_batch(["one", "two"])
-    {:ok, state} = S3.commit(state, batch, bytes)
+    {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
     assert S3.offsets(state) == %{first: 0, next: 2}
 
     {:ok, state} = S3.truncate(state, 2)
@@ -131,7 +131,7 @@ defmodule DurableBuffer.Backend.S3Test do
     assert S3.offsets(reopened) == %{first: 2, next: 2}
 
     {batch, bytes} = encode_batch(["three"])
-    {:ok, state} = S3.commit(reopened, batch, bytes)
+    {:ok, state} = S3.commit(reopened, batch, bytes, span(S3, reopened, batch))
     assert S3.offsets(state) == %{first: 2, next: 3}
 
     assert Enum.to_list(S3.stream(config, 0, with_offsets: true)) == [{2, "three"}]
@@ -164,6 +164,12 @@ defmodule DurableBuffer.Backend.S3Test do
     {:ok, state} = S3.open(config, 0)
     {batch, bytes} = encode_batch(["doomed"])
 
-    assert {:error, {:unexpected_status, 500}, _state} = S3.commit(state, batch, bytes)
+    assert {:error, {:unexpected_status, 500}, _state} =
+             S3.commit(state, batch, bytes, span(S3, state, batch))
+  end
+
+  defp span(module, state, batch) do
+    {payloads, _valid, _rest} = batch |> IO.iodata_to_binary() |> DurableBuffer.WAL.decode_all()
+    {module.offsets(state).next, length(payloads)}
   end
 end

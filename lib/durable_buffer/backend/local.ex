@@ -19,6 +19,7 @@ defmodule DurableBuffer.Backend.Local do
 
   @behaviour DurableBuffer.Backend
 
+  alias DurableBuffer.Backend.Local.Index
   alias DurableBuffer.Meta
   alias DurableBuffer.WAL
 
@@ -26,7 +27,11 @@ defmodule DurableBuffer.Backend.Local do
 
   @impl DurableBuffer.Backend
   def init_config(opts) do
-    %{dir: Keyword.fetch!(opts, :dir), fsync: Keyword.get(opts, :fsync, true)}
+    %{
+      dir: Keyword.fetch!(opts, :dir),
+      fsync: Keyword.get(opts, :fsync, true),
+      index: Keyword.get(opts, :index, true)
+    }
   end
 
   @impl DurableBuffer.Backend
@@ -46,15 +51,19 @@ defmodule DurableBuffer.Backend.Local do
        dir: config.dir,
        partition_index: partition_index,
        base_offset: meta.base_offset,
-       entry_count: entry_count
+       entry_count: entry_count,
+       index: open_index(config, partition_index, offset)
      }}
   end
 
-  @doc """
-  Logical entry offsets as of `open/2` or the last `truncate/1`.
+  defp open_index(%{index: false}, _partition_index, _offset), do: %{fd: nil, path: nil}
 
-  `DurableBuffer.Partition.Committer` seeds its offset counter from this and
-  assigns every offset after it, so these do not track later commits.
+  defp open_index(config, partition_index, offset) do
+    Index.open(config.dir, partition_index, offset)
+  end
+
+  @doc """
+  The partition's logical entry offset bounds.
   """
   @impl DurableBuffer.Backend
   @spec offsets(map()) :: %{first: non_neg_integer(), next: non_neg_integer()}
@@ -63,10 +72,12 @@ defmodule DurableBuffer.Backend.Local do
   end
 
   @impl DurableBuffer.Backend
-  def commit(state, batch, byte_size) do
+  def commit(state, batch, byte_size, {first_offset, count}) do
     with :ok <- :file.write(state.fd, batch),
          :ok <- sync(state) do
-      {:ok, %{state | offset: state.offset + byte_size}}
+      Index.append(state.index, first_offset, state.offset)
+
+      {:ok, %{state | offset: state.offset + byte_size, entry_count: state.entry_count + count}}
     else
       {:error, reason} -> {:error, reason, state}
     end
@@ -132,12 +143,25 @@ defmodule DurableBuffer.Backend.Local do
 
   @impl DurableBuffer.Backend
   def stream(config, partition_index, opts) do
-    base = Meta.load(config.dir, partition_index).base_offset
+    meta = Meta.load(config.dir, partition_index)
+    from = Keyword.get(opts, :from)
+    {start_byte, start_offset} = start_at(config.dir, partition_index, meta, from)
 
     config.dir
     |> wal_path(partition_index)
-    |> stream_file(Keyword.get(opts, :limit))
-    |> project(base, Keyword.get(opts, :from), Keyword.get(opts, :with_offsets, false))
+    |> stream_file(limit: Keyword.get(opts, :limit), start: start_byte)
+    |> project(start_offset, from, Keyword.get(opts, :with_offsets, false))
+  end
+
+  defp start_at(_dir, _partition_index, meta, nil) do
+    {meta.base_byte_offset, meta.base_offset}
+  end
+
+  defp start_at(dir, partition_index, meta, from) do
+    case Index.seek(dir, partition_index, from) do
+      nil -> {meta.base_byte_offset, meta.base_offset}
+      found -> found
+    end
   end
 
   defp project(stream, _base, nil, false), do: stream
@@ -176,23 +200,36 @@ defmodule DurableBuffer.Backend.Local do
     end)
 
     {:ok, fd} = :file.open(state.path, [:append, :raw, :binary])
-    {:ok, %{state | fd: fd, offset: 0, base_offset: next, entry_count: 0}}
+
+    {:ok,
+     %{
+       state
+       | fd: fd,
+         offset: 0,
+         base_offset: next,
+         entry_count: 0,
+         index: Index.reset(state.index)
+     }}
   end
 
   @impl DurableBuffer.Backend
   def close(state) do
+    :ok = Index.close(state.index)
     :ok = :file.close(state.fd)
   end
 
   @doc """
   Lazily streams CRC-valid WAL payloads from a file, reading in chunks.
   """
-  @spec stream_file(Path.t(), DurableBuffer.Backend.limit_fun() | nil) :: Enumerable.t()
-  def stream_file(path, limit_fun \\ nil) do
+  @spec stream_file(Path.t(), keyword()) :: Enumerable.t()
+  def stream_file(path, opts \\ []) do
+    limit_fun = Keyword.get(opts, :limit)
+    start = Keyword.get(opts, :start, 0)
+
     Stream.resource(
       fn ->
         case :file.open(path, [:read, :raw, :binary, {:read_ahead, @read_chunk_size}]) do
-          {:ok, fd} -> {fd, <<>>, 0}
+          {:ok, fd} -> position(fd, start)
           {:error, :enoent} -> :done
         end
       end,
@@ -221,6 +258,15 @@ defmodule DurableBuffer.Backend.Local do
         {fd, _buffer, _position} -> :file.close(fd)
       end
     )
+  end
+
+  defp position(fd, 0), do: {fd, <<>>, 0}
+
+  defp position(fd, start) do
+    case :file.position(fd, start) do
+      {:ok, _position} -> {fd, <<>>, start}
+      {:error, _reason} -> {fd, <<>>, 0}
+    end
   end
 
   defp readable_bytes(nil, _position), do: @read_chunk_size

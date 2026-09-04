@@ -19,9 +19,7 @@ defmodule DurableBuffer.Meta do
   Framed as `<<epoch::64, base_offset::64, base_byte_offset::64, crc32::32>>`.
 
   A missing or corrupt file reads as all zeroes — the safe direction, since
-  a stale epoch is rejected by peers rather than accepted. The 12-byte
-  `<<epoch::64, crc32::32>>` record written before 0.4.0 is still read, so
-  an upgrade keeps its epoch instead of resyncing every replica.
+  a stale epoch is rejected by peers rather than accepted.
   """
 
   defstruct epoch: 0, base_offset: 0, base_byte_offset: 0
@@ -89,12 +87,6 @@ defmodule DurableBuffer.Meta do
     else
       %__MODULE__{}
     end
-  end
-
-  defp decode(<<body::binary-size(8), crc::32-big>>) do
-    <<epoch::64-big>> = body
-
-    if :erlang.crc32(body) == crc, do: %__MODULE__{epoch: epoch}, else: %__MODULE__{}
   end
 
   defp decode(_other), do: %__MODULE__{}

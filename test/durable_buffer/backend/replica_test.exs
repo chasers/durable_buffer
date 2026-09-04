@@ -25,7 +25,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {:ok, state} = Replica.open(config, 0)
     {batch, bytes} = encode_batch(["replicated-entry"])
 
-    assert {:ok, state} = Replica.commit(state, batch, bytes)
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     assert Enum.to_list(Replica.stream(config, 0)) == ["replicated-entry"]
 
@@ -51,7 +51,8 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {:ok, state} = Replica.open(config, 0)
     {batch, bytes} = encode_batch(["never-acked"])
 
-    assert {:error, {:insufficient_acks, 1, 2}, state} = Replica.commit(state, batch, bytes)
+    assert {:error, {:insufficient_acks, 1, 2}, state} =
+             Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     assert Enum.to_list(Replica.stream(config, 0)) == ["never-acked"]
     assert :ok = Replica.close(state)
@@ -72,7 +73,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {:ok, state} = Replica.open(config, 0)
     {batch, bytes} = encode_batch(["quorum-entry"])
 
-    assert {:ok, state} = Replica.commit(state, batch, bytes)
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
     assert Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0)) == ["quorum-entry"]
     assert :ok = Replica.close(state)
   end
@@ -92,7 +93,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
     {:ok, state} = Replica.open(config, 0)
     {batch, bytes} = encode_batch(["majority"])
-    assert {:ok, state} = Replica.commit(state, batch, bytes)
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
     assert :ok = Replica.close(state)
   end
 
@@ -104,7 +105,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
     {:ok, state} = Replica.open(config, 0)
     {batch, bytes} = encode_batch(["to-be-dropped"])
-    {:ok, state} = Replica.commit(state, batch, bytes)
+    {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     assert {:ok, state} = Replica.truncate(state, 0)
 
@@ -132,7 +133,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     assert state.local.fsync == true
 
     {batch, bytes} = encode_batch(["synced-everywhere"])
-    assert {:ok, state} = Replica.commit(state, batch, bytes)
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     writer = DurableBuffer.Replica.writer_pid(replica_dir, 0, true)
     assert :sys.get_state(writer).local.fsync == true
@@ -178,12 +179,12 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
     {:ok, state} = Replica.open(config, 0)
     {batch, bytes} = encode_batch(["watermarked"])
-    {:ok, state} = Replica.commit(state, batch, bytes)
+    {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     assert state.watermarks == %{:local => {0, bytes}, node() => {0, bytes}}
 
     {batch2, bytes2} = encode_batch(["again"])
-    {:ok, state} = Replica.commit(state, batch2, bytes2)
+    {:ok, state} = Replica.commit(state, batch2, bytes2, span(Replica, state, batch2))
 
     assert state.watermarks == %{
              :local => {0, bytes + bytes2},
@@ -227,7 +228,10 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     solo_config = Replica.init_config(dir: primary_dir, replica_dir: replica_dir, replicas: [])
     {:ok, solo_state} = Replica.open(solo_config, 0)
     {batch1, bytes1} = encode_batch(["missed-by-replica"])
-    {:ok, solo_state} = Replica.commit(solo_state, batch1, bytes1)
+
+    {:ok, solo_state} =
+      Replica.commit(solo_state, batch1, bytes1, span(Replica, solo_state, batch1))
+
     :ok = Replica.close(solo_state)
 
     config =
@@ -241,7 +245,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {:ok, state} = Replica.open(config, 0)
     {batch2, bytes2} = encode_batch(["after-the-gap"])
 
-    assert {:ok, state} = Replica.commit(state, batch2, bytes2)
+    assert {:ok, state} = Replica.commit(state, batch2, bytes2, span(Replica, state, batch2))
 
     assert Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0)) ==
              ["missed-by-replica", "after-the-gap"]
@@ -262,7 +266,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     assert state.epoch == 0
 
     {batch, bytes} = encode_batch(["pre-truncate"])
-    {:ok, state} = Replica.commit(state, batch, bytes)
+    {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     {:ok, state} = Replica.truncate(state, 0)
     assert state.epoch == 1
@@ -270,7 +274,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     assert DurableBuffer.Meta.epoch(replica_dir, 0) == 1
 
     {batch, bytes} = encode_batch(["post-truncate"])
-    assert {:ok, state} = Replica.commit(state, batch, bytes)
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     assert Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0)) ==
              ["post-truncate"]
@@ -292,7 +296,10 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {:ok, solo_state} = Replica.truncate(solo_state, 0)
     assert solo_state.epoch == 1
     {new_batch, new_bytes} = encode_batch(["new-epoch-data"])
-    {:ok, solo_state} = Replica.commit(solo_state, new_batch, new_bytes)
+
+    {:ok, solo_state} =
+      Replica.commit(solo_state, new_batch, new_bytes, span(Replica, solo_state, new_batch))
+
     :ok = Replica.close(solo_state)
 
     config =
@@ -306,7 +313,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
     {:ok, state} = Replica.open(config, 0)
     {batch, bytes} = encode_batch(["after-heal"])
 
-    assert {:ok, state} = Replica.commit(state, batch, bytes)
+    assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
     assert Enum.to_list(Local.stream(Local.init_config(dir: replica_dir), 0)) ==
              ["new-epoch-data", "after-heal"]
@@ -460,7 +467,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
       {:ok, state} = Replica.open(config, 0)
       {batch, bytes} = encode_batch(["acked-then-lost"])
-      assert {:ok, state} = Replica.commit(state, batch, bytes)
+      assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
       assert :ok = Replica.close(state)
 
       crash_primary(primary_dir, 0)
@@ -487,7 +494,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
       state =
         Enum.reduce(["one", "two", "three"], state, fn payload, state ->
           {batch, bytes} = encode_batch([payload])
-          {:ok, state} = Replica.commit(state, batch, bytes)
+          {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
           state
         end)
 
@@ -510,7 +517,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
       {:ok, state} = Replica.open(config, 0)
       {batch, bytes} = encode_batch(["level"])
-      assert {:ok, state} = Replica.commit(state, batch, bytes)
+      assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
       assert :ok = Replica.close(state)
 
       {:ok, state} = Replica.open(config, 0)
@@ -547,7 +554,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
       {:ok, state} = Replica.open(config, 0)
       {batch, bytes} = encode_batch(["old-epoch"])
-      assert {:ok, state} = Replica.commit(state, batch, bytes)
+      assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
       assert :ok = Replica.close(state)
 
       crash_primary(primary_dir, 0)
@@ -574,7 +581,7 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
       {:ok, state} = Replica.open(config, 0)
       {batch, bytes} = encode_batch(["before-truncate"])
-      assert {:ok, state} = Replica.commit(state, batch, bytes)
+      assert {:ok, state} = Replica.commit(state, batch, bytes, span(Replica, state, batch))
 
       before = state |> Replica.status() |> Map.fetch!(node())
       assert before.adopted_epoch == 0
@@ -611,5 +618,10 @@ defmodule DurableBuffer.Backend.ReplicaTest do
 
       assert :ok = Replica.close(state)
     end
+  end
+
+  defp span(module, state, batch) do
+    {payloads, _valid, _rest} = batch |> IO.iodata_to_binary() |> DurableBuffer.WAL.decode_all()
+    {module.offsets(state).next, length(payloads)}
   end
 end
