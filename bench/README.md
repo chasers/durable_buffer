@@ -36,6 +36,7 @@ Reproduce with:
 ```sh
 mix run bench/local_bench.exs
 REPLICAS=2 ACK=all mix run bench/replica_bench.exs
+mix run bench/transport_bench.exs
 mix run bench/s3_bench.exs                              # fake S3, 30ms PUT
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs    # real S3
 ```
@@ -260,3 +261,52 @@ parallel      average     median     99th %
 
 At 64 parallel callers the median is ~2× PUT latency: a caller lands mid-PUT,
 waits for it to finish, then rides the next group commit.
+
+## Replication transport
+
+`mix run bench/transport_bench.exs`
+
+Append throughput and caller latency for each transport, with and without an
+unrelated load on the distribution channel between the same node pair. The
+hog is four processes shipping 4 MiB `:erpc` payloads to the replica node —
+traffic replication has nothing to do with, which is the point. `HOGS`
+(default `0,4`) sets the counts. `BENCH_DURATION_MS`, `BENCH_WARMUP_MS` and
+`PARTITIONS` apply as elsewhere.
+
+Both nodes run on this host, so this measures contention for one socket and
+the scheduler, not a saturated network. Three runs, 64 KiB payloads, 8
+partitions:
+
+| transport | hogs | ops/s | p50 us | p99 us |
+|---|---|---|---|---|
+| distribution | 0 | 26402 / 29750 / 20578 | 388 / 376 / 377 | 1926 / 1939 / 1886 |
+| distribution | 4 | 10360 / 10457 / 10238 | 3356 / 3482 / 2712 | 8743 / 13206 / 10738 |
+| gen_rpc | 0 | 29062 / 32108 / 29387 | 403 / 379 / 414 | 2017 / 1933 / 1917 |
+| gen_rpc | 4 | 26140 / 14324 / 25035 | 511 / 500 / 516 | 2102 / 2123 / 3206 |
+
+**Idle, the two are the same.** Same p50 to within 10%, same p99, and
+overlapping throughput. Nothing here argues for gen_rpc on a quiet pair.
+
+**Under contention, all three columns separate, and the direction is the
+same in every run.**
+
+* **Throughput.** Distribution drops to ~10.3k ops/s, from ~26k idle — a
+  2.5x fall, and the most repeatable number in the table (10360 / 10457 /
+  10238). gen_rpc holds 14k-26k.
+* **p50.** Distribution rises 7-9x, to ~2700-3500 us. gen_rpc rises about
+  1.3x, to ~510 us.
+* **p99.** Distribution rises 4.5-7x, to ~8700-13200 us. gen_rpc stays
+  within 1.1-1.7x of idle.
+
+So a contended pair costs distribution most of its throughput and roughly an
+order of magnitude of median latency. gen_rpc gives up little of either.
+
+**An earlier version of this bench reported no throughput difference.** That
+was a harness bug, not a finding. `hog_loop/2` put its recursive call inside
+a `try` — a function-level `catch` wraps the whole body — so it was not a
+tail call and each hog's stack grew without bound (measured: 71 MB and
+climbing, against 2.7 KB for the fixed loop). The load the hogs applied
+therefore drifted across the measurement window instead of staying constant,
+which buried the effect. The hogs also were not awaited on kill and the
+replica writers were never stopped, so residue accumulated in loop order.
+All three are fixed.
