@@ -27,6 +27,10 @@ defmodule DurableBuffer.Backend.S3Test do
     {entries, IO.iodata_length(entries)}
   end
 
+  test "is available when req and req_s3 are loaded" do
+    assert S3.available?()
+  end
+
   test "each commit writes one immutable segment object" do
     {config, store} = start_backend()
     {:ok, state} = S3.open(config, 0)
