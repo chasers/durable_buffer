@@ -24,8 +24,8 @@ defmodule DurableBuffer.MixProject do
 
   defp deps do
     [
-      {:req, "~> 0.5"},
-      {:req_s3, "~> 0.2"},
+      {:req, "~> 0.5", optional: true},
+      {:req_s3, "~> 0.2", optional: true},
       {:benchee, "~> 1.3", only: :dev},
       {:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1", only: [:dev, :test]},
       {:plug, "~> 1.16", only: [:dev, :test]}
