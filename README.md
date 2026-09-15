@@ -556,6 +556,15 @@ separate TLS configuration and the git dependency are not worth it.
  req_options: [aws_sigv4: [access_key_id: ..., secret_access_key: ...]]}
 ```
 
+**Add the dependencies yourself.** `:req` and `:req_s3` are optional
+dependencies of `:durable_buffer`, so an application that does not use S3
+does not pull them in. Add them to your own application to use this backend:
+
+```elixir
+{:req, "~> 0.5"},
+{:req_s3, "~> 0.2"}
+```
+
 Uses [`req_s3`](https://hex.pm/packages/req_s3). Each group commit uploads
 one immutable segment object (`<prefix>/p<partition>/<offset>.wal`, keyed by
 the segment's first logical entry offset), so durability is exactly PUT
