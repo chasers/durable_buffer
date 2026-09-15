@@ -565,6 +565,10 @@ does not pull them in. Add them to your own application to use this backend:
 {:req_s3, "~> 0.2"}
 ```
 
+`init_config/1` raises when either one is not loaded, so a missing
+dependency is an argument error at startup rather than an undefined
+function when the first partition opens.
+
 Uses [`req_s3`](https://hex.pm/packages/req_s3). Each group commit uploads
 one immutable segment object (`<prefix>/p<partition>/<offset>.wal`, keyed by
 the segment's first logical entry offset), so durability is exactly PUT

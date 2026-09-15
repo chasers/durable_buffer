@@ -41,12 +41,34 @@ defmodule DurableBuffer.Backend.S3 do
 
   @behaviour DurableBuffer.Backend
 
+  @compile {:no_warn_undefined, [Req, ReqS3]}
+
   alias DurableBuffer.WAL
 
   @offset_width 12
 
+  @doc """
+  Returns whether `:req` and `:req_s3` are loaded.
+
+  Both are optional dependencies of `:durable_buffer`, so an application
+  that uses this backend must declare them itself. `init_config/1` checks
+  this, so a missing dependency fails at startup rather than when the
+  first partition opens.
+  """
+  @spec available?() :: boolean()
+  def available? do
+    Code.ensure_loaded?(Req) and Code.ensure_loaded?(ReqS3)
+  end
+
   @impl DurableBuffer.Backend
   def init_config(opts) do
+    unless available?() do
+      raise ArgumentError,
+            "DurableBuffer.Backend.S3 needs :req and :req_s3, which are not loaded. " <>
+              "durable_buffer declares them as optional dependencies. " <>
+              ~s|Add {:req, "~> 0.5"} and {:req_s3, "~> 0.2"} to your own application.|
+    end
+
     %{
       bucket: Keyword.fetch!(opts, :bucket),
       prefix: Keyword.get(opts, :prefix, "durable_buffer"),
