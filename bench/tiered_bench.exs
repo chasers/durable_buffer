@@ -1,3 +1,5 @@
+import Bitwise
+
 Code.require_file("support/bench_helper.exs", __DIR__)
 
 alias DurableBuffer.Backend.Tiered
@@ -8,6 +10,26 @@ partitions = String.to_integer(System.get_env("PARTITIONS", "4"))
 bucket = System.get_env("S3_BENCH_BUCKET")
 puts = :counters.new(1, [:write_concurrency])
 
+compression =
+  case System.get_env("COMPRESSION") do
+    nil -> DurableBuffer.Compression.default()
+    value -> String.to_existing_atom(value)
+  end
+
+log_payload = fn size ->
+  line = fn ->
+    ~s({"ts":"2026-09-16T14:#{:rand.uniform(59)}:#{:rand.uniform(59)}.#{:rand.uniform(999_999)}Z",) <>
+      ~s("level":"info","event_message":"request completed","request_id":"#{:rand.uniform(1 <<< 60)}",) <>
+      ~s("status":#{Enum.random([200, 201, 204, 404, 500])},"duration_ms":#{:rand.uniform(900)}}\n)
+  end
+
+  Stream.repeatedly(line)
+  |> Enum.reduce_while("", fn chunk, acc ->
+    if byte_size(acc) >= size, do: {:halt, acc}, else: {:cont, acc <> chunk}
+  end)
+  |> binary_part(0, size)
+end
+
 req_options =
   if bucket do
     IO.puts("tiered backend: real bucket #{bucket} (credentials/endpoint from AWS_* env vars)")
@@ -16,7 +38,8 @@ req_options =
     Code.require_file("../test/support/fake_s3.ex", __DIR__)
 
     simulated_latency_ms = String.to_integer(System.get_env("S3_SIM_LATENCY_MS", "30"))
-    {:ok, store} = DurableBuffer.Test.FakeS3.start_store()
+    {:ok, fake_store} = DurableBuffer.Test.FakeS3.start_store()
+    Process.put(:fake_store, fake_store)
     Req.Test.set_req_test_to_shared()
 
     Req.Test.stub(:tiered_bench_stub, fn conn ->
@@ -25,7 +48,7 @@ req_options =
         Process.sleep(simulated_latency_ms)
       end
 
-      DurableBuffer.Test.FakeS3.call(conn, store)
+      DurableBuffer.Test.FakeS3.call(conn, fake_store)
     end)
 
     IO.puts(
@@ -55,6 +78,7 @@ segment_opts =
        [
          dir: dir,
          ack: ack,
+         compression: compression,
          bucket: bucket || "bench-bucket",
          prefix: "durable_buffer_bench/#{System.os_time(:second)}",
          req_options: req_options
@@ -64,7 +88,7 @@ segment_opts =
 %{backend: {Tiered, config}} = DurableBuffer.config(:bench_tiered)
 
 IO.puts(
-  "ack=#{ack} partitions=#{partitions} fsync=#{config.fsync} segment_ms=#{config.segment_ms} " <>
+  "ack=#{ack} compression=#{config.s3.compression} partitions=#{partitions} fsync=#{config.fsync} segment_ms=#{config.segment_ms} " <>
     "segment_bytes=#{config.segment_bytes}"
 )
 
@@ -91,7 +115,7 @@ IO.puts(
 )
 
 for payload_size <- [1024, 16 * 1024], concurrency <- [1, 32, 256] do
-  payload = :binary.copy("x", payload_size)
+  payload = log_payload.(payload_size)
   :counters.put(puts, 1, 0)
   deadline = System.monotonic_time(:millisecond) + duration_ms
 
@@ -127,7 +151,7 @@ end
 
 IO.puts("\n== Upload lag: append return to S3 watermark, 1KB, 1 caller ==")
 
-payload = :binary.copy("x", 1024)
+payload = log_payload.(1024)
 index = DurableBuffer.partition_index(:bench_tiered, :lag)
 
 await_watermark = fn await_watermark, target, started ->
@@ -154,6 +178,43 @@ IO.puts(
 )
 
 DurableBuffer.truncate_all(:bench_tiered)
+
+if fake_store = Process.get(:fake_store) do
+  IO.puts("\n== Compression: 2000 x 1KB log-like entries in one partition ==")
+
+  entries = for _entry <- 1..2000, do: log_payload.(1024)
+  {:ok, first.._last//_step} = DurableBuffer.append_batch(:bench_tiered, :ratio, entries)
+  ratio_index = DurableBuffer.partition_index(:bench_tiered, :ratio)
+  started = System.monotonic_time(:microsecond)
+
+  await_watermark = fn await_watermark, target ->
+    if Tiered.uploaded(config, ratio_index) >= target do
+      :ok
+    else
+      Process.sleep(5)
+      await_watermark.(await_watermark, target)
+    end
+  end
+
+  await_watermark.(await_watermark, first + 2000)
+  _waited = System.monotonic_time(:microsecond) - started
+
+  stored =
+    fake_store
+    |> DurableBuffer.Test.FakeS3.objects()
+    |> Enum.filter(fn {key, _body} -> String.contains?(key, "/p#{ratio_index}/") end)
+    |> Enum.map(fn {_key, body} -> byte_size(body) end)
+    |> Enum.sum()
+
+  raw = 2000 * (1024 + 8)
+
+  IO.puts(
+    "raw #{Bench.format_bytes(raw)}, stored #{Bench.format_bytes(stored)}, " <>
+      "ratio #{:erlang.float_to_binary(raw / max(stored, 1), decimals: 1)}x"
+  )
+
+  DurableBuffer.truncate_all(:bench_tiered)
+end
 
 Bench.latency(:bench_tiered, payload_size: 1024, parallel_levels: [1, 64])
 

@@ -38,7 +38,7 @@ mix run bench/local_bench.exs
 REPLICAS=2 ACK=all mix run bench/replica_bench.exs
 mix run bench/transport_bench.exs
 mix run bench/s3_bench.exs                              # fake S3, 30ms PUT
-ACK=local SEGMENT_MS=1000 mix run bench/tiered_bench.exs  # ACK=local|remote
+ACK=local SEGMENT_MS=1000 mix run bench/tiered_bench.exs  # ACK=local|remote COMPRESSION=zstd|gzip|none
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs    # real S3
 ```
 
@@ -266,42 +266,70 @@ waits for it to finish, then rides the next group commit.
 ## Tiered (experimental; in-memory fake S3, 30 ms simulated PUT latency, 4 partitions)
 
 Captured 2026-09-16 on the same machine with `BENCH_DURATION_MS=3000
-BENCH_TIME=3`. These are single runs. Read them for shape, not for exact
+BENCH_TIME=3 SEGMENT_MS=1000`. Payloads are log-like JSON lines, not one
+repeated byte. These are single runs. Read them for shape, not for exact
 numbers.
 
-**`ack: :local`** (`SEGMENT_MS=1000`). An append waits for one local
-`datasync`. Throughput follows the local backend. The PUT rate stays near
-one per partition per second, whatever the load:
+> An earlier capture in this section was wrong at 16 KB. The fake S3 read
+> only the first 8 MB of a PUT body, so large segment uploads failed and
+> retried, and the commit path did not pay for them. The fake now reads the
+> whole body.
+
+**`ack: :local`, `compression: :zstd` (default).** An append waits for one
+local `datasync`. The PUT rate stays near one per partition per second:
 
 ```
 payload   callers         ops/s      MB/s    PUTs/s  entries/PUT
-1KB       1                2.1k       2.1         1         3.2k
-1KB       32              12.4k      12.1         3         4.6k
-1KB       256             80.6k      78.7         7        12.1k
-16KB      1                2.2k      34.0         2         1.3k
-16KB      32              11.0k     171.8         7         1.6k
-16KB      256             62.2k     972.6         7         9.3k
+1KB       1                2.4k       2.3         1         3.5k
+1KB       32              12.7k      12.4         3         4.8k
+1KB       256             47.2k      46.1         3        17.7k
+16KB      1                1.1k      17.1         1         1.6k
+16KB      32               6.4k      99.4         3         2.1k
+16KB      256             35.4k     553.3         8         4.6k
 ```
 
-Upload lag from append to S3 is about `segment_ms`: median 1043 ms. Caller
-latency (1 KB) has a median of 243 µs with 1 caller and 3.37 ms with 64.
+**`ack: :local`, `compression: :none`**, for comparison:
 
-**`ack: :remote`** (defaults). An append waits for its segment's PUT. The
-uploader seals the active segment each time it goes idle, so the shape
-matches the S3 backend. The same fake gives the S3 backend 32 / 512 / 4.2k
-ops/s at 1 / 32 / 256 callers:
+```
+payload   callers         ops/s      MB/s    PUTs/s  entries/PUT
+1KB       1                2.4k       2.3         1         3.5k
+1KB       32              14.0k      13.7         3         5.3k
+1KB       256             48.7k      47.6         3        18.3k
+16KB      1                 967      15.1         1         1.4k
+16KB      32               7.0k     108.6         3         2.3k
+16KB      256             43.3k     675.9        10         4.3k
+```
+
+Compression costs little on the append path: the uploader compresses in
+1 MiB chunks at low process priority, and local files stay plain. Repeated
+paired runs at 16 KB × 256 callers put zstd and none within run-to-run noise
+(30-40k ops/s each). With no uploads in the window the same case reaches
+about 94k ops/s. So at that rate the limit is reading 64 MiB segments back
+off the SSD that takes the fsynced writes, not the codec.
+
+Stored size for 2000 × 1 KB log-like entries: 306 KB with zstd, 1 MB plain
+(**6.6x**). zstd level 1 measured about 800 MB/s on one core, and gzip about
+95 MB/s at a similar ratio.
+
+Upload lag from append to S3 is about `segment_ms`: median 1038 ms. Caller
+latency (1 KB) has a median of 296 µs with 1 caller and 2.51 ms with 64.
+
+**`ack: :remote`, `compression: :zstd`.** An append waits for its segment's
+PUT. The uploader seals the active segment each time it goes idle, so the
+shape matches the S3 backend. The same fake gives the S3 backend 32 / 512 /
+4.2k ops/s at 1 / 32 / 256 callers:
 
 ```
 payload   callers         ops/s      MB/s    PUTs/s  entries/PUT
 1KB       1                  28       0.0        28            1
-1KB       32                424       0.4       106            4
-1KB       256              5.0k       4.9       105           48
-16KB      1                  25       0.4        25            1
-16KB      32                646      10.1       103            6
-16KB      256              6.3k      99.0        99           64
+1KB       32                437       0.4       109            4
+1KB       256              6.5k       6.4       102           64
+16KB      1                  27       0.4        27            1
+16KB      32                654      10.2       104            6
+16KB      256              6.0k      93.2       103           58
 ```
 
-Caller latency (1 KB) has a median of 35.5 ms with 1 caller and 41.4 ms
+Caller latency (1 KB) has a median of 35.8 ms with 1 caller and 39.9 ms
 with 64.
 
 A first version sealed only on `segment_ms` in this mode. Blocked callers

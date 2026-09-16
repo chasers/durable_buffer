@@ -38,7 +38,7 @@ defmodule DurableBuffer.Test.FakeS3 do
 
     case {conn.method, Map.get(conn, :request_path) || "/"} do
       {"PUT", "/" <> key} ->
-        {:ok, body, conn} = read_body(conn)
+        {body, conn} = read_full_body(conn, [])
         stamp = System.system_time(:millisecond)
         Agent.update(store, &Map.put(&1, key, {body, stamp}))
         send_resp(conn, 200, "")
@@ -55,6 +55,13 @@ defmodule DurableBuffer.Test.FakeS3 do
       {"DELETE", "/" <> key} ->
         Agent.update(store, &Map.delete(&1, key))
         send_resp(conn, 204, "")
+    end
+  end
+
+  defp read_full_body(conn, acc) do
+    case read_body(conn) do
+      {:ok, chunk, conn} -> {IO.iodata_to_binary([acc, chunk]), conn}
+      {:more, chunk, conn} -> read_full_body(conn, [acc, chunk])
     end
   end
 

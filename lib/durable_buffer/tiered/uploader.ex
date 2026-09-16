@@ -8,8 +8,9 @@ defmodule DurableBuffer.Tiered.Uploader do
   the partition's `uploaded` file and sends `{:backend, {:uploaded, through}}`
   to that owner, which settles `ack: :remote` commits and releases backlog.
 
-  An upload is one `DurableBuffer.Backend.S3.commit/4` of the whole segment,
-  so the S3 object has the same key and framing as a segment written by the
+  An upload reads the segment file in 1 MiB chunks, compresses it with the
+  configured codec, and PUTs it with `DurableBuffer.Backend.S3.put_segment/3`.
+  So the S3 object has the same key and framing as a segment written by the
   S3 backend. A failed upload retries with exponential backoff and never
   skips a segment, so S3 always holds a contiguous prefix of the log. A
   sealed file never changes, so a retry or a second upload after a crash
@@ -27,6 +28,7 @@ defmodule DurableBuffer.Tiered.Uploader do
   require Logger
 
   alias DurableBuffer.Backend.S3
+  alias DurableBuffer.Compression
   alias DurableBuffer.Tiered.Segments
 
   @min_backoff_ms 100
@@ -72,6 +74,8 @@ defmodule DurableBuffer.Tiered.Uploader do
 
   @impl GenServer
   def init(opts) do
+    Process.flag(:priority, :low)
+
     state = %{
       owner: Keyword.fetch!(opts, :owner),
       s3: Keyword.fetch!(opts, :s3),
@@ -134,14 +138,9 @@ defmodule DurableBuffer.Tiered.Uploader do
   end
 
   defp put(s3, segment) do
-    case File.read(segment.path) do
-      {:ok, binary} ->
-        case S3.commit(
-               s3,
-               binary,
-               byte_size(binary),
-               {segment.offset, segment.end - segment.offset}
-             ) do
+    case Compression.compress_file(segment.path, s3.config.compression) do
+      {:ok, body} ->
+        case S3.put_segment(s3, body, {segment.offset, segment.end - segment.offset}) do
           {:ok, s3} -> {:ok, s3}
           {:error, reason, _s3} -> {:error, reason}
         end

@@ -8,7 +8,9 @@ defmodule DurableBuffer.Backend.Tiered do
   uploads each sealed segment as one S3 object, strictly in offset order.
 
   Objects use the key layout of `DurableBuffer.Backend.S3`, and this backend
-  drives the S3 tier through that module. So a processor on any node reads
+  drives the S3 tier through that module. The uploader compresses each
+  segment before its PUT, `:zstd` by default. Local files stay uncompressed,
+  so compression costs nothing on the commit path. So a processor on any node reads
   the uploaded log with `DurableBuffer.Backend.S3.stream/3` and needs no
   running buffer.
 
@@ -42,6 +44,9 @@ defmodule DurableBuffer.Backend.Tiered do
     * `:dir` (required)
     * `:bucket` (required), `:prefix`, `:req_options` — as for
       `DurableBuffer.Backend.S3`
+    * `:compression` — `:zstd`, `:gzip` or `:none`; default
+      `DurableBuffer.Compression.default/0`: `:zstd` on OTP 28 and later,
+      `:gzip` before
     * `:ack` — `:local` or `:remote`, default `:local`
     * `:fsync` — default `true` for `:local`, `false` for `:remote`
     * `:segment_bytes` — default 64 MiB
@@ -56,6 +61,7 @@ defmodule DurableBuffer.Backend.Tiered do
   @behaviour DurableBuffer.Backend
 
   alias DurableBuffer.Backend.S3
+  alias DurableBuffer.Compression
   alias DurableBuffer.Tiered.Segments
   alias DurableBuffer.Tiered.Uploader
   alias DurableBuffer.WAL
@@ -70,7 +76,11 @@ defmodule DurableBuffer.Backend.Tiered do
 
     %{
       dir: Keyword.fetch!(opts, :dir),
-      s3: S3.init_config(Keyword.take(opts, [:bucket, :prefix, :req_options])),
+      s3:
+        opts
+        |> Keyword.take([:bucket, :prefix, :req_options])
+        |> Keyword.put(:compression, Keyword.get(opts, :compression, Compression.default()))
+        |> S3.init_config(),
       ack: ack,
       fsync: Keyword.get(opts, :fsync, ack == :local),
       segment_bytes: Keyword.get(opts, :segment_bytes, 64 * 1024 * 1024),

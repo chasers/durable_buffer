@@ -83,7 +83,7 @@ defmodule DurableBuffer.Backend.TieredTest do
     {:ok, state} = commit(state, ["three"])
     state = await_uploaded(state, 2)
 
-    assert "tiered/p0/000000000000.wal" in keys(store)
+    assert "tiered/p0/000000000000.wal.zst" in keys(store)
     assert local_files(tmp_dir) == ["000000000002.wal", "uploaded"]
     assert Tiered.uploaded(config, 0) == 2
 
@@ -100,7 +100,7 @@ defmodule DurableBuffer.Backend.TieredTest do
     {:ok, state} = commit(state, ["late"])
     state = await_uploaded(state, 1)
 
-    assert keys(store) == ["tiered/p0/000000000000.wal"]
+    assert keys(store) == ["tiered/p0/000000000000.wal.zst"]
     assert state.active == nil
     assert :ok = Tiered.close(state)
   end
@@ -113,7 +113,7 @@ defmodule DurableBuffer.Backend.TieredTest do
 
     {:ok, state} = commit(state, ["durable"])
 
-    assert keys(store) == ["tiered/p0/000000000000.wal"]
+    assert keys(store) == ["tiered/p0/000000000000.wal.zst"]
     assert Tiered.durable_offset(state) == 1
     assert :ok = Tiered.close(state)
   end
@@ -142,7 +142,7 @@ defmodule DurableBuffer.Backend.TieredTest do
 
     completions = await_completion(state, :tag)
     assert completions == [{:tag, :ok}]
-    assert keys(store) == ["tiered/p0/000000000000.wal"]
+    assert keys(store) == ["tiered/p0/000000000000.wal.zst"]
   end
 
   defp await_completion(state, tag) do
@@ -172,7 +172,7 @@ defmodule DurableBuffer.Backend.TieredTest do
 
     {:ok, state} = commit(state, ["after"])
 
-    assert keys(store) == ["tiered/p0/000000000000.wal"]
+    assert keys(store) == ["tiered/p0/000000000000.wal.zst"]
     assert local_files(tmp_dir) == ["000000000002.wal", "uploaded"]
     assert Enum.to_list(Tiered.stream(config, 0)) == ~w(before restart after)
     assert :ok = Tiered.close(state)
@@ -190,7 +190,10 @@ defmodule DurableBuffer.Backend.TieredTest do
 
       File.write!(
         Path.join([tmp_dir, "p0", "000000000000.wal"]),
-        store |> FakeS3.objects() |> Map.fetch!("tiered/p0/000000000000.wal")
+        store
+        |> FakeS3.objects()
+        |> Map.fetch!("tiered/p0/000000000000.wal.zst")
+        |> DurableBuffer.Compression.decompress(:zstd)
       )
 
       {:ok, state} = Tiered.open(config, 0)
@@ -302,7 +305,7 @@ defmodule DurableBuffer.Backend.TieredTest do
     {:ok, state} = Tiered.trim(state, 3)
 
     assert Tiered.offsets(state) == %{first: 2, next: 3}
-    assert "tiered/p0/000000000002.wal" not in keys(store)
+    assert "tiered/p0/000000000002.wal.zst" not in keys(store)
     assert Enum.to_list(Tiered.stream(config, 0)) == ~w(c)
     assert :ok = Tiered.close(state)
   end
@@ -340,6 +343,37 @@ defmodule DurableBuffer.Backend.TieredTest do
 
     assert {:error, :upload_backlog, state} = commit(state, ["refused"])
     assert Tiered.offsets(state).next == 1
+    assert :ok = Tiered.close(state)
+  end
+
+  test "segments upload zstd-compressed by default and plain with compression: :none",
+       %{tmp_dir: tmp_dir} do
+    payloads = for index <- 1..50, do: "log line #{index} with a repeated body"
+
+    %{config: config, state: state, store: store} = setup_backend(tmp_dir, segment_bytes: 1)
+    assert config.s3.compression == :zstd
+
+    {:ok, state} = commit(state, payloads)
+    state = await_uploaded(state, 50)
+
+    [{key, body}] = Map.to_list(FakeS3.objects(store))
+    assert key == "tiered/p0/000000000000.wal.zst"
+    plain_bytes = payloads |> Enum.map(&(byte_size(&1) + 8)) |> Enum.sum()
+    assert byte_size(body) < div(plain_bytes, 2)
+    assert Enum.to_list(Tiered.stream(config, 0)) == payloads
+    assert Enum.to_list(S3.stream(config.s3, 0)) == payloads
+    assert :ok = Tiered.close(state)
+
+    plain_dir = Path.join(tmp_dir, "plain")
+
+    %{config: config, state: state, store: store} =
+      setup_backend(plain_dir, segment_bytes: 1, compression: :none)
+
+    {:ok, state} = commit(state, payloads)
+    state = await_uploaded(state, 50)
+
+    assert Map.keys(FakeS3.objects(store)) == ["tiered/p0/000000000000.wal"]
+    assert Enum.to_list(Tiered.stream(config, 0)) == payloads
     assert :ok = Tiered.close(state)
   end
 
