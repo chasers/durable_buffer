@@ -23,6 +23,14 @@ defmodule DurableBuffer.Backend.S3 do
   entries. Failing lets the supervisor retry.
 
 
+  With `compression: :zstd` or `:gzip` the object body is compressed and the
+  key gains `.zst` or `.gz` (see `DurableBuffer.Compression`). Reads pick the
+  decoder from each key, so a reader with any `compression:` setting reads
+  objects written with every codec. If two objects name the same offset,
+  which a re-upload under a new codec can leave, reads use one of them and
+  `trim/2` and `truncate/2` delete both. Retention counts the bytes S3
+  stores, so compressed sizes.
+
   S3 PUT latency is high relative to disk, which makes group commit the whole
   ballgame: while one PUT is in flight every new append queues into the next
   batch, so throughput is bounded by `batch size × partitions / PUT latency`,
@@ -32,6 +40,7 @@ defmodule DurableBuffer.Backend.S3 do
 
     * `:bucket` (required)
     * `:prefix` — key prefix, default `"durable_buffer"`
+    * `:compression` — `:none` (default), `:zstd` or `:gzip`
     * `:req_options` — extra options merged into the `Req` request; use
       `aws_sigv4: [access_key_id: ..., secret_access_key: ...]` for
       credentials (or rely on `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`),
@@ -43,6 +52,7 @@ defmodule DurableBuffer.Backend.S3 do
 
   @compile {:no_warn_undefined, [Req, ReqS3]}
 
+  alias DurableBuffer.Compression
   alias DurableBuffer.WAL
 
   @offset_width 12
@@ -72,6 +82,7 @@ defmodule DurableBuffer.Backend.S3 do
     %{
       bucket: Keyword.fetch!(opts, :bucket),
       prefix: Keyword.get(opts, :prefix, "durable_buffer"),
+      compression: Compression.validate!(Keyword.get(opts, :compression, :none)),
       req_options: Keyword.get(opts, :req_options, [])
     }
   end
@@ -116,11 +127,23 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   @impl DurableBuffer.Backend
-  def commit(state, batch, _byte_size, {first_offset, count}) do
-    key = object_key(state.config, state.partition_index, first_offset)
-    binary = IO.iodata_to_binary(batch)
+  def commit(state, batch, _byte_size, span) do
+    put_segment(state, Compression.compress(batch, state.config.compression), span)
+  end
 
-    case Req.put(state.req, url: "s3://#{state.config.bucket}/#{key}", body: binary) do
+  @doc """
+  Uploads one segment whose body is already encoded with the config's
+  `:compression` codec, under the key for its first offset.
+
+  `commit/4` encodes the batch and calls this. `DurableBuffer.Tiered.Uploader`
+  calls it directly, with a body it compressed in chunks from a file.
+  """
+  @spec put_segment(map(), binary(), DurableBuffer.Backend.span()) ::
+          {:ok, map()} | {:error, term(), map()}
+  def put_segment(state, body, {first_offset, count}) do
+    key = object_key(state.config, state.partition_index, first_offset)
+
+    case Req.put(state.req, url: "s3://#{state.config.bucket}/#{key}", body: body) do
       {:ok, %{status: status}} when status in 200..299 ->
         {:ok, %{state | next_offset: first_offset + count}}
 
@@ -149,7 +172,7 @@ defmodule DurableBuffer.Backend.S3 do
           %{status: 200, body: body} =
             Req.get!(req, url: "s3://#{config.bucket}/#{key}", decode_body: false)
 
-          {payloads, _valid, _rest} = WAL.decode_all(body)
+          {payloads, _valid, _rest} = body |> decompress(key) |> WAL.decode_all()
           {payloads, {req, rest}}
       end,
       fn _acc -> :ok end
@@ -301,12 +324,12 @@ defmodule DurableBuffer.Backend.S3 do
           segment_end <= upto,
           do: key
 
-    for key <- dropped do
-      %{status: status} =
-        Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
+    dropped_offsets = MapSet.new(dropped, &offset_from_key/1)
 
-      true = status in 200..299
-    end
+    state.req
+    |> list_all_objects(state.config, state.partition_index)
+    |> Enum.filter(&MapSet.member?(dropped_offsets, offset_from_key(&1.key)))
+    |> Enum.each(&delete!(state, &1.key))
 
     first =
       case keys -- dropped do
@@ -342,12 +365,9 @@ defmodule DurableBuffer.Backend.S3 do
 
   @impl DurableBuffer.Backend
   def truncate(state, next) do
-    for key <- list_keys(state.req, state.config, state.partition_index) do
-      %{status: status} =
-        Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
-
-      true = status in 200..299
-    end
+    state.req
+    |> list_all_objects(state.config, state.partition_index)
+    |> Enum.each(&delete!(state, &1.key))
 
     :ok = store_base(state.req, state.config, state.partition_index, next)
 
@@ -356,6 +376,12 @@ defmodule DurableBuffer.Backend.S3 do
 
   @impl DurableBuffer.Backend
   def close(_state) do
+    :ok
+  end
+
+  defp delete!(state, key) do
+    %{status: status} = Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
+    true = status in 200..299
     :ok
   end
 
@@ -371,13 +397,19 @@ defmodule DurableBuffer.Backend.S3 do
 
   defp object_key(config, partition_index, offset) do
     padded = offset |> Integer.to_string() |> String.pad_leading(@offset_width, "0")
-    "#{partition_prefix(config, partition_index)}#{padded}.wal"
+
+    partition_prefix(config, partition_index) <>
+      padded <> Compression.extension(config.compression)
   end
 
   defp offset_from_key(key) do
-    key
-    |> Path.basename(".wal")
-    |> String.to_integer()
+    {:ok, offset, _codec} = Compression.parse_key(key)
+    offset
+  end
+
+  defp decompress(body, key) do
+    {:ok, _offset, codec} = Compression.parse_key(key)
+    Compression.decompress(body, codec)
   end
 
   defp base_key(config, partition_index) do
@@ -413,7 +445,7 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   defp count_entries(req, config, key) do
-    {payloads, _valid, _rest} = WAL.decode_all(fetch!(req, config, key))
+    {payloads, _valid, _rest} = req |> fetch!(config, key) |> decompress(key) |> WAL.decode_all()
     length(payloads)
   end
 
@@ -438,8 +470,14 @@ defmodule DurableBuffer.Backend.S3 do
 
   defp list_objects(req, config, partition_index) do
     req
+    |> list_all_objects(config, partition_index)
+    |> Enum.dedup_by(&offset_from_key(&1.key))
+  end
+
+  defp list_all_objects(req, config, partition_index) do
+    req
     |> list_prefix(config, partition_prefix(config, partition_index), nil, [])
-    |> Enum.filter(&String.ends_with?(&1.key, ".wal"))
+    |> Enum.filter(&(Compression.parse_key(&1.key) != :error))
   end
 
   defp list_prefix(req, config, prefix, continuation_token, acc) do

@@ -49,6 +49,67 @@ defmodule DurableBuffer.Backend.S3Test do
     assert :ok = S3.close(state)
   end
 
+  test "compression writes a coded key and reads back through any config" do
+    {config, store} = start_backend()
+
+    for codec <- [:zstd, :gzip] do
+      {:ok, state} = S3.open(%{config | compression: codec}, 0)
+      {batch, bytes} = encode_batch(["#{codec}-1", "#{codec}-2"])
+      {:ok, _state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+    end
+
+    {:ok, state} = S3.open(config, 0)
+    {batch, bytes} = encode_batch(["plain"])
+    {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+
+    assert keys(store) == [
+             "buffers/test/p0/000000000000.wal.zst",
+             "buffers/test/p0/000000000002.wal.gz",
+             "buffers/test/p0/000000000004.wal"
+           ]
+
+    assert Enum.to_list(S3.stream(config, 0)) == ~w(zstd-1 zstd-2 gzip-1 gzip-2 plain)
+
+    assert Enum.to_list(S3.stream(config, 0, from: 3, with_offsets: true)) ==
+             [{3, "gzip-2"}, {4, "plain"}]
+
+    assert S3.offsets(state) == %{first: 0, next: 5}
+    {:ok, reopened} = S3.open(%{config | compression: :zstd}, 0)
+    assert S3.offsets(reopened) == %{first: 0, next: 5}
+  end
+
+  test "an offset uploaded under two codecs reads once and trims fully" do
+    {config, store} = start_backend()
+    {:ok, state} = S3.open(config, 0)
+    {batch, bytes} = encode_batch(["a", "b"])
+    span = span(S3, state, batch)
+    {:ok, _state} = S3.commit(state, batch, bytes, span)
+
+    {:ok, state} =
+      S3.commit(%{state | config: %{config | compression: :zstd}}, batch, bytes, span)
+
+    {batch, bytes} = encode_batch(["c"])
+    {:ok, state} = S3.commit(state, batch, bytes, span(S3, state, batch))
+
+    assert Enum.to_list(S3.stream(config, 0)) == ~w(a b c)
+
+    {:ok, state} = S3.trim(state, 2)
+
+    assert keys(store) == ["buffers/test/p0/000000000002.wal.zst", "buffers/test/p0/base"]
+    assert S3.offsets(state) == %{first: 2, next: 3}
+
+    {:ok, _state} = S3.truncate(state, 3)
+    assert keys(store) == ["buffers/test/p0/base"]
+  end
+
+  test "init_config rejects an unknown codec" do
+    assert_raise ArgumentError, ~r/:compression must be/, fn ->
+      S3.init_config(bucket: "b", compression: :lz4)
+    end
+  end
+
+  defp keys(store), do: store |> FakeS3.objects() |> Map.keys() |> Enum.sort()
+
   test "streams an empty partition as an empty list" do
     {config, _store} = start_backend()
     assert Enum.to_list(S3.stream(config, 0)) == []

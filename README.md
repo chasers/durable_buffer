@@ -569,6 +569,10 @@ does not pull them in. Add them to your own application to use this backend:
 dependency is an argument error at startup rather than an undefined
 function when the first partition opens.
 
+`compression:` (`:none` by default, `:zstd` or `:gzip`) compresses each
+segment object and adds `.zst` or `.gz` to its key. Reads decode by key, so
+one prefix can hold objects written with different codecs.
+
 Uses [`req_s3`](https://hex.pm/packages/req_s3). Each group commit uploads
 one immutable segment object (`<prefix>/p<partition>/<offset>.wal`, keyed by
 the segment's first logical entry offset), so durability is exactly PUT
@@ -583,6 +587,97 @@ S3's high PUT latency is where group commit matters most: while one PUT is
 in flight, every arriving append queues into the next segment, so throughput
 is `batch size × partitions / PUT latency` rather than one append per
 round trip.
+
+### Tiered: local segments uploaded to S3 (experimental)
+
+```elixir
+{DurableBuffer.Backend.Tiered,
+ dir: "/var/lib/events",
+ bucket: "my-bucket",
+ prefix: "buffers/events",
+ ack: :local}
+```
+
+**This backend is an experiment.** Its options and behavior can change in
+any release.
+
+Each partition appends group commits to segment files under
+`<dir>/p<partition>/`. A file is named by its first logical entry offset. The
+backend seals the active segment when it reaches `segment_bytes` or when it
+is `segment_ms` old. A per-partition uploader then sends each sealed segment
+to S3 as one object, strictly in offset order.
+
+The objects use the same keys and framing as `Backend.S3`. So a processor on
+any node reads the uploaded log with `Backend.S3.stream/3`, with no buffer
+running:
+
+```elixir
+config = DurableBuffer.Backend.S3.init_config(bucket: "my-bucket", prefix: "buffers/events")
+DurableBuffer.Backend.S3.stream(config, partition, from: cursor, with_offsets: true)
+```
+
+**Segments are compressed by default.** The uploader compresses each segment
+before its PUT, with zstd (level 1) on OTP 28 and later and gzip before. The
+codec is part of the key: `<offset>.wal.zst`, `<offset>.wal.gz`, or
+`<offset>.wal` with `compression: :none`. Local files stay uncompressed, so
+compression adds nothing to the append path. On log-like JSON lines zstd
+stores about 6x less. A processor needs no codec setting: `Backend.S3` picks
+the decoder from each key.
+
+The processor keeps its own cursor, like any other consumer.
+`Backend.Tiered.uploaded/2` returns the offset through which S3 has a
+partition's data.
+
+**`ack:` sets when an append returns.**
+
+| | `ack: :local` (default) | `ack: :remote` |
+|---|---|---|
+| An append returns after | the local write and `datasync` | S3 stores the segment that holds it |
+| `fsync` default | `true` | `false` (sealing always `datasync`s) |
+| Readers see | everything written locally | only uploaded entries |
+| A node lost before upload loses | its un-uploaded segments | nothing that was acked |
+
+With `ack: :remote` the backend also seals the active segment whenever the
+uploader is idle. This is group commit one level up. While a PUT is in
+flight, new commits collect in the active segment. When the PUT completes,
+they go out together in the next one. A lone append pays one PUT, and
+segments grow with load.
+
+An upload that fails retries with backoff and never skips a segment. So S3
+always holds an unbroken prefix of the log. A failed upload never fails an
+append. With `ack: :remote` the append waits, so use the append timeout to
+bound it. A timeout does not mean the entry was not written: the entry is on
+local disk and uploads later.
+
+**Reads** come from S3 below the lowest local segment and from local files
+above it. If the uploader deletes a local segment while a reader waits to
+open it, the reader gets that segment from S3.
+
+**On open** every existing segment is sealed. The backend truncates the torn
+tail of the highest file, queues segments that are not uploaded yet, and
+starts a new segment at the next commit.
+
+**Retention** applies to the S3 tier through the `Backend.S3` rules, so
+`retention_bytes` counts compressed bytes. A trim
+never deletes a segment that is not uploaded yet.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `:dir` | required | Local segment directory |
+| `:bucket`, `:prefix`, `:req_options` | as `Backend.S3` | The S3 target |
+| `:ack` | `:local` | `:local` or `:remote`, see above |
+| `:compression` | `:zstd` on OTP 28+, else `:gzip` | Codec for uploaded segments: `:zstd`, `:gzip` or `:none` |
+| `:fsync` | `true` for `:local`, `false` for `:remote` | `datasync` each commit |
+| `:segment_bytes` | 64 MiB | Seal the active segment at this size |
+| `:segment_ms` | 60 s | Seal a non-empty active segment at this age |
+| `:local_retention` | `:uploaded` | Delete a segment's file once it is uploaded, or keep uploaded segments up to this many bytes |
+| `:max_local_bytes` | `:infinity` | Refuse commits with `{:error, :upload_backlog}` while more bytes than this are not uploaded |
+
+Known limits:
+
+- Sealing does not `fsync` the segment directory.
+- `open/2` lists S3, so a partition does not start while S3 is down.
+- With `ack: :remote`, `truncate` and `trim` wait for pending appends to upload.
 
 ## Benchmarks
 
@@ -610,6 +705,7 @@ mix run bench/local_bench.exs                       # PARTITIONS=N
 mix run bench/replica_bench.exs                     # REPLICAS=2 ACK=all|quorum|N PARTITIONS=N FSYNC=true|false
 mix run bench/s3_bench.exs                          # fake S3, S3_SIM_LATENCY_MS=30
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs # real S3 (AWS_* env vars)
+ACK=local SEGMENT_MS=1000 mix run bench/tiered_bench.exs  # ACK=local|remote COMPRESSION SEGMENT_MS SEGMENT_BYTES
 ```
 
 `replica_bench.exs` boots real replica nodes with `:peer` on the local host
@@ -623,7 +719,7 @@ mix test
 ```
 
 The suite covers WAL framing and torn-tail recovery, group-commit batching
-and error propagation, all three backends (S3 via a `Req.Test` fake with
+and error propagation, all four backends (S3 and Tiered via a `Req.Test` fake with
 ListObjectsV2 pagination, replication via `:erpc` to the local node), and
 end-to-end restart recovery.
 
