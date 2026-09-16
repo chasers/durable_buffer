@@ -38,6 +38,7 @@ mix run bench/local_bench.exs
 REPLICAS=2 ACK=all mix run bench/replica_bench.exs
 mix run bench/transport_bench.exs
 mix run bench/s3_bench.exs                              # fake S3, 30ms PUT
+ACK=local SEGMENT_MS=1000 mix run bench/tiered_bench.exs  # ACK=local|remote
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs    # real S3
 ```
 
@@ -261,6 +262,51 @@ parallel      average     median     99th %
 
 At 64 parallel callers the median is ~2× PUT latency: a caller lands mid-PUT,
 waits for it to finish, then rides the next group commit.
+
+## Tiered (experimental; in-memory fake S3, 30 ms simulated PUT latency, 4 partitions)
+
+Captured 2026-09-16 on the same machine with `BENCH_DURATION_MS=3000
+BENCH_TIME=3`. These are single runs. Read them for shape, not for exact
+numbers.
+
+**`ack: :local`** (`SEGMENT_MS=1000`). An append waits for one local
+`datasync`. Throughput follows the local backend. The PUT rate stays near
+one per partition per second, whatever the load:
+
+```
+payload   callers         ops/s      MB/s    PUTs/s  entries/PUT
+1KB       1                2.1k       2.1         1         3.2k
+1KB       32              12.4k      12.1         3         4.6k
+1KB       256             80.6k      78.7         7        12.1k
+16KB      1                2.2k      34.0         2         1.3k
+16KB      32              11.0k     171.8         7         1.6k
+16KB      256             62.2k     972.6         7         9.3k
+```
+
+Upload lag from append to S3 is about `segment_ms`: median 1043 ms. Caller
+latency (1 KB) has a median of 243 µs with 1 caller and 3.37 ms with 64.
+
+**`ack: :remote`** (defaults). An append waits for its segment's PUT. The
+uploader seals the active segment each time it goes idle, so the shape
+matches the S3 backend. The same fake gives the S3 backend 32 / 512 / 4.2k
+ops/s at 1 / 32 / 256 callers:
+
+```
+payload   callers         ops/s      MB/s    PUTs/s  entries/PUT
+1KB       1                  28       0.0        28            1
+1KB       32                424       0.4       106            4
+1KB       256              5.0k       4.9       105           48
+16KB      1                  25       0.4        25            1
+16KB      32                646      10.1       103            6
+16KB      256              6.3k      99.0        99           64
+```
+
+Caller latency (1 KB) has a median of 35.5 ms with 1 caller and 41.4 ms
+with 64.
+
+A first version sealed only on `segment_ms` in this mode. Blocked callers
+could not add commits to a segment. So throughput was `callers /
+segment_ms`: 256 ops/s at 256 callers with a 1 s segment.
 
 ## Replication transport
 
