@@ -38,6 +38,7 @@ mix run bench/local_bench.exs
 REPLICAS=2 ACK=all mix run bench/replica_bench.exs
 mix run bench/transport_bench.exs
 mix run bench/s3_bench.exs                              # fake S3, 30ms PUT
+NODES=3 mix run bench/queue_bench.exs                    # NODES MANIFEST_GAP_MS
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs    # real S3
 ```
 
@@ -261,6 +262,56 @@ parallel      average     median     99th %
 
 At 64 parallel callers the median is ~2× PUT latency: a caller lands mid-PUT,
 waits for it to finish, then rides the next group commit.
+
+## Queue (experimental; in-memory fake S3, 30 ms per GET and PUT, 4 partitions)
+
+Captured 2026-09-17 on the same machine with `BENCH_DURATION_MS=3000
+BENCH_TIME=3`, `manifest_gap_ms: 50` (default), zstd, 1 KB log-like payloads.
+These are single runs against a fake with a fixed latency. Real object stores
+add jitter and tail latency.
+
+An append waits for the batch PUT and the manifest PUT. With `NODES=3`, two
+more simulated nodes run the same caller count against the same manifest.
+Each of them waits one simulated batch PUT and then appends through its own
+appender.
+
+```
+nodes  callers    ops/s  batch PUTs/s  manifest writes/s  conflicts/s  entries/batch
+1      1             12            12                 12            0              1
+1      32           395            51                 12            0              8
+1      256         3.0k            49                 12            0             61
+3      1              7             7                 40            7              1
+3      32           182            26                 40            8              7
+3      256         1.3k            20                 39           11             64
+```
+
+`ops/s` and `batch PUTs/s` are for the measured node only. `manifest writes/s`
+and `conflicts/s` count every node. The same fake gives `Backend.S3`
+32 / 512 / 4.2k ops/s at 1 / 32 / 256 callers.
+
+Caller latency (1 KB, one node) has a median of 82 ms with 1 caller and with
+64. That is one batch PUT, one manifest PUT and up to 50 ms of manifest gap.
+
+**Manifest gap sweep** (256 callers, ops/s of the measured node):
+
+```
+manifest_gap_ms   1 node   3 nodes
+0                 2.8k     171
+50                3.0k     1.6k
+100               2.0k     1.3k
+```
+
+With no gap, the node that wrote last writes again from its cached version
+in one request, while a node that lost needs a GET and a PUT and loses again.
+A first version with no retry jitter also fell into lockstep: 0 ops/s for a
+single caller against one other node.
+
+**Consume** with read-ahead of 64 batches, fetched in parallel, one
+`ack_through` per round: 12.3k entries/s over 337 batches (one node), and
+468 batches/s over 8384 small batches (three nodes). A round is a manifest
+GET and decode, 64 parallel GETs, and a manifest GET and PUT. So the rate is
+bound by batches per round, not by entries, and it falls as the manifest
+grows.
 
 ## Replication transport
 
