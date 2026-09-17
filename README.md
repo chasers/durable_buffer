@@ -584,6 +584,86 @@ in flight, every arriving append queues into the next segment, so throughput
 is `batch size × partitions / PUT latency` rather than one append per
 round trip.
 
+### Queue: stateless producers and a manifest (experimental)
+
+```elixir
+{DurableBuffer,
+ name: :events,
+ partitions: 4,
+ backend:
+   {DurableBuffer.Backend.Queue,
+    bucket: "my-bucket",
+    prefix: "events/queue"}}
+```
+
+**This backend is an experiment.** It follows the design of
+[Open Data Buffer](https://www.opendata.dev/docs/buffer). It uses the version 1
+manifest and batch formats from its RFC 0001 byte for byte.
+
+A group commit settles when two writes succeed:
+
+1. The batch goes to `<prefix>/<ULID>.batch`, compressed with zstd by default.
+2. Its location is appended to one **queue manifest** object with a
+   conditional write (compare-and-set).
+
+Nothing stays on local disk, so any producer node can stop at any time. Each
+node has one appender per manifest. It group-commits the appends of every
+partition into one manifest write, and it writes from its last known version
+without a GET until another node writes in between. A partition's batches
+enter the manifest in offset order.
+
+**Consumers need no consumer group, cursor store, or bucket listing.**
+
+```elixir
+{DurableBuffer.Queue.ConsumerServer,
+ queue: [bucket: "my-bucket", prefix: "events/queue"],
+ handler: &MyApp.Ingest.handle_batch/1,
+ dead_letter: &MyApp.Ingest.dead_letter/2}
+```
+
+- **One consumer per manifest.** Opening a consumer increments an epoch in the
+  manifest. The earlier consumer gets `{:error, :fenced}` on its next manifest
+  operation, and `ConsumerServer` stops with `{:shutdown, :fenced}`. So a
+  loose owner per manifest is safe: a second owner takes over, it does not
+  corrupt anything.
+- **At-least-once, in manifest order.** Acks advance a contiguous frontier.
+  Acked entries leave the manifest in one write every `:ack_interval` acks.
+  Acks that were not written yet are delivered again after a takeover.
+- **Retries and dead letters.** `ConsumerServer` retries a failing batch with
+  backoff, then calls `dead_letter` and acks it.
+- **Read-ahead.** `DurableBuffer.Queue.Consumer.next_descriptors/2`,
+  `fetch/2` and `ack_through/2` let many workers fetch batches concurrently.
+- **Garbage collection.** `DurableBuffer.Queue.GC` deletes unreferenced batch
+  objects after a grace period. It is the only operation that lists the
+  bucket, and `ConsumerServer` runs it every 5 minutes.
+
+**Conditional writes.** `conditional_writes: :etag` (default) uses `If-Match`
+and `If-None-Match: *`, which S3 and MinIO support. `:gcs_generation` uses
+`x-goog-if-generation-match` for the GCS XML API.
+
+**What does not apply to a queue.** Offsets from `append` count from zero in
+each run. `DurableBuffer.stream/3` reads the manifest without fencing, for
+debugging. `truncate` does nothing. There is no retention: acks and GC remove
+data.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `:bucket` | required | The bucket |
+| `:prefix` | `"durable_buffer/queue"` | Where batch objects go |
+| `:manifest` | `"<prefix>/manifest"` | The manifest key; one consumer per manifest |
+| `:compression` | `:zstd` | `:zstd` or `:none` (the batch format has no gzip code) |
+| `:conditional_writes` | `:etag` | `:etag` or `:gcs_generation` |
+| `:manifest_gap_ms` | 50 | Pause between one node's manifest writes, so other nodes get a turn |
+| `:req_options` | `[]` | As for `Backend.S3` |
+
+Known limits:
+
+- Every manifest write sends the whole manifest. Its size grows with consumer
+  lag, and nothing applies backpressure.
+- All producer nodes contend on one manifest. Throughput per node falls as
+  nodes are added. Use more manifests (more buffers) to scale out.
+- A crashed appender leaves its waiting commits pending.
+
 ## Benchmarks
 
 On a MacBook Pro (M1 Max, internal SSD), the local backend sustains
@@ -610,6 +690,7 @@ mix run bench/local_bench.exs                       # PARTITIONS=N
 mix run bench/replica_bench.exs                     # REPLICAS=2 ACK=all|quorum|N PARTITIONS=N FSYNC=true|false
 mix run bench/s3_bench.exs                          # fake S3, S3_SIM_LATENCY_MS=30
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs # real S3 (AWS_* env vars)
+NODES=1 mix run bench/queue_bench.exs                     # NODES MANIFEST_GAP_MS S3_SIM_LATENCY_MS
 ```
 
 `replica_bench.exs` boots real replica nodes with `:peer` on the local host
@@ -623,7 +704,7 @@ mix test
 ```
 
 The suite covers WAL framing and torn-tail recovery, group-commit batching
-and error propagation, all three backends (S3 via a `Req.Test` fake with
+and error propagation, all four backends (S3 and Queue via a `Req.Test` fake with
 ListObjectsV2 pagination, replication via `:erpc` to the local node), and
 end-to-end restart recovery.
 
