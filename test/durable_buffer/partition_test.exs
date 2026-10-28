@@ -56,6 +56,52 @@ defmodule DurableBuffer.PartitionTest do
     assert List.flatten(SlowBackend.committed_batches(recorder)) == ["b1", "b2", "b3", "single"]
   end
 
+  describe "framing happens in the caller" do
+    test "append sends the writer an already framed entry" do
+      {pid, _recorder} = start_partition()
+      :ok = :sys.suspend(pid)
+
+      task = Task.async(fn -> Partition.append(pid, ["he", "llo"]) end)
+      request = await_request(pid)
+
+      {framed, size} = DurableBuffer.WAL.encode("hello")
+      assert {:append, {entries, 1, ^size}} = request
+      assert IO.iodata_to_binary(entries) == IO.iodata_to_binary(framed)
+
+      :ok = :sys.resume(pid)
+      assert {:ok, _} = Task.await(task)
+    end
+
+    test "append_batch sends the writer already framed entries" do
+      {pid, _recorder} = start_partition()
+      :ok = :sys.suspend(pid)
+
+      task = Task.async(fn -> Partition.append_batch(pid, ["a", "bb"]) end)
+      request = await_request(pid)
+
+      {framed_a, size_a} = DurableBuffer.WAL.encode("a")
+      {framed_b, size_b} = DurableBuffer.WAL.encode("bb")
+      size = size_a + size_b
+      assert {:append_batch, {entries, 2, ^size}} = request
+      assert IO.iodata_to_binary(entries) == IO.iodata_to_binary([framed_a, framed_b])
+
+      :ok = :sys.resume(pid)
+      assert {:ok, _} = Task.await(task)
+    end
+
+    test "invalid iodata raises in the caller and leaves the writer running" do
+      {pid, recorder} = start_partition()
+
+      assert_raise ArgumentError, fn -> Partition.append(pid, [:not_iodata]) end
+      assert_raise ArgumentError, fn -> Partition.append_async(pid, [:not_iodata]) end
+      assert_raise ArgumentError, fn -> Partition.append_batch(pid, ["ok", [:not_iodata]]) end
+
+      assert Process.alive?(pid)
+      assert {:ok, _} = Partition.append(pid, "after")
+      assert List.flatten(SlowBackend.committed_batches(recorder)) == ["after"]
+    end
+  end
+
   test "append_batch with an empty list is a no-op" do
     {pid, recorder} = start_partition()
 
@@ -180,5 +226,18 @@ defmodule DurableBuffer.PartitionTest do
     assert :ok = Partition.truncate(pid)
 
     assert SlowBackend.committed_batches(recorder) == []
+  end
+
+  defp await_request(pid) do
+    {:messages, messages} = Process.info(pid, :messages)
+
+    case Enum.find(messages, &match?({:"$gen_call", _from, _request}, &1)) do
+      {:"$gen_call", _from, request} ->
+        request
+
+      nil ->
+        Process.sleep(5)
+        await_request(pid)
+    end
   end
 end

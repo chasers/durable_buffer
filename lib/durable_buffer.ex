@@ -96,7 +96,8 @@ defmodule DurableBuffer do
   until it is durable.
 
   Returns `{:ok, offset}` — the entry's logical position in the partition
-  log, usable with `stream/3`'s `:from` option.
+  log, usable with `stream/3`'s `:from` option. Raises `ArgumentError` in
+  the caller if `payload` is not iodata.
   """
   @spec append(atom(), term(), iodata(), timeout()) ::
           {:ok, non_neg_integer()} | {:error, term()}
@@ -115,7 +116,8 @@ defmodule DurableBuffer do
   commit. An empty list is a no-op and returns `{:ok, []}`.
 
   Returns `{:ok, first..last}` — the contiguous range of logical offsets the
-  payloads landed at.
+  payloads landed at. Raises `ArgumentError` in the caller if any payload
+  is not iodata; the partition then receives none of the list.
   """
   @spec append_batch(atom(), term(), [iodata()], timeout()) ::
           {:ok, Range.t() | []} | {:error, term()}
@@ -127,7 +129,8 @@ defmodule DurableBuffer do
 
   @doc """
   Enqueues a payload without waiting for durability. Use `sync/2` to await
-  durability of everything enqueued so far.
+  durability of everything enqueued so far. Raises `ArgumentError` in the
+  caller if `payload` is not iodata.
   """
   @spec append_async(atom(), term(), iodata()) :: :ok
   def append_async(name, partition_key, payload) do

@@ -39,6 +39,7 @@ REPLICAS=2 ACK=all mix run bench/replica_bench.exs
 mix run bench/transport_bench.exs
 mix run bench/s3_bench.exs                              # fake S3, 30ms PUT
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs    # real S3
+mix run bench/writer_framing_bench.exs
 ```
 
 `BENCH_DURATION_MS`, `BENCH_WARMUP_MS`, and `BENCH_TIME` shorten runs;
@@ -310,3 +311,22 @@ therefore drifted across the measurement window instead of staying constant,
 which buried the effect. The hogs also were not awaited on kill and the
 replica writers were never stopped, so residue accumulated in loop order.
 All three are fixed.
+
+## Writer framing
+
+`mix run bench/writer_framing_bench.exs`
+
+One partition writer with a no-op backend, so this measures the writer's
+message path and not durability. 64 callers append 256 KiB payloads
+(iodata of 1 KiB binaries), 2,000 appends each. `CALLERS`, `APPENDS` and `PAYLOAD_KB` override
+the defaults. Captured 2026-10-28 on a 10-core Apple M1 Max, two runs each:
+
+| build | appends/s | MB/s |
+|---|---|---|
+| writer frames entries (0.6.1) | 20,276 / 20,387 | 5,069 / 5,097 |
+| caller frames entries (0.6.2) | 139,726 / 140,080 | 34,932 / 35,020 |
+
+**The writer was the ceiling.** It copied and CRC'd every payload for every
+caller, so one partition could frame only as fast as one core. Now each
+caller frames its own entries before it sends them, and the writer only
+batches. The gain is about 6.9x here; it scales with core count.

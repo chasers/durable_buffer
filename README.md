@@ -218,7 +218,9 @@ floor key from the listing it already does, and that listing carries
 The `partition_key` (any term) is hashed to one of a fixed number of
 partitions (default `System.schedulers_online()`). Each partition has its own
 writer, WAL, and backend state, so partitions commit fully in parallel —
-use more partitions to saturate your disk.
+use more partitions to saturate your disk. Each caller frames its own WAL
+entries (copy + CRC32) before it sends them to the writer, so the framing
+cost spreads across callers instead of one writer per partition.
 
 ### Options
 
@@ -610,8 +612,11 @@ mix run bench/local_bench.exs                       # PARTITIONS=N
 mix run bench/replica_bench.exs                     # REPLICAS=2 ACK=all|quorum|N PARTITIONS=N FSYNC=true|false
 mix run bench/s3_bench.exs                          # fake S3, S3_SIM_LATENCY_MS=30
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs # real S3 (AWS_* env vars)
+mix run bench/writer_framing_bench.exs              # CALLERS=64 APPENDS=2000 PAYLOAD_KB=256
 ```
 
+`writer_framing_bench.exs` drives one partition writer with a no-op backend,
+so it measures the writer's own message path, not durability.
 `replica_bench.exs` boots real replica nodes with `:peer` on the local host
 (measuring protocol overhead, not network RTT). `s3_bench.exs` runs against
 an in-memory fake with simulated PUT latency unless `S3_BENCH_BUCKET` is set.

@@ -2,6 +2,11 @@ defmodule DurableBuffer.Partition do
   @moduledoc """
   Per-partition group-commit writer.
 
+  Each caller frames its own WAL entries (copy + CRC32) before it sends them,
+  so the writer only batches ready entries and one process does not do the
+  framing work for every caller. Invalid iodata raises `ArgumentError` in
+  the caller and never reaches the writer.
+
   Appends are calls that do not reply immediately: entries accumulate in a
   pending batch, and batches are handed to a linked
   `DurableBuffer.Partition.Committer` that owns the backend and replies to
@@ -48,7 +53,7 @@ defmodule DurableBuffer.Partition do
   @spec append(GenServer.server(), iodata(), timeout()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def append(server, payload, timeout \\ :infinity) do
-    GenServer.call(server, {:append, payload}, timeout)
+    GenServer.call(server, {:append, encode_one(payload)}, timeout)
   end
 
   @doc """
@@ -66,7 +71,7 @@ defmodule DurableBuffer.Partition do
   def append_batch(_server, [], _timeout), do: {:ok, []}
 
   def append_batch(server, payloads, timeout) do
-    GenServer.call(server, {:append_batch, payloads}, timeout)
+    GenServer.call(server, {:append_batch, encode_many(payloads)}, timeout)
   end
 
   @doc """
@@ -74,7 +79,7 @@ defmodule DurableBuffer.Partition do
   """
   @spec append_async(GenServer.server(), iodata()) :: :ok
   def append_async(server, payload) do
-    GenServer.cast(server, {:append, payload})
+    GenServer.cast(server, {:append, encode_one(payload)})
   end
 
   @doc """
@@ -157,12 +162,12 @@ defmodule DurableBuffer.Partition do
   end
 
   @impl GenServer
-  def handle_call({:append, payload}, from, state) do
-    {:noreply, enqueue(state, from, encode_one(payload), :offset)}
+  def handle_call({:append, encoded}, from, state) do
+    {:noreply, enqueue(state, from, encoded, :offset)}
   end
 
-  def handle_call({:append_batch, payloads}, from, state) do
-    {:noreply, enqueue(state, from, encode_many(payloads), :range)}
+  def handle_call({:append_batch, encoded}, from, state) do
+    {:noreply, enqueue(state, from, encoded, :range)}
   end
 
   def handle_call(:sync, from, %{pending: []} = state) do
@@ -201,8 +206,8 @@ defmodule DurableBuffer.Partition do
   end
 
   @impl GenServer
-  def handle_cast({:append, payload}, state) do
-    {:noreply, enqueue(state, nil, encode_one(payload), :offset)}
+  def handle_cast({:append, encoded}, state) do
+    {:noreply, enqueue(state, nil, encoded, :offset)}
   end
 
   @impl GenServer
