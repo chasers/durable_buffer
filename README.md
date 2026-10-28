@@ -2,86 +2,119 @@
 
 [![CI](https://github.com/chasers/durable_buffer/actions/workflows/ci.yml/badge.svg)](https://github.com/chasers/durable_buffer/actions/workflows/ci.yml)
 
-A partitioned, group-committed buffer for Elixir, durable to **local disk**,
-**N replica nodes**, or **S3**.
+DurableBuffer is a partitioned buffer for Elixir. An append returns only after its data is **durable**.
 
-Every append blocks until its data is durable per the backend's guarantee —
-an `fsync`, a set of replica acks, or a successful S3 PUT. The trick that
-makes that fast is **group commit**: all appends that arrive at a partition
-while a commit is in flight are committed together, so the expensive
-durability step is paid once per batch, not once per append. A lone append
-pays exactly one commit of latency; under load, batches grow automatically
-and throughput scales until the disk (or network, or S3) is the bottleneck.
+You choose where the data is durable:
 
-## Usage
+- **Local disk.** The backend calls `fsync` on a write-ahead log (WAL).
+- **Replica nodes.** A set number of nodes acknowledge the write.
+- **S3.** The S3 PUT request succeeds.
 
-Start a buffer under your supervision tree:
+## Why it is fast
 
-```elixir
-children = [
-  {DurableBuffer,
-   name: :events,
-   backend: {DurableBuffer.Backend.Local, dir: "/var/lib/events"},
-   partitions: 8}
-]
-```
+The buffer uses **group commit**. Appends that arrive while a commit runs wait for the next commit. Then they commit together.
 
-Append, read, and trim:
+- The expensive step (`fsync`, replication or PUT) runs once per batch, not once per append.
+- A single append waits for exactly one commit.
+- Under load, batches grow by themselves. Throughput grows until the disk, network or S3 is the limit.
+
+## Install
+
+The package is not on Hex. Add it as a git dependency in `mix.exs`:
 
 ```elixir
-{:ok, offset} = DurableBuffer.append(:events, user_id, payload)   # blocks until durable
-{:ok, first..last} =
-  DurableBuffer.append_batch(:events, user_id, payloads)          # N payloads, one call,
-                                                                  # one reply after commit
-:ok = DurableBuffer.append_async(:events, user_id, payload)       # enqueue, don't wait
-:ok = DurableBuffer.sync(:events, user_id)                        # await pending appends;
-                                                                  # also surfaces commit
-                                                                  # errors from async entries
-:ok = DurableBuffer.sync_all(:events)
-
-DurableBuffer.stream(:events, user_id) |> Enum.to_list()          # oldest first, durable only
-DurableBuffer.stream(:events, user_id, from: 42)                  # resume at an offset
-DurableBuffer.stream(:events, user_id, with_offsets: true)        # {offset, payload}
-
-DurableBuffer.offsets(:events, user_id)                           # %{first:, durable:, next:}
-
-:ok = DurableBuffer.trim(:events, user_id)                        # apply the policy
-:ok = DurableBuffer.trim(:events, user_id, upto: 5_000)           # explicit point
-DurableBuffer.retention(:events, user_id)                         # %{oldest_age_ms:, bytes:}
-:ok = DurableBuffer.truncate(:events, user_id)                    # drop everything
-:ok = DurableBuffer.truncate_all(:events)
+{:durable_buffer, github: "chasers/durable_buffer", tag: "v0.6.2"}
 ```
 
-### Logical offsets
+Each release has a `v<version>` tag. See [Releases](#releases).
 
-Every committed entry gets a monotonic `offset` — 0, 1, 2, … — assigned in
-commit-submission order, which is also caller-reply order. The offset an
-append returns is the entry's true position in the partition log, so it is
-usable directly as a resume point or as an SSE `id:` field.
+## Quick start
 
-`offsets/2` reports three bounds:
+1. Add a buffer to your supervision tree:
 
-| key | meaning |
+   ```elixir
+   children = [
+     {DurableBuffer,
+      name: :events,
+      backend: {DurableBuffer.Backend.Local, dir: "/var/lib/events"},
+      partitions: 8}
+   ]
+   ```
+
+2. Append, read and trim from any process:
+
+   ```elixir
+   {:ok, offset} = DurableBuffer.append(:events, user_id, payload)
+   {:ok, first..last} = DurableBuffer.append_batch(:events, user_id, payloads)
+   :ok = DurableBuffer.append_async(:events, user_id, payload)
+
+   :ok = DurableBuffer.sync(:events, user_id)
+   :ok = DurableBuffer.sync_all(:events)
+
+   DurableBuffer.stream(:events, user_id) |> Enum.to_list()
+   DurableBuffer.stream(:events, user_id, from: 42)
+   DurableBuffer.stream(:events, user_id, with_offsets: true)
+
+   DurableBuffer.offsets(:events, user_id)
+
+   :ok = DurableBuffer.trim(:events, user_id)
+   :ok = DurableBuffer.trim(:events, user_id, upto: 5_000)
+   DurableBuffer.retention(:events, user_id)
+
+   :ok = DurableBuffer.truncate(:events, user_id)
+   :ok = DurableBuffer.truncate_all(:events)
+   ```
+
+### What each call does
+
+| Call | Result |
 |---|---|
-| `:first` | oldest offset still retained |
-| `:durable` | end of what a reader can see |
-| `:next` | where the next append lands |
+| `append/4` | Blocks until the payload is durable. Returns its offset. |
+| `append_batch/4` | Appends a list in one call. Replies once, after the commit. Returns the offset range. |
+| `append_async/3` | Adds the payload to the queue. Does not wait. |
+| `sync/3` | Waits for all queued appends on one partition. Returns commit errors from `append_async/3` entries. |
+| `sync_all/2` | Does `sync/3` for all partitions. |
+| `stream/3` | Reads durable entries, oldest first. |
+| `offsets/2` | Returns `%{first:, durable:, next:}`. |
+| `trim/3` | Drops old entries by the retention policy, or below `upto:`. |
+| `retention/2` | Returns `%{oldest_age_ms:, bytes:}`. |
+| `truncate/3` | Drops all entries in one partition. |
+| `truncate_all/2` | Does `truncate/3` for all partitions. |
 
-Offsets never repeat. `truncate/3` advances `:first` past `:next` rather
-than resetting to zero, so a resumed consumer can never silently read
-different data at the same offset. They survive a restart: a partition
-recovers its count from the WAL on open.
+An append raises `ArgumentError` in the caller if a payload is not iodata.
 
-Compare a resume point against `:first` to detect that it predates
-retention. `stream/3` checks it too, and raises
-`DurableBuffer.OutOfRangeError` rather than replaying from the trim point.
+### Partitions
 
-### Consumer positions
+The buffer hashes each `partition_key` (any term) to one partition. The default count is `System.schedulers_online()`.
 
-The buffer does not track consumers. It records no positions for them, and
-their positions do not gate retention. A consumer keeps its own cursor, the
-way an SSE client carries `Last-Event-ID` and a Kafka consumer stores its
-offset outside the log:
+- Each partition has its own writer, WAL and backend state.
+- Partitions commit in parallel. Add partitions to use more disk bandwidth.
+- Each caller frames its own WAL entries (copy and CRC32 checksum) before it sends them. One writer does not do this work for all callers.
+
+## Offsets
+
+Each committed entry gets an offset: 0, 1, 2 and so on. **An offset never repeats.**
+
+- The buffer assigns offsets in commit order. This is also the order of the replies to callers.
+- The offset from an append is the true position of the entry in the partition log.
+- Use an offset as a resume point, or as the `id:` field of a server-sent event (SSE).
+- Offsets survive a restart. A partition counts its entries from the WAL when it opens.
+
+`offsets/2` returns three bounds:
+
+| Key | Meaning |
+|---|---|
+| `:first` | The oldest offset that the buffer keeps |
+| `:durable` | The end of the data that a reader can see |
+| `:next` | The offset that the next append gets |
+
+`truncate/3` moves `:first` to `:next`. It does not reset the offsets to zero. Thus a consumer that resumes never reads different data at the same offset.
+
+## Consumers
+
+**The buffer does not track consumers.** It stores no consumer positions. Consumer positions do not stop retention.
+
+Each consumer keeps its own cursor. An SSE client does this with `Last-Event-ID`. A Kafka consumer does this when it stores its offset outside the log.
 
 ```elixir
 from = MyApp.Cursor.load("worker-1") || 0
@@ -97,17 +130,17 @@ rescue
 end
 ```
 
-**A read below `:first` raises.** Starting at the retained base instead
-would hand the consumer a contiguous-looking stream with a hole in it, and
-nothing else protects a consumer that falls behind the retention window.
-`DurableBuffer.OutOfRangeError` names the offset asked for and the oldest
-one retained, so the caller resyncs deliberately. `stream/3` reads the
-bounds before it builds the stream, so the raise lands at the call rather
-than part-way through iterating.
+### A read below `:first` raises
 
-### Retention
+`stream/3` raises `DurableBuffer.OutOfRangeError` when `from:` is below `:first`.
 
-Declare a window and let the buffer pick the trim point:
+- The error gives the requested offset and the oldest offset that the buffer keeps. The caller then resyncs on purpose.
+- A silent start at `:first` gives a stream with a hole that looks complete. Nothing else protects a consumer that falls behind retention.
+- `stream/3` reads the bounds before it builds the stream. Thus the error comes at the call, not during the iteration.
+
+## Retention
+
+Set a time limit, a size limit, or both. The buffer then finds the trim point.
 
 ```elixir
 {DurableBuffer,
@@ -117,156 +150,104 @@ Declare a window and let the buffer pick the trim point:
  retention_bytes: 10 * 1024 * 1024 * 1024}
 ```
 
-```elixir
-:ok = DurableBuffer.trim(:events, user_id)              # apply the policy
-:ok = DurableBuffer.trim(:events, user_id, upto: 5_000) # explicit point
-```
+**The first limit to apply wins.** A time limit does not limit disk use during a traffic spike. A size limit does not limit age when traffic is low.
 
-Whichever bound binds first decides: "7 days" does not bound disk under a
-traffic spike, and "10 GB" does not bound age on a quiet one. A buffer that
-declares neither returns `{:error, :no_retention_policy}` — the buffer
-tracks no consumers, so with no policy there is nothing to compute a point
-from. Nothing to drop is `:ok`, not an error.
+### Retention runs by itself
 
-**Retention runs on its own.** Declaring a bound turns on a per-partition
-timer, so a buffer honours its window without anyone calling `trim/2`.
-`retention_interval_ms` controls it (default 60 s) and `:infinity` turns it
-off. Partitions start on a random offset inside the first interval, so they
-do not all trim at the same instant. The timed trim goes through the same
-committer as every other unit of work, so it queues behind pending commits
-rather than pre-empting them — a trim landing during a load spike takes its
-turn. Call `trim/2` yourself only to trim sooner than the next tick.
+A retention limit starts a timer on each partition. You do not have to call `trim/3`.
 
-`DurableBuffer.retention/2` reports what the policy has to work with:
+- `retention_interval_ms` sets the interval. The default is 60 seconds.
+- `:infinity` stops the timer. Then you call `trim/3` yourself.
+- Each partition starts at a random time in the first interval. Thus the partitions do not all trim at the same time.
+- A timed trim waits behind the commits in the queue. It does not interrupt them.
+
+Call `trim/3` yourself only to trim before the next timer tick.
+
+### Results of `trim/3`
+
+| Case | Result |
+|---|---|
+| No retention limit and no `upto:` | `{:error, :no_retention_policy}` |
+| Nothing to drop | `:ok` |
+| `upto:` is past the durable offset | `{:error, :not_durable}` |
+| The policy point is past the durable offset | The buffer trims to the durable offset |
+
+`upto:` is exclusive. The buffer drops each entry below it, and `upto:` becomes the new `:first`.
+
+### Where the trim lands
+
+- **Local, explicit `upto:`:** exactly at the point.
+- **Local, policy point:** at the batch boundary at or below the point.
+- **S3:** at the segment boundary at or below the point. S3 drops only segments that are fully below the point.
+
+### Monitor retention
+
+`retention/2` reports what the policy has to work with:
 
 ```elixir
 {:ok, %{oldest_age_ms: 604_012, bytes: 8_431_923_712}} =
   DurableBuffer.retention(:events, user_id)
 ```
 
-Alert on `:oldest_age_ms`. It should sit near `retention_ms` on a busy
-partition, and climbing well past it is what a stalled time retention looks
-like from outside. It is `nil` only for an empty partition.
+**Alert on `:oldest_age_ms`.**
 
-**Where the timestamps live.** In the seek index, one per group commit,
-alongside the offset and byte position that record already carries. That
-costs 8 bytes per *batch* and no extra write on the commit path. The index
-is `datasync`ed on an interval (`index_sync_ms`, default 5 s), not per
-commit, so a crash leaves only the last few seconds of commits undated.
+- On a busy partition, it stays near `retention_ms`.
+- If it climbs far past `retention_ms`, time retention has stopped.
+- It is `nil` only for an empty partition.
 
-Undated data is treated as **just written**. A partition backfills any
-retained range its index cannot date with the current time when it opens,
-so a lost index makes old data look young and never the reverse. A lost
-index therefore *delays* retention; it never causes an early trim.
+### Retention and the seek index
 
-Both bounds resolve through the index, so both go coarse while it rebuilds
-— a cut can only land on a surviving record's boundary. `retention_bytes`
-recovers first, because it needs only byte positions and every new commit
-adds one. `retention_ms` additionally waits out the backfilled timestamp on
-the head, which is the case worth setting a size bound alongside it for.
+Retention uses the seek index of the local backend. Thus you cannot set a retention limit together with `index: false`. That combination raises at startup. Without the raise, the buffer grows with no limit and gives no warning.
 
-`upto:` is exclusive: every entry below it is dropped and becomes the new
-`:first`. A trim past the durable offset is refused with
-`{:error, :not_durable}`; a policy point is clamped to it instead.
+A lost or damaged index can only delay a trim. It never causes an early trim. See [docs/internals.md](docs/internals.md#retention-timestamps).
 
-The local backend cuts exactly at an explicit point, and on the batch
-boundary at or below a policy point. It copies the retained suffix
-to a sibling file, `datasync`s it and renames over the WAL, so a crash
-mid-trim leaves the original intact; the cost is proportional to the bytes
-*kept*, which is cheap exactly when trimming is routine. S3 stores immutable
-segments, so it drops only segments lying entirely below the point and
-`:first` lands on a segment boundary at or below it.
-
-**A trim does not reach the replication wire.** Batches are stamped with
-*logical* byte offsets, which count from the first byte ever written rather
-than from the start of the file, so trimming the head moves
-`base_byte_offset` and leaves every stamped number alone. No epoch bump, no
-resync, and the seek index needs no rebuild. The primary passes its new base
-on to each replica as an advisory, best-effort `:erpc` — a replica that
-misses it simply keeps more data than it needs.
-
-The one case that needs care is a replica whose tail falls *below* the
-primary's base, because it was down while the primary appended and then
-trimmed. Nobody has the bytes in between, so the sender discards that
-replica's copy, rebases it on the primary's base, and streams forward from
-there.
-
-`from:` seeks rather than scans. The local backend keeps a sparse index
-(`p<index>.idx`, one 28-byte record per group commit: first offset, byte
-position, commit time) and binary-searches it for the last batch at or
-before the wanted offset. All three fields rise together, because commits
-are ordered, so a search by time or by size is the same binary search — which
-is what retention uses.
-
-For reads the index is a pure cache. Any record the WAL does not back is
-dropped when the partition opens — past its tail, below its retained base,
-or torn. A seek result pointing below the base is ignored as well, since a
-crash between the index write and the synced metadata beside it can leave
-the base advanced and stale records behind. A missing, stale, torn or
-corrupt index costs a scan from the start of the log — never a wrong
-answer.
-
-For retention it is a cache that can only *delay* a trim, never cause an
-early one: a range the index cannot date is backfilled as just written. A
-trim carries the timestamp of the batch it cut into over to the new head, so
-the head keeps its real age instead of resetting.
-
-S3 needs no index at all: its segment keys *are* offsets, so a seek picks the
-floor key from the listing it already does, and that listing carries
-`LastModified` and `Size` for retention.
-
-The `partition_key` (any term) is hashed to one of a fixed number of
-partitions (default `System.schedulers_online()`). Each partition has its own
-writer, WAL, and backend state, so partitions commit fully in parallel —
-use more partitions to saturate your disk. Each caller frames its own WAL
-entries (copy + CRC32) before it sends them to the writer, so the framing
-cost spreads across callers instead of one writer per partition.
-
-### Options
+## Options
 
 | Option | Default | Meaning |
 |---|---|---|
-| `:name` | required | Buffer name (atom) |
-| `:backend` | required | `{module, opts}` backend spec |
-| `:partitions` | schedulers | Number of parallel partition writers |
-| `:max_batch_bytes` | 8 MiB | Force a flush when a pending batch reaches this size |
-| `:max_batch_entries` | 5000 | Force a flush at this many pending entries |
-| `:flush_delay_ms` | 0 (adaptive) | Dwell before committing a batch started while idle. Default is adaptive: 0 normally, growing to 2 ms automatically when commit completions are slow (fsync/PUT-bound) and batches are concurrent. An explicit value fixes the dwell |
-| `:max_inflight_commits` | 32 | For backends with pipelined commits (currently `Backend.Replica`): batches committing concurrently per partition; replies stay in order |
-| `:heal_timeout` | 5 s | `Backend.Replica` only: how long `open/2` waits for a replica to report its tail before it opens without healing from that node |
-| `:transport` | `Transport.Distribution` | `Backend.Replica` only: the wire replicated batches travel on. See [Transports](#transports) |
-| `:retention_ms` | none | Keep at most this much history per partition. `trim/2` with no options drops batches that committed longer ago |
-| `:retention_bytes` | none | Keep at most this many bytes per partition. Whichever bound binds first decides |
-| `:retention_interval_ms` | 60 s | How often each partition applies its policy on its own. Declaring a bound turns the timer on; `:infinity` turns it off and leaves `trim/2` manual. Must be a positive integer or `:infinity` |
+| `:name` | required | The buffer name (an atom) |
+| `:backend` | required | The backend spec, `{module, opts}` |
+| `:partitions` | schedulers | The number of partition writers |
+| `:max_batch_bytes` | 8 MiB | Commit a batch when it reaches this size |
+| `:max_batch_entries` | 5000 | Commit a batch when it has this many entries |
+| `:flush_delay_ms` | 0 (adaptive) | The wait before an idle partition commits a new batch. See [Flush delay](#flush-delay) |
+| `:max_inflight_commits` | 32 | `Backend.Replica` only. The number of batches that commit at the same time per partition. Replies stay in order |
+| `:heal_timeout` | 5 s | `Backend.Replica` only. How long `open/2` waits for a replica tail. After that, the partition opens without that replica |
+| `:transport` | `Transport.Distribution` | `Backend.Replica` only. The connection for replicated batches. See [Transports](#transports) |
+| `:retention_ms` | none | The maximum age of the data in each partition |
+| `:retention_bytes` | none | The maximum bytes in each partition |
+| `:retention_interval_ms` | 60 s | The interval of the retention timer. Use a positive integer or `:infinity` |
 
-Retention resolves both bounds through the seek index, so a buffer that sets
-a bound cannot also set `index: false` on the local backend — that
-combination raises rather than growing without limit in silence.
+### Flush delay
 
-### Tuning for small payloads
+The default `flush_delay_ms` is adaptive.
 
-Throughput is `fsync rate × entries per commit`, so small payloads are fast
-exactly when commits carry many of them:
+- It is 0 when commits are fast.
+- It grows to 2 ms when commits are slow (for example, `fsync` or S3 PUT) and callers append at the same time.
+- An explicit value sets a fixed wait.
 
-- **Use `append_batch/4`** whenever producers can hand over lists — it pays
-  the messaging cost once per list and is ~100× single appends at 256 B
-  (disk-bandwidth-bound even at tiny payload sizes).
-- **Use fewer partitions.** More partitions help large payloads (parallel
-  bandwidth) but split small-payload batches across more fsyncs:
-  2 partitions beat 10 by ~2.2× at 256 B in the bench.
-- **Leave `flush_delay_ms` at its adaptive default.** The dwell only pays
-  where an expensive durability step dominates each commit (fsync, S3
-  PUT), and the adaptive default detects exactly that: on the fsync-on
-  replicated bench it captured ~90% of the best fixed dwell's throughput
-  (34.6k vs 37.8k ops/s at 256 B × 256 callers, ~5× the no-dwell 7.1k)
-  while keeping single-caller latency 3× lower than the fixed dwell, and
-  with `fsync: false` it stays at zero — a fixed 1 ms dwell there *drops*
-  throughput ~334k → ~123k ops/s and puts a ~2 ms floor under idle
-  appends. Set an explicit value only to force the trade one way.
+## Small payloads
 
-Commits are pipelined internally (batch formation overlaps the in-flight
-fsync/PUT), so `append_async` and `append_batch` producers keep the disk fed
-without waiting for commit boundaries.
+Throughput is `fsync rate × entries per commit`. Thus small payloads are fast only when each commit holds many of them.
+
+1. **Use `append_batch/4`** when producers can give a list. It is about 100× faster than single appends at 256 B. It reaches the disk bandwidth limit even with very small payloads.
+2. **Use fewer partitions.** More partitions help large payloads. For small payloads, they split the batches across more `fsync` calls. In the bench, 2 partitions are about 2.2× faster than 10 at 256 B.
+3. **Keep the adaptive `flush_delay_ms`.** Set a fixed value only to force a trade-off.
+
+The adaptive delay helps only when a slow durability step controls each commit. The bench shows this:
+
+| Replicated bench, 256 B × 256 callers | ops/s |
+|---|---|
+| `fsync: true`, no delay | 7.1k |
+| `fsync: true`, adaptive delay | 34.6k |
+| `fsync: true`, best fixed delay | 37.8k |
+| `fsync: false`, adaptive delay (stays at 0) | about 334k |
+| `fsync: false`, fixed 1 ms delay | about 123k |
+
+- With `fsync: true`, the adaptive delay gets about 90% of the best fixed delay. Its single-caller latency is 3× lower.
+- With `fsync: false`, a fixed 1 ms delay cuts throughput. It also adds about 2 ms to each idle append.
+
+Commits run as a pipeline. The next batch forms while the current `fsync` or PUT runs. Thus `append_async/3` and `append_batch/4` keep the disk busy without a wait for each commit.
 
 ## Backends
 
@@ -276,31 +257,17 @@ without waiting for commit boundaries.
 {DurableBuffer.Backend.Local, dir: "/var/lib/events"}
 ```
 
-Append-only WAL file per partition (`p<index>.wal`), one write + one
-`:file.datasync/1` per group commit. Entries are framed as
-`<<len::32, crc32::32, payload>>`; torn tails from crashes are detected by
-CRC and truncated on open. Two sidecars sit next to it: `p<index>.meta`
-(epoch and the retained bases) and `p<index>.idx` (the sparse seek index).
-A third, `p<index>.trim`, exists only while a trim is in flight.
+Each partition has one append-only WAL file, `p<index>.wal`. Each group commit does one write and one `:file.datasync/1`.
 
-**A trim is two durable steps**, the WAL rewrite and the new base in
-`p<index>.meta`, so a crash can land between them. Before the rewrite the
-base it is moving to goes into `p<index>.trim`; after the metadata is
-written it is removed. On open, a leftover `p<index>.trim` says a trim was
-interrupted, and the presence of the WAL's own temporary file says which
-side of the rename the crash fell on: still there means the rewrite never
-landed and the old base stands, gone means it did and the new base is
-adopted. `p<index>.meta` is itself written to a sibling and renamed, so it
-is never a zero-byte file with the bases reset to zero.
+| Option | Default | Meaning |
+|---|---|---|
+| `fsync:` | `true` | `false` skips the `datasync`. Then commits survive a crash of the Erlang VM (BEAM), but not an OS crash or a power loss |
+| `index_sync_ms:` | 5 s | How often the seek index is synced to disk |
+| `index:` | `true` | `false` turns off the seek index. You cannot use it with retention |
 
-`fsync: false` skips the `datasync` — commits then survive a BEAM crash but
-not an OS crash or power loss. Defaults to `true` for this backend: with a
-single copy, the fsync *is* the durability.
+**Keep `fsync: true` on this backend.** With one copy of the data, the `fsync` is the only durability.
 
-`index_sync_ms` (default 5 s) is how often the seek index is `datasync`ed.
-It is append-only, so one sync covers every record since the last, and the
-cost stays off the per-commit path. A crash then leaves at most that much
-data undated, which retention reads as young.
+The WAL detects torn writes after a crash by CRC. It cuts them off when it opens. For the file layout and the crash safety of a trim, see [docs/internals.md](docs/internals.md#local-backend-files).
 
 ### Replicated
 
@@ -312,175 +279,132 @@ data undated, which retention reads as young.
  ack: :quorum}
 ```
 
-Each group commit is written to the local WAL and, in parallel, pipelined to
-every replica node over a long-lived per-replica channel
-(`DurableBuffer.Replica.Sender`), where it is appended and `datasync`ed by a
-`DurableBuffer.Replica.Writer`. Commits overlap: up to
-`:max_inflight_commits` batches are replicating concurrently per partition
-(callers still get replies in order), and the replica writer group-commits
-whatever has queued on its channel into a single write + fsync — so a slow
-or dead replica stalls only its own channel, never the commit path. Replica
-nodes need no configuration beyond running the `:durable_buffer`
-application; writers start on demand, keyed by `{replica_dir, partition}`.
+Each group commit goes to the local WAL. At the same time, it goes to each replica node, which writes and syncs it.
 
-`ack:` controls when a commit counts as durable (the local write is one ack):
-`:all` (default), `:quorum` (majority of `1 + length(replicas)`), or an
-integer. Commits return as soon as the ack target is met; reads are served
-from the local WAL.
+| Option | Default | Meaning |
+|---|---|---|
+| `dir:` | required | The WAL directory on the primary |
+| `replicas:` | required | The replica nodes |
+| `replica_dir:` | `dir` | The WAL directory on each replica |
+| `ack:` | `:all` | When a commit is durable. See [The ack policy](#the-ack-policy) |
+| `fsync:` | `false` | Sync to disk before each ack. See [Durability](#durability) |
+| `max_sender_bytes:` | 64 MiB | The maximum unacknowledged bytes for each replica |
+| `transport:` | `Transport.Distribution` | See [Transports](#transports) |
 
-A primary that comes back from a crash heals itself first. With
-`fsync: false` it can lose WAL bytes a replica already has and already
-acked, so `open/2` asks every replica for its tail and pulls back anything
-it is missing from the furthest one, before the partition serves a single
-append. Pulled bytes are CRC-checked frame by frame and `datasync`ed
-whatever the `fsync:` setting is. `heal_timeout:` (5 s) bounds how long an
-unreachable replica delays startup; a replica that does not answer is not
-consulted.
+- **Setup:** replica nodes need only the running `:durable_buffer` application. Their writers start on demand.
+- **Versions:** the primary and the replicas must run the same `:durable_buffer` version.
+- **Slow replicas:** a slow or dead replica stops only its own channel. It does not stop the commit path.
+- **Recovery:** a replica that was down, or that lost its disk, catches up by itself.
 
-Every batch is stamped with `{epoch, offset}` — a per-partition epoch that
-increments on truncate (persisted in the `p<index>.meta` sidecar alongside
-the retention bounds, see `DurableBuffer.Meta`) and the WAL byte offset
-where the batch starts. A replica appends a batch only when
-it lands exactly at its own WAL tail, so it can never diverge silently, and
-every failure heals the same way: the sender re-attaches, compares the
-replica's tail against the primary's WAL, and streams the replica the
-missing suffix before resuming live traffic (truncating the replica first if
-it missed a truncate). A replica merely ahead of the sender's unacked
-queue — normal whenever an ack is in flight — keeps its data; the sender
-adopts its tail as that member's watermark. Each attach mints a reference
-that stamps the batches it sends, so an ack from an earlier attach is
-dropped rather than counted. A replica that was down for an hour — or
-that lost its disk entirely — catches up automatically; until it has, its
-missing acks surface as `:insufficient_acks` errors whenever the ack policy
-needs it. Primary and replica nodes must run the same `:durable_buffer`
-version.
+#### The ack policy
 
-Acks are durability watermarks rather than per-batch confirmations: a
-replica replies "durable through `{epoch, offset}`", the primary keeps the
-highest watermark seen per member, and a batch is committed once `ack:`
-members (the primary included) have watermarks at or past its end — the
-same commit rule RabbitMQ's quorum queues use, generalized to the
-configurable ack policy.
+`ack:` sets when a commit is durable. The local write counts as one ack.
 
-**Topology:** one static primary and a static list of followers. There is no
-leader election, no membership protocol, and no automatic failover. The
-`replicas:` list is configuration on the primary. Followers never accept
-writes from anyone else and are never read. The epoch increments on
-*truncate*, not on a change of leader, so it is not a leadership fencing
-token. If you need automatic failover, put it above this library.
+| Value | A commit is durable when |
+|---|---|
+| `:all` (default) | All nodes acknowledge it |
+| `:quorum` | A majority of `1 + length(replicas)` acknowledge it |
+| an integer | That number of nodes acknowledge it |
 
-**Promoting a follower** is a manual, operator-driven procedure:
+A commit returns when it meets the ack target. A missing ack gives `{:error, :insufficient_acks}`. This continues until the replica catches up.
 
-1. **Stop the old primary and keep it stopped.** Nothing fences it. If it
-   comes back it re-attaches to the followers, sees data it does not have,
-   and truncates them.
-2. **Pick the most current follower.** With `ack: :all` every follower is
-   complete. With `:quorum` or an integer they can differ — compare the
-   `p<index>.wal` file sizes under `replica_dir` on each node and take the
-   largest, per partition. Note that a primary which merely *restarts* does
-   not need this: it heals itself from the followers at open.
-3. **Check that the follower adopted the current epoch.** A truncate whose
-   `:erpc` to a follower failed leaves that follower holding pre-truncate
-   data until its sender re-attaches. Do not promote inside that window:
+#### Durability
+
+**By default, the replicated backend does not `fsync`** (`fsync: false`). The durability is the ack policy: the data is on N machines. RabbitMQ streams take the same approach.
+
+- A crash of one node is safe. CRC checks find torn writes on recovery.
+- A power loss on a quorum of nodes at the same time can lose acknowledged writes.
+- `fsync: true` syncs on the primary and on each replica before its ack.
+
+With `fsync: true`, each commit costs more when many partitions share one disk. The adaptive flush delay starts in this case. It gives about 35k ops/s at 256 B × 256 callers on the bench machine. That is about 1.7× the old engine, which always synced.
+
+A primary that restarts heals itself before it accepts an append. It pulls back any bytes that a replica has and it does not have. See [docs/internals.md](docs/internals.md#primary-heal).
+
+#### Reads
+
+`stream/3` reads the WAL of the primary. It stops at the durable offset, which is the point that a commit waits for.
+
+- A reader never sees a batch that can still fail with `:insufficient_acks`.
+- The stream reads the durable offset again as it moves. A consumer that keeps pulling gets new durable data.
+- The stream ends at the current end of the durable data.
+- A reader gets the durable offset from an `:atomics` slot. It sends no message to the partition.
+
+Use `dirty: true` to read the full local WAL, for example in recovery tools:
+
+```elixir
+DurableBuffer.stream(:events, user_id)
+DurableBuffer.stream(:events, user_id, dirty: true)
+```
+
+#### Topology
+
+The buffer has **one static primary** and a static list of followers.
+
+- It has no leader election, no membership protocol and no automatic failover.
+- The `replicas:` list is configuration on the primary.
+- Followers accept writes only from their primary. Nothing reads from a follower.
+- The epoch changes on a truncate, not on a leader change. It is not a fencing token for leaders.
+
+If you need automatic failover, build it above this library.
+
+#### Promote a follower
+
+Promotion is a manual procedure:
+
+1. **Stop the old primary and keep it stopped.** Nothing fences it. If it starts again, it sees data that it does not have and truncates the followers.
+2. Find the most current follower:
+   - With `ack: :all`, each follower is complete.
+   - With `:quorum` or an integer, the followers can differ. For each partition, compare the size of `p<index>.wal` under `replica_dir` on each node. Use the largest.
+3. Make sure that the follower has the current epoch. After a truncate, a follower can keep old data for a short time. Do not promote it in that window:
 
    ```elixir
    {:ok, status} = DurableBuffer.replica_status(:events, user_id)
-   status[:"node2@host2"].promotable?          # false inside the window
+   status[:"node2@host2"].promotable?
 
-   :ok = DurableBuffer.await_replicas(:events, user_id)   # or block on it
+   :ok = DurableBuffer.await_replicas(:events, user_id)
    ```
 
    See F-3 in [`tla/FINDINGS.md`](tla/FINDINGS.md).
-4. **Start a buffer on that node** with `dir:` set to the follower's
-   `replica_dir`, the **same** `partitions:` count, and the surviving nodes
-   as `replicas:`. A follower's WAL is written by the same `Backend.Local`
-   code as a primary's, so it needs no conversion.
-5. **Point producers at the new node.**
+4. Start a buffer on that node with these settings:
+   - `dir:` is the `replica_dir` of the follower.
+   - `partitions:` is the **same** count as before.
+   - `replicas:` lists the remaining nodes.
+5. Send producer traffic to the new node.
 
-The partition count must match. Keys are hashed with
-`:erlang.phash2(key, partitions)` into `p<index>.wal`, so a different count
-sends a key to a different file. Note also that `replica_dir` defaults to
-`dir`, and that any write the promoted follower had not acked is gone.
+A primary that only restarts does not need this procedure. It heals itself from the followers when it opens.
 
-**Truncate and replicas:** `truncate/3` bumps the epoch, wipes the local
-WAL, resets the senders and returns. It does not wait for the replicas. Each
-replica is sent an `:erpc` truncate; one that fails is logged, and that
-replica converges shortly afterwards when its sender re-attaches, compares
-epochs and truncates it. Until it does, the replica still holds pre-truncate
-data — it cannot cause a false ack, because an old-epoch watermark can never
-satisfy a new-epoch target, but it is not safe to promote. Use
-`replica_status/3` to see which replicas have adopted the current epoch, or
-`await_replicas/3` to block until they all have.
+Some facts about promotion:
 
-**Reads:** `stream/3` reads the primary's local WAL, gated at the durable
-offset — the `ack:`-th largest replica watermark, which is exactly what a
-commit waits for. A reader never sees a batch that has not met the policy,
-so it never sees one that may still fail with `:insufficient_acks`. The
-limit is re-read as the stream advances, so a consumer that keeps pulling
-picks up data that becomes durable while it runs; like any read of a file
-still being written, the stream ends at the current end of durable data.
+- **The partition count must match.** The buffer hashes keys with `:erlang.phash2(key, partitions)` to `p<index>.wal`. A different count sends a key to a different file.
+- The follower WAL uses the same `Backend.Local` code as the primary WAL. It needs no conversion.
+- `replica_dir` defaults to `dir`.
+- A write that the promoted follower did not acknowledge is lost.
 
-Each partition publishes its durable offset into an `:atomics` slot, so a
-reader takes it lock-free and sends the partition no message.
+#### Truncate with replicas
 
-Pass `dirty: true` to read the whole local WAL instead, for recovery
-tooling:
+`truncate/3` returns without a wait for the replicas.
 
-```elixir
-DurableBuffer.stream(:events, user_id)               # durable only
-DurableBuffer.stream(:events, user_id, dirty: true)  # everything on disk
-```
+1. It increments the epoch, clears the local WAL and resets the senders.
+2. It sends a truncate to each replica by `:erpc`. A failed call goes to the log.
+3. A replica that missed the truncate converges when its sender attaches again.
 
-**Durability model:** by default the replicated backend does *not* fsync
-(`fsync: false`) — durability is the ack policy itself, data held on N
-machines, the same stance RabbitMQ streams take. Per-node crashes are
-handled by CRC torn-tail recovery; the trade-off is that correlated power
-loss across an ack-quorum of nodes can lose acked writes. Pass
-`fsync: true` to `datasync` on the primary and on every replica before its
-ack. Fsyncing per commit costs throughput when many partitions share a
-disk, so the adaptive flush dwell (see `flush_delay_ms`) kicks in
-automatically under exactly that pressure — with it, `fsync: true`
-measures ~35k ops/s at 256 B × 256 callers on the bench machine, ~1.7×
-the old always-fsync engine, without taxing idle latency. `FSYNC=true`
-toggles it in `replica_bench.exs`.
+Until it converges, the replica keeps its old data. It cannot give a false ack, because an old-epoch ack never meets a new-epoch target. But it is not safe to promote. Use `replica_status/3` to see which replicas have the current epoch. Use `await_replicas/3` to wait for all of them.
 
 #### Transports
 
-`transport:` decides what carries replicated batches. It defaults to
-`DurableBuffer.Transport.Distribution`, which sends them to the remote
-writer over the Erlang distribution channel — the behaviour every earlier
-version had.
+`transport:` sets the connection that carries replicated batches. The default is `DurableBuffer.Transport.Distribution`, which uses Erlang distribution.
 
-Only the batches use it. The control path (attach, truncate, trim, remote
-tail, remote read) and the acks stay on distribution whatever `transport:`
-says. They are small request/reply round trips, so they block nothing, and
-keeping them on distribution is what lets the sender detect a dead replica
-with an ordinary `Process.monitor/1` on the remote writer.
+**Head-of-line blocking is the reason to change it.** Erlang distribution uses one TCP connection for each node pair. All processes on the two nodes share it.
 
-The reason to change it is head-of-line blocking. Distribution is **one TCP
-connection per node pair**, shared by every process on those nodes. An
-8-partition buffer under load is 8 senders pushing batches through the same
-socket that carries the cluster heartbeat. A starved heartbeat reads as a
-node going down, which is the event replication exists to survive.
+- An 8-partition buffer under load has 8 senders on that one socket.
+- The cluster heartbeat uses the same socket.
+- A delayed heartbeat looks like a node failure. Replication exists to survive a node failure.
 
-A transport must deliver batches to one replica in the order they were sent.
-A replica appends a batch only when it lands exactly at its WAL tail, so a
-reordered pair costs a full resync.
-
-A transport reports a failure rather than raising: `channel/4` and
-`send_batch/6` both return `{:error, reason}`, and the sender heals by
-re-attaching. It catches a raise too, but a transport that raises on an
-ordinary dead peer produces log lines that read like a bug.
-
-`max_sender_bytes` bounds in-flight bytes on both paths — the unacked queue
-while live, and the unacknowledged window while resyncing a replica that is
-behind. The resync bound matters most for a transport that does not block
-its caller, which is every transport except distribution.
+Only the batches use the transport. Control messages and acks stay on distribution. See [docs/internals.md](docs/internals.md#transports).
 
 ##### gen_rpc
 
-`DurableBuffer.Transport.GenRPC` gives each node pair a dedicated TCP
-socket, outside distribution:
+`DurableBuffer.Transport.GenRPC` gives each node pair its own TCP socket, outside distribution:
 
 ```elixir
 {DurableBuffer.Backend.Replica,
@@ -489,65 +413,33 @@ socket, outside distribution:
  transport: DurableBuffer.Transport.GenRPC}
 ```
 
-**Add the dependency yourself.** `:durable_buffer` does not declare it. The
-maintained fork is not on Hex, so it can only be a git dependency, and Hex
-forbids a git dependency in a published package. Add it to your own
-application, on every primary and replica node:
+**Add the dependency yourself**, on every primary and replica node:
 
 ```elixir
 {:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1"}
 ```
 
-`init_config/1` raises when the transport is set and `:gen_rpc` is not
-loaded, so a missing dependency is an argument error at startup rather than
-a failure on the first commit.
+`:durable_buffer` does not declare it. The maintained fork is not on Hex. Hex does not allow a git dependency in a published package. `init_config/1` raises at startup if the transport is set and `:gen_rpc` is not loaded.
 
-What it costs:
+gen_rpc has these costs:
 
-* **A port.** gen_rpc listens on its own TCP port on every node. Open it
-  between the nodes. Two nodes on one host need `port_discovery: :stateless`
-  or distinct `tcp_server_port` settings, or they collide on 5369.
-* **A TLS decision.** gen_rpc speaks plain TCP by default, and
-  distribution's TLS settings do not apply to it. Configure its own
-  `ssl_server_options` and `ssl_client_options`.
-* **A different place for backpressure.** `send/2` to a remote pid blocks
-  the sender when the distribution buffer fills. `:gen_rpc.ordered_cast/4`
-  does not block the caller: it hands the payload to gen_rpc's client
-  process, whose mailbox is unbounded, and the TCP send blocks that process
-  instead. So the bytes wait in that mailbox rather than in the sender.
-  `max_sender_bytes` is what bounds them: it caps the unacked queue on the
-  live path and the unacknowledged resync window on the catch-up path. A
-  replica far behind still parks up to that much in gen_rpc's mailbox.
-* **A whitelist, if the node already runs gen_rpc.** With
-  `rpc_module_control` set to `:whitelist`, the acceptor discards a batch
-  whose module is not listed — at debug level, while the send still
-  reports success. Add `DurableBuffer.Replica` to the list.
+- **A port.** gen_rpc uses its own TCP port on each node. Open it between the nodes. Two nodes on one host need `port_discovery: :stateless` or different `tcp_server_port` values. If not, both use port 5369.
+- **Its own TLS settings.** gen_rpc uses plain TCP by default. The Transport Layer Security (TLS) settings of distribution do not apply. Set `ssl_server_options` and `ssl_client_options`.
+- **A different backpressure point.** The bytes wait in the unbounded mailbox of the gen_rpc client, not in the sender. `max_sender_bytes` limits them.
+- **A whitelist.** If `rpc_module_control` is `:whitelist`, add `DurableBuffer.Replica` to the list. If not, gen_rpc drops each batch and logs it only at debug level. The send still reports success.
 
-Ordering comes from `ordered_cast/4`, which gen_rpc serialises per
-`{node, tag}`. The tag is `{replica_dir, partition}`, so each partition
-gets its own connection and its own order, and partitions never block each
-other.
+`bench/transport_bench.exs` puts an unrelated load on the distribution channel. It then measures both transports.
 
-**When it is worth it.** `bench/transport_bench.exs` puts an unrelated load
-on the distribution channel between the same pair and measures both
-transports. Idle, the two are indistinguishable. Under contention every
-column separates, in the same direction across three runs:
-
-| | distribution | gen_rpc |
+| Under load | distribution | gen_rpc |
 |---|---|---|
-| throughput | falls ~2.5x | holds most of it |
-| p50 latency | rises 7-9x | rises ~1.3x |
-| p99 latency | rises 4.5-7x | rises 1.1-1.7x |
+| Throughput | falls about 2.5× | stays near its idle value |
+| p50 latency | rises 7–9× | rises about 1.3× |
+| p99 latency | rises 4.5–7× | rises 1.1–1.7× |
 
-See [bench/README.md](bench/README.md) for the numbers.
+When the channel is idle, the two transports give the same results. See [bench/README.md](bench/README.md) for the numbers.
 
-Reach for gen_rpc when the node pair carries anything besides replication —
-that is when distribution gives up most of its throughput and roughly an
-order of magnitude of median latency. The heartbeat argument stands on its
-own: a starved heartbeat reads as a node going down.
-
-Stay on distribution when the pair is quiet, or when the extra port, the
-separate TLS configuration and the git dependency are not worth it.
+- **Use gen_rpc** when the node pair carries other traffic in addition to replication.
+- **Use distribution** when the pair is quiet. Use it also when the extra port, TLS settings and git dependency cost too much.
 
 ### S3
 
@@ -558,85 +450,79 @@ separate TLS configuration and the git dependency are not worth it.
  req_options: [aws_sigv4: [access_key_id: ..., secret_access_key: ...]]}
 ```
 
-**Add the dependencies yourself.** `:req` and `:req_s3` are optional
-dependencies of `:durable_buffer`, so an application that does not use S3
-does not pull them in. Add them to your own application to use this backend:
+**Add the dependencies yourself.** `:req` and `:req_s3` are optional dependencies. An application without S3 does not get them.
 
 ```elixir
 {:req, "~> 0.5"},
 {:req_s3, "~> 0.2"}
 ```
 
-`init_config/1` raises when either one is not loaded, so a missing
-dependency is an argument error at startup rather than an undefined
-function when the first partition opens.
+`init_config/1` raises at startup if one of them is not loaded.
 
-Uses [`req_s3`](https://hex.pm/packages/req_s3). Each group commit uploads
-one immutable segment object (`<prefix>/p<partition>/<offset>.wal`, keyed by
-the segment's first logical entry offset), so durability is exactly PUT
-success and there is no torn-write recovery to do.
-Reads need no durability gate for the same reason: an object exists only
-once its PUT succeeded.
-Credentials come from `req_options` or the standard `AWS_*` environment
-variables; point `aws_endpoint_url_s3:` at MinIO or another S3-compatible
-store. In tests, pass `req_options: [plug: {Req.Test, YourStub}]`.
+The backend uses [`req_s3`](https://hex.pm/packages/req_s3).
 
-S3's high PUT latency is where group commit matters most: while one PUT is
-in flight, every arriving append queues into the next segment, so throughput
-is `batch size × partitions / PUT latency` rather than one append per
-round trip.
+- Each group commit uploads one segment object: `<prefix>/p<partition>/<offset>.wal`. The key is the first entry offset of the segment.
+- An object never changes after the upload.
+- Durability is the success of the PUT. Thus there are no torn writes to recover.
+- Reads need no durability check. An object exists only after its PUT succeeds.
+
+Credentials come from `req_options` or from the standard `AWS_*` environment variables. To use MinIO or another S3-compatible store, set `aws_endpoint_url_s3:`. In tests, pass `req_options: [plug: {Req.Test, YourStub}]`.
+
+Group commit helps most on S3, because a PUT is slow. While one PUT runs, new appends go into the next segment. Throughput is `batch size × partitions / PUT latency`.
 
 ## Benchmarks
 
-On a MacBook Pro (M1 Max, internal SSD), the local backend sustains
-**~2 GB/s of fsync-durable appends** (64 KB payloads, 256 concurrent
-callers, 10 partitions), and `append_batch` keeps even 256 B payloads
-disk-bandwidth-bound at **4.9M entries/s**. The replicated backend
-(2 replica nodes, `ack: :all`, default `fsync: false`) sustains
-**~1.4 GB/s / 197k appends/s** of quorum-acked writes with a ~105 µs
-single-caller median. Full results for
-all three backends — including batch and mixed append + stream workloads,
-caller latency distributions, and small-payload tuning — are in
-[`bench/README.md`](bench/README.md).
+Results on a MacBook Pro (M1 Max, internal SSD):
 
-Each script prints an aggregate **throughput** grid (ops/s and MB/s over a
-payload-size × caller-concurrency matrix, measured with timed concurrent
-loops), a **mixed append + stream** grid (readers re-streaming partitions
-while writers append), a **stream-only** grid (the read path with no
-writers), a **seek** grid (time to the first entry of a `from:` read at
-increasing depth), and Benchee **caller latency** distributions
-(median / p99) at several concurrency levels.
+| Backend | Workload | Result |
+|---|---|---|
+| Local, 10 partitions | 64 KB payloads, 256 callers | about 2 GB/s, `fsync`-durable |
+| Local, `append_batch/4` | 256 B payloads | 4.9M entries/s, disk bandwidth limit |
+| Replica, 2 nodes, `ack: :all` | `fsync: false` | about 1.4 GB/s, 197k appends/s |
+| Replica, 2 nodes, `ack: :all` | 1 caller | about 105 µs median latency |
+
+**See [`bench/README.md`](bench/README.md) for all results.** It includes batch and mixed workloads, latency distributions and small-payload settings.
+
+Run the benchmarks:
 
 ```sh
-mix run bench/local_bench.exs                       # PARTITIONS=N
-mix run bench/replica_bench.exs                     # REPLICAS=2 ACK=all|quorum|N PARTITIONS=N FSYNC=true|false
-mix run bench/s3_bench.exs                          # fake S3, S3_SIM_LATENCY_MS=30
+mix run bench/local_bench.exs                        # PARTITIONS=N
+mix run bench/replica_bench.exs                      # REPLICAS=2 ACK=all|quorum|N PARTITIONS=N FSYNC=true|false
+mix run bench/s3_bench.exs                           # fake S3, S3_SIM_LATENCY_MS=30
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs # real S3 (AWS_* env vars)
-mix run bench/writer_framing_bench.exs              # CALLERS=64 APPENDS=2000 PAYLOAD_KB=256
+mix run bench/writer_framing_bench.exs               # CALLERS=64 APPENDS=2000 PAYLOAD_KB=256
 ```
 
-`writer_framing_bench.exs` drives one partition writer with a no-op backend,
-so it measures the writer's own message path, not durability.
-`replica_bench.exs` boots real replica nodes with `:peer` on the local host
-(measuring protocol overhead, not network RTT). `s3_bench.exs` runs against
-an in-memory fake with simulated PUT latency unless `S3_BENCH_BUCKET` is set.
+Each backend script prints these results:
 
-## Testing
+- **Throughput:** ops/s and MB/s for each payload size and caller count.
+- **Mixed append and stream:** readers stream partitions while writers append.
+- **Stream only:** the read path with no writers.
+- **Seek:** the time to the first entry of a `from:` read, at different depths.
+- **Caller latency:** Benchee median and p99 at different caller counts.
+
+Some scripts have special conditions:
+
+- `writer_framing_bench.exs` uses one partition writer and a no-op backend. It measures the message path of the writer, not durability.
+- `replica_bench.exs` starts real replica nodes with `:peer` on the local host. It measures protocol overhead, not network round-trip time.
+- `s3_bench.exs` uses an in-memory fake S3 with a simulated PUT latency. Set `S3_BENCH_BUCKET` to use real S3.
+
+## Tests
 
 ```sh
 mix test
 ```
 
-The suite covers WAL framing and torn-tail recovery, group-commit batching
-and error propagation, all three backends (S3 via a `Req.Test` fake with
-ListObjectsV2 pagination, replication via `:erpc` to the local node), and
-end-to-end restart recovery.
+The suite covers these areas:
+
+- WAL framing and recovery from torn writes
+- Group commit and error propagation
+- All three backends. S3 uses a `Req.Test` fake with ListObjectsV2 pagination. Replication uses `:erpc` to the local node.
+- Recovery after a restart, end to end
 
 ### TLA+ models
 
-The replication protocol is model-checked. `tla/Replication.tla` models the
-primary, the sender and the replica writer across crashes, dropped batches,
-re-attaches, resyncs and truncates.
+The replication protocol has a TLA+ model, which the TLC model checker checks. `tla/Replication.tla` models the primary, the sender and the replica writer. It covers crashes, dropped batches, re-attaches, resyncs and truncates.
 
 ```sh
 ./tla/run check                     # every config vs tla/expected.tsv
@@ -644,19 +530,28 @@ re-attaches, resyncs and truncates.
 ./tla/run Replication_core          # one config
 ```
 
-`check` is the gate: each config's PASS/VIOLATED result must match
-`tla/expected.tsv`. A VIOLATED row is intentional — a negative control, or a
-documented finding on the code as it stands. The runner downloads
-`tla2tools.jar` on first use and needs only a JDK. See
-[`tla/README.md`](tla/README.md) for the config matrix and
-[`tla/FINDINGS.md`](tla/FINDINGS.md) for what each spec proved or found.
+**`check` is the gate.** The PASS or VIOLATED result of each config must match `tla/expected.tsv`.
 
-CI runs formatting, a warnings-as-errors compile, the test suite, and the
-TLA+ gate on every push and pull request.
+- A VIOLATED row is intentional. It is a negative control or a known finding on the current code.
+- The runner downloads `tla2tools.jar` the first time. It needs only a JDK.
+- See [`tla/README.md`](tla/README.md) for the config matrix.
+- See [`tla/FINDINGS.md`](tla/FINDINGS.md) for what each spec proved or found.
+
+CI runs these on each push and pull request:
+
+- The formatter check
+- A compile with warnings as errors
+- The test suite
+- The TLA+ gate
 
 ## Releases
 
-Bumping `version:` in `mix.exs` and pushing to `main` cuts a release: the
-release workflow re-runs the tests, then creates the `v<version>` tag and a
-GitHub release with generated notes. Pushes that touch `mix.exs` without
-changing the version are no-ops (the existing tag is detected and skipped).
+To make a release, change `version:` in `mix.exs` and push to `main`.
+
+The release workflow then does these steps:
+
+1. It runs the tests again.
+2. It creates the `v<version>` tag.
+3. It creates a GitHub release with generated notes.
+
+A push that changes `mix.exs` but not the version does nothing. The workflow finds the existing tag and skips it.
