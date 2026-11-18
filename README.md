@@ -20,6 +20,8 @@ The buffer uses **group commit**. Appends that arrive while a commit runs wait f
 
 ## Install
 
+DurableBuffer needs Erlang/OTP 25 or later.
+
 The package is not on Hex. Add it as a git dependency in `mix.exs`:
 
 ```elixir
@@ -48,8 +50,10 @@ Each release has a `v<version>` tag. See [Releases](#releases).
    {:ok, first..last} = DurableBuffer.append_batch(:events, user_id, payloads)
    :ok = DurableBuffer.append_async(:events, user_id, payload)
 
-   :ok = DurableBuffer.sync(:events, user_id)
-   :ok = DurableBuffer.sync_all(:events)
+   case DurableBuffer.sync_all(:events, 5_000) do
+     :ok -> :ok
+     {:error, failures} -> IO.inspect(failures, label: "Partition sync failures")
+   end
 
    DurableBuffer.stream(:events, user_id) |> Enum.to_list()
    DurableBuffer.stream(:events, user_id, from: 42)
@@ -73,7 +77,7 @@ Each release has a `v<version>` tag. See [Releases](#releases).
 | `append_batch/4` | Appends a list in one call. Replies once, after the commit. Returns the offset range. |
 | `append_async/3` | Adds the payload to the queue. Does not wait. |
 | `sync/3` | Waits for all queued appends on one partition. Returns commit errors from `append_async/3` entries. |
-| `sync_all/2` | Does `sync/3` for all partitions. |
+| `sync_all/2` | Syncs all partitions in parallel with one shared timeout. Returns `:ok` or `{:error, [{index, reason}]}`. |
 | `stream/3` | Reads durable entries, oldest first. |
 | `offsets/2` | Returns `%{first:, durable:, next:}`. |
 | `trim/3` | Drops old entries by the retention policy, or below `upto:`. |

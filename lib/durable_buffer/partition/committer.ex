@@ -63,6 +63,20 @@ defmodule DurableBuffer.Partition.Committer do
     GenServer.cast(server, {:sync, from})
   end
 
+  @doc """
+  Clears the latched async error if `ref` matches it.
+
+  A sync reply does not clear the error, because OTP drops a reply that
+  arrives after the caller timed out. The caller acknowledges the error
+  only after it receives the reply. The acknowledgment goes through the
+  partition, so a later sync from the same caller reaches the committer
+  after it.
+  """
+  @spec ack_sync(GenServer.server(), reference()) :: :ok
+  def ack_sync(server, ref) do
+    GenServer.cast(server, {:ack_sync, ref})
+  end
+
   @spec request_truncate(GenServer.server(), GenServer.from()) :: :ok
   def request_truncate(server, from) do
     GenServer.cast(server, {:truncate, from})
@@ -210,7 +224,7 @@ defmodule DurableBuffer.Partition.Committer do
   def handle_cast({:sync, from}, %{async?: true} = state) do
     if :queue.is_empty(state.pending) do
       GenServer.reply(from, sync_reply(:ok, state))
-      {:noreply, %{state | async_error: nil}}
+      {:noreply, state}
     else
       {:noreply, %{state | pending: :queue.in({:sync_mark, from}, state.pending)}}
     end
@@ -218,8 +232,14 @@ defmodule DurableBuffer.Partition.Committer do
 
   def handle_cast({:sync, from}, state) do
     GenServer.reply(from, sync_reply(:ok, state))
+    {:noreply, state}
+  end
+
+  def handle_cast({:ack_sync, ref}, %{async_error: {ref, _reason}} = state) do
     {:noreply, %{state | async_error: nil}}
   end
+
+  def handle_cast({:ack_sync, _ref}, state), do: {:noreply, state}
 
   def handle_cast({:retention_status, from}, state) do
     reply =
@@ -412,7 +432,7 @@ defmodule DurableBuffer.Partition.Committer do
       {:value, {:sync_mark, from}} ->
         GenServer.reply(from, sync_reply(:ok, state))
         {_head, pending} = :queue.out(state.pending)
-        flush(%{state | pending: pending, async_error: nil})
+        flush(%{state | pending: pending})
 
       :empty ->
         state
@@ -501,32 +521,31 @@ defmodule DurableBuffer.Partition.Committer do
         :ok
     end)
 
-    state = %{state | async_error: async_error(reply, units, state.async_error)}
-    reply_to_syncs(units, reply, state)
+    {sync_result, state} =
+      case new_async_error(reply, units) do
+        nil ->
+          {sync_reply(reply, state), state}
+
+        async_error ->
+          state = %{state | async_error: async_error}
+          {sync_reply(:ok, state), state}
+      end
+
+    for {:sync, from} <- units, do: GenServer.reply(from, sync_result)
+    state
   end
 
-  defp async_error({:error, reason}, units, previous) do
+  defp new_async_error({:error, reason}, units) do
     if Enum.any?(units, &match?({:entries, nil, _entries, _count, _shape, _first}, &1)) do
-      reason
-    else
-      previous
+      {make_ref(), reason}
     end
   end
 
-  defp async_error(:ok, _units, previous), do: previous
+  defp new_async_error(:ok, _units), do: nil
 
-  defp reply_to_syncs(units, reply, state) do
-    syncs = for {:sync, from} <- units, do: from
-
-    if syncs == [] do
-      state
-    else
-      Enum.each(syncs, &GenServer.reply(&1, sync_reply(reply, state)))
-      %{state | async_error: nil}
-    end
+  defp sync_reply(:ok, %{writer: writer, async_error: {ref, reason}}) do
+    {:async_error, writer, ref, reason}
   end
 
-  defp sync_reply(reply, %{async_error: nil}), do: reply
-  defp sync_reply(:ok, state), do: {:error, state.async_error}
-  defp sync_reply(error, _state), do: error
+  defp sync_reply(reply, _state), do: reply
 end

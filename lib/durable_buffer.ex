@@ -151,16 +151,61 @@ defmodule DurableBuffer do
 
   @doc """
   Blocks until every enqueued payload in every partition is durable.
+
+  Sends sync requests in parallel and waits up to one shared timeout.
+  Returns `:ok` if all partitions complete successfully, or
+  `{:error, [{index, reason}]}` with all partition failures, exits and timeouts.
+  A timeout does not cancel a sync that was already sent or consume an
+  unreported async commit error.
   """
-  @spec sync_all(atom(), timeout()) :: :ok
+  @spec sync_all(atom(), timeout()) :: :ok | {:error, [{non_neg_integer(), term()}]}
   def sync_all(name, timeout \\ :infinity) do
     %{partitions: partitions} = config(name)
 
-    for index <- 0..(partitions - 1) do
-      Partition.sync(partition_name(name, index), timeout)
-    end
+    deadline =
+      if timeout == :infinity, do: :infinity, else: System.monotonic_time(:millisecond) + timeout
 
-    :ok
+    requests = :gen_server.reqids_new()
+
+    {requests, failures} =
+      Enum.reduce(0..(partitions - 1), {requests, []}, fn index, {requests, failures} ->
+        if deadline == :infinity or System.monotonic_time(:millisecond) < deadline do
+          {Partition.send_sync(partition_name(name, index), index, requests), failures}
+        else
+          {requests, [{index, :timeout} | failures]}
+        end
+      end)
+
+    response_timeout = if deadline == :infinity, do: :infinity, else: {:abs, deadline}
+
+    case collect_sync_responses(requests, response_timeout, failures) do
+      [] -> :ok
+      failures -> {:error, Enum.sort(failures)}
+    end
+  end
+
+  defp collect_sync_responses(requests, timeout, failures) do
+    case :gen_server.receive_response(requests, timeout, true) do
+      {{:reply, reply}, index, remaining} ->
+        failures =
+          case Partition.acknowledge_sync(reply) do
+            :ok -> failures
+            {:error, reason} -> [{index, reason} | failures]
+          end
+
+        collect_sync_responses(remaining, timeout, failures)
+
+      {{:error, {reason, _server}}, index, remaining} ->
+        collect_sync_responses(remaining, timeout, [{index, reason} | failures])
+
+      :timeout ->
+        Enum.reduce(:gen_server.reqids_to_list(requests), failures, fn {_request, index}, acc ->
+          [{index, :timeout} | acc]
+        end)
+
+      :no_request ->
+        failures
+    end
   end
 
   @doc """

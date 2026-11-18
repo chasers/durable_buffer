@@ -3,7 +3,8 @@ defmodule DurableBuffer.ManualAsyncBackend do
   Test backend implementing the asynchronous commit contract with externally
   controlled completions: every `commit_async/4` notifies `owner:` with
   `{:submitted, tag, committer}` and stays pending until the test sends the
-  committer `{:backend, {:complete, tag}}`.
+  committer `{:backend, {:complete, tag}}` for success or
+  `{:backend, {:complete, tag, {:error, reason}}}` to inject a failure.
   """
 
   @behaviour DurableBuffer.Backend
@@ -30,8 +31,10 @@ defmodule DurableBuffer.ManualAsyncBackend do
   end
 
   @impl DurableBuffer.Backend
-  def handle_message({:complete, tag}, state) do
-    {[{tag, :ok}], state}
+  def handle_message({:complete, tag}, state), do: handle_message({:complete, tag, :ok}, state)
+
+  def handle_message({:complete, tag, result}, state) do
+    {[{tag, result}], state}
   end
 
   @impl DurableBuffer.Backend

@@ -100,6 +100,156 @@ defmodule DurableBufferTest do
     end
   end
 
+  test "sync_all reports async commit failures without skipping the remaining partitions", %{
+    tmp_dir: tmp_dir
+  } do
+    name =
+      start_buffer(tmp_dir,
+        partitions: 2,
+        backend: {DurableBuffer.ManualAsyncBackend, owner: self()}
+      )
+
+    {first, second} = distinct_partition_keys(name)
+    first_index = DurableBuffer.partition_index(name, first)
+    second_index = DurableBuffer.partition_index(name, second)
+    assert :ok = DurableBuffer.append_async(name, first, "first")
+    assert :ok = DurableBuffer.append_async(name, second, "second")
+
+    for _ <- 1..2 do
+      assert_receive {:submitted, tag, committer}, 1_000
+      send(committer, {:backend, {:complete, tag, {:error, :write_failed}}})
+    end
+
+    assert {:error, failures} = DurableBuffer.sync_all(name, 1_000)
+    assert Map.new(failures) == %{first_index => :write_failed, second_index => :write_failed}
+    assert :ok = DurableBuffer.sync_all(name, 1_000)
+  end
+
+  test "a late sync_all reply does not consume a previous async failure", %{tmp_dir: tmp_dir} do
+    name = start_manual_buffer(tmp_dir, 1)
+    {first_tag, committer} = submit_async(name, :key)
+    send(committer, {:backend, {:complete, first_tag, {:error, :write_failed}}})
+
+    {pending_tag, ^committer} = submit_async(name, :key)
+    assert {:error, [{0, :timeout}]} = DurableBuffer.sync_all(name, 100)
+    assert_sync_pending(committer)
+
+    send(committer, {:backend, {:complete, pending_tag}})
+    assert :queue.is_empty(:sys.get_state(committer).pending)
+
+    assert {:error, [{0, :write_failed}]} = DurableBuffer.sync_all(name, 1_000)
+    assert :ok = DurableBuffer.sync_all(name, 1_000)
+  end
+
+  test "a timed-out sync/3 does not consume the failure of its own batch", %{tmp_dir: tmp_dir} do
+    name = start_manual_buffer(tmp_dir, 1, flush_delay_ms: 60_000)
+    assert :ok = DurableBuffer.append_async(name, :key, "held until sync")
+
+    assert {:timeout, _} = catch_exit(DurableBuffer.sync(name, :key, 100))
+    assert_receive {:submitted, tag, committer}, 1_000
+    send(committer, {:backend, {:complete, tag, {:error, :write_failed}}})
+    assert :queue.is_empty(:sys.get_state(committer).pending)
+
+    assert {:error, :write_failed} = DurableBuffer.sync(name, :key)
+    assert :ok = DurableBuffer.sync(name, :key)
+  end
+
+  test "sync_all collects a fast partition's reply while a slower one times out", %{
+    tmp_dir: tmp_dir
+  } do
+    name = start_manual_buffer(tmp_dir, 2)
+    {slow, fast} = ordered_partition_keys(name)
+    {slow_tag, slow_committer} = submit_async(name, slow)
+    {fast_tag, fast_committer} = submit_async(name, fast)
+
+    task = Task.async(fn -> DurableBuffer.sync_all(name, 1_000) end)
+    assert_sync_pending(slow_committer)
+    assert_sync_pending(fast_committer)
+    send(fast_committer, {:backend, {:complete, fast_tag, {:error, :write_failed}}})
+
+    assert {:error, [{0, :timeout}, {1, :write_failed}]} = Task.await(task)
+    send(slow_committer, {:backend, {:complete, slow_tag}})
+    assert :ok = DurableBuffer.sync(name, slow)
+  end
+
+  @tag capture_log: true
+  test "sync_all reports a partition crash without discarding other replies", %{tmp_dir: tmp_dir} do
+    name = start_manual_buffer(tmp_dir, 2)
+    {first, second} = ordered_partition_keys(name)
+    {_crashed_tag, crashed_committer} = submit_async(name, first)
+    {tag, committer} = submit_async(name, second)
+
+    task = Task.async(fn -> DurableBuffer.sync_all(name) end)
+    assert_sync_pending(crashed_committer)
+    assert_sync_pending(committer)
+
+    partition = name |> DurableBuffer.partition_name(0) |> GenServer.whereis()
+    Process.exit(partition, :kill)
+    send(committer, {:backend, {:complete, tag, {:error, :write_failed}}})
+
+    assert {:error, [{0, :killed}, {1, :write_failed}]} = Task.await(task)
+  end
+
+  test "a stale sync acknowledgment cannot clear a newer failure", %{tmp_dir: tmp_dir} do
+    name = start_manual_buffer(tmp_dir, 1)
+    partition = DurableBuffer.partition_name(name, 0)
+    {first_tag, committer} = submit_async(name, :key)
+    send(committer, {:backend, {:complete, first_tag, {:error, :first_failure}}})
+
+    # Receive the internal reply without acknowledging it yet.
+    reply = GenServer.call(partition, :sync)
+    assert {:async_error, _partition, _ref, :first_failure} = reply
+
+    {second_tag, ^committer} = submit_async(name, :key)
+    send(committer, {:backend, {:complete, second_tag, {:error, :second_failure}}})
+    assert :queue.is_empty(:sys.get_state(committer).pending)
+    assert {:error, :first_failure} = DurableBuffer.Partition.acknowledge_sync(reply)
+
+    assert {:error, :second_failure} = DurableBuffer.sync(name, :key)
+    assert :ok = DurableBuffer.sync(name, :key)
+  end
+
+  test "sync_all with no time left does not send sync requests", %{tmp_dir: tmp_dir} do
+    name = start_manual_buffer(tmp_dir, 1, flush_delay_ms: 60_000)
+    assert :ok = DurableBuffer.append_async(name, :key, "held until sync")
+    assert {:error, [{0, :timeout}]} = DurableBuffer.sync_all(name, 0)
+
+    partition = DurableBuffer.partition_name(name, 0)
+    assert :sys.get_state(partition).pending_count == 1
+    refute_received {:submitted, _, _}
+  end
+
+  defp start_manual_buffer(tmp_dir, partitions, opts \\ []) do
+    start_buffer(
+      tmp_dir,
+      Keyword.merge(
+        [backend: {DurableBuffer.ManualAsyncBackend, owner: self()}, partitions: partitions],
+        opts
+      )
+    )
+  end
+
+  defp submit_async(name, key) do
+    assert :ok = DurableBuffer.append_async(name, key, "payload")
+    assert_receive {:submitted, tag, committer}, 1_000
+    {tag, committer}
+  end
+
+  defp assert_sync_pending(committer) do
+    assert eventually(fn ->
+             committer
+             |> :sys.get_state()
+             |> Map.fetch!(:pending)
+             |> :queue.to_list()
+             |> Enum.any?(&match?({:sync_mark, _}, &1))
+           end)
+  end
+
+  defp ordered_partition_keys(name) do
+    {left, right} = distinct_partition_keys(name)
+    if DurableBuffer.partition_index(name, left) == 0, do: {left, right}, else: {right, left}
+  end
+
   test "data survives a buffer restart", %{tmp_dir: tmp_dir} do
     name = :"restart_buffer_#{System.unique_integer([:positive])}"
     opts = [name: name, backend: {DurableBuffer.Backend.Local, dir: tmp_dir}, partitions: 2]
