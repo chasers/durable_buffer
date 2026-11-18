@@ -151,16 +151,37 @@ defmodule DurableBuffer do
 
   @doc """
   Blocks until every enqueued payload in every partition is durable.
+
+  Returns `{:error, failures}` with the index and reason for every failed partition.
+  The timeout is shared across all partitions; failures do not skip later partitions.
   """
-  @spec sync_all(atom(), timeout()) :: :ok
+  @spec sync_all(atom(), timeout()) :: :ok | {:error, [{non_neg_integer(), term()}]}
   def sync_all(name, timeout \\ :infinity) do
     %{partitions: partitions} = config(name)
 
-    for index <- 0..(partitions - 1) do
-      Partition.sync(partition_name(name, index), timeout)
-    end
+    deadline =
+      if timeout == :infinity, do: :infinity, else: System.monotonic_time(:millisecond) + timeout
 
-    :ok
+    failures =
+      for index <- 0..(partitions - 1),
+          {:error, reason} <- [sync_partition(partition_name(name, index), deadline)],
+          do: {index, reason}
+
+    case failures do
+      [] -> :ok
+      failures -> {:error, failures}
+    end
+  end
+
+  defp sync_partition(partition, deadline) do
+    remaining =
+      if deadline == :infinity,
+        do: :infinity,
+        else: max(deadline - System.monotonic_time(:millisecond), 0)
+
+    Partition.sync(partition, remaining)
+  catch
+    :exit, {reason, {GenServer, :call, _}} when reason in [:timeout, :noproc] -> {:error, reason}
   end
 
   @doc """

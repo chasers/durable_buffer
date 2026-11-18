@@ -30,8 +30,10 @@ defmodule DurableBuffer.ManualAsyncBackend do
   end
 
   @impl DurableBuffer.Backend
-  def handle_message({:complete, tag}, state) do
-    {[{tag, :ok}], state}
+  def handle_message({:complete, tag}, state), do: handle_message({:complete, tag, :ok}, state)
+
+  def handle_message({:complete, tag, result}, state) do
+    {[{tag, result}], state}
   end
 
   @impl DurableBuffer.Backend

@@ -100,6 +100,31 @@ defmodule DurableBufferTest do
     end
   end
 
+  test "sync_all reports async commit failures without skipping the remaining partitions", %{
+    tmp_dir: tmp_dir
+  } do
+    name =
+      start_buffer(tmp_dir,
+        partitions: 2,
+        backend: {DurableBuffer.ManualAsyncBackend, owner: self()}
+      )
+
+    {first, second} = distinct_partition_keys(name)
+    first_index = DurableBuffer.partition_index(name, first)
+    second_index = DurableBuffer.partition_index(name, second)
+    assert :ok = DurableBuffer.append_async(name, first, "first")
+    assert :ok = DurableBuffer.append_async(name, second, "second")
+
+    for _ <- 1..2 do
+      assert_receive {:submitted, tag, committer}, 1_000
+      send(committer, {:backend, {:complete, tag, {:error, :write_failed}}})
+    end
+
+    assert {:error, failures} = DurableBuffer.sync_all(name, 1_000)
+    assert Map.new(failures) == %{first_index => :write_failed, second_index => :write_failed}
+    assert :ok = DurableBuffer.sync_all(name, 1_000)
+  end
+
   test "data survives a buffer restart", %{tmp_dir: tmp_dir} do
     name = :"restart_buffer_#{System.unique_integer([:positive])}"
     opts = [name: name, backend: {DurableBuffer.Backend.Local, dir: tmp_dir}, partitions: 2]
