@@ -85,14 +85,31 @@ defmodule DurableBuffer.Partition do
   @doc """
   Blocks until every previously enqueued payload is durable.
 
-  Returns `{:error, reason}` if any commit containing `append_async/2`
-  entries has failed since the last sync or truncate — those entries had no
-  caller to receive the error, so it is surfaced here.
+  Returns `{:error, reason}` for an unacknowledged failure of a commit
+  containing `append_async/2` entries. A timed-out sync does not consume
+  that failure.
   """
   @spec sync(GenServer.server(), timeout()) :: :ok | {:error, term()}
   def sync(server, timeout \\ :infinity) do
-    GenServer.call(server, :sync, timeout)
+    server
+    |> GenServer.call(:sync, timeout)
+    |> acknowledge_sync()
   end
+
+  @doc false
+  def send_sync(server, label, requests) do
+    :gen_server.send_request(server, :sync, label, requests)
+  end
+
+  @doc false
+  def acknowledge_sync({:async_error, partition, ref, reason}) do
+    # Go through the same partition so a follow-up sync from this caller
+    # reaches the committer after the acknowledgment.
+    GenServer.cast(partition, {:ack_sync, ref})
+    {:error, reason}
+  end
+
+  def acknowledge_sync(reply), do: reply
 
   @doc """
   Discards all committed data for the partition.
@@ -208,6 +225,11 @@ defmodule DurableBuffer.Partition do
   @impl GenServer
   def handle_cast({:append, encoded}, state) do
     {:noreply, enqueue(state, nil, encoded, :offset)}
+  end
+
+  def handle_cast({:ack_sync, ref}, state) do
+    Committer.ack_sync(state.committer, ref)
+    {:noreply, state}
   end
 
   @impl GenServer
