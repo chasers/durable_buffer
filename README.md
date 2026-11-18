@@ -25,7 +25,7 @@ DurableBuffer needs Erlang/OTP 25 or later.
 The package is not on Hex. Add it as a git dependency in `mix.exs`:
 
 ```elixir
-{:durable_buffer, github: "chasers/durable_buffer", tag: "v0.6.2"}
+{:durable_buffer, github: "chasers/durable_buffer", tag: "v0.6.3"}
 ```
 
 Each release has a `v<version>` tag. See [Releases](#releases).
