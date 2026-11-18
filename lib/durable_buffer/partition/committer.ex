@@ -63,6 +63,15 @@ defmodule DurableBuffer.Partition.Committer do
     GenServer.cast(server, {:sync, from})
   end
 
+  @doc """
+  Clears the latched async error if `ref` matches it.
+
+  A sync reply does not clear the error, because OTP drops a reply that
+  arrives after the caller timed out. The caller acknowledges the error
+  only after it receives the reply. The acknowledgment goes through the
+  partition, so a later sync from the same caller reaches the committer
+  after it.
+  """
   @spec ack_sync(GenServer.server(), reference()) :: :ok
   def ack_sync(server, ref) do
     GenServer.cast(server, {:ack_sync, ref})
@@ -226,7 +235,6 @@ defmodule DurableBuffer.Partition.Committer do
     {:noreply, state}
   end
 
-  # Sending the reply is not proof of receipt: OTP drops replies after timeouts.
   def handle_cast({:ack_sync, ref}, %{async_error: {ref, _reason}} = state) do
     {:noreply, %{state | async_error: nil}}
   end

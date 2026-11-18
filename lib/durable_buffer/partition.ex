@@ -103,8 +103,6 @@ defmodule DurableBuffer.Partition do
 
   @doc false
   def acknowledge_sync({:async_error, partition, ref, reason}) do
-    # Go through the same partition so a follow-up sync from this caller
-    # reaches the committer after the acknowledgment.
     GenServer.cast(partition, {:ack_sync, ref})
     {:error, reason}
   end

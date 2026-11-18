@@ -20,6 +20,8 @@ The buffer uses **group commit**. Appends that arrive while a commit runs wait f
 
 ## Install
 
+DurableBuffer needs Erlang/OTP 25 or later.
+
 The package is not on Hex. Add it as a git dependency in `mix.exs`:
 
 ```elixir
